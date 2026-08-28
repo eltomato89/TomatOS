@@ -4,7 +4,7 @@ A 32-bit x86 hobby kernel (Multiboot 1) — preemptive scheduler, VGA text
 console, PS/2 keyboard with German layout, PIT timer, CMOS clock, physical
 frame allocator, kernel heap, paging, ring 3 with system calls, per-task
 address spaces, loadable programs, an ATA driver with a FAT12/16 filesystem,
-and a small shell. Originally written between
+VGA graphics, and a small shell. Originally written between
 2006 and 2011, ported to a current Linux toolchain in 2026.
 
 ## Requirements
@@ -39,7 +39,7 @@ involved — the fastest way to try a change. Quit with `Ctrl-C` in the
 terminal.
 
 The shell offers `help`, `taskmgr`, `start`, `mem`, `page`, `user`, `ps`,
-`exec`, `ls`, `cat`, `df`, `reboot` and `exit`. `taskmgr` without an argument prints its own syntax, `mem` and `page`
+`exec`, `ls`, `cat`, `df`, `gfx`, `reboot` and `exit`. `taskmgr` without an argument prints its own syntax, `mem` and `page`
 show the memory and paging state, and `mem -t` / `page -t` run self-tests.
 
 ### Memory layout
@@ -209,6 +209,24 @@ cluster count** (below 4085 is FAT12, below 65525 FAT16), never from the
 type string in the boot sector — that field is advisory and often wrong. And
 the root directory of FAT12/16 is a fixed area behind the FATs, not part of
 the cluster chain, unlike every subdirectory.
+
+### Graphics
+
+`gfx` switches to VGA mode 13h — 320x200 at 256 colours — draws a picture
+with the built-in primitives, and returns to the shell on a keypress.
+There is no BIOS to call from protected mode, so the mode is set by writing
+the register tables directly.
+
+Two things make the round trip work. The text mode font lives in plane 2 of
+the very memory the graphics mode uses as its framebuffer, so it is saved
+before the switch and written back afterwards — without that the console
+returns to a screen of blanks. The visible text is a second casualty for the
+same reason and is saved separately, which is why the scrollback survives.
+
+Nothing prints while graphics mode is up: writes to `0xB8000` are discarded
+by the hardware in that mode, but they would still move the cursor and
+scroll a screen the saved copy no longer matches. The status bar task is
+suspended for the duration for the same reason.
 
 ## On real hardware
 

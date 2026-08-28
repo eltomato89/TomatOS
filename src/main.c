@@ -12,6 +12,7 @@
 #include <exec.h>
 #include <ata.h>
 #include <fat.h>
+#include <vga.h>
 //#include <wmessages.h>
 
 #define NULL 0
@@ -250,6 +251,99 @@ extern char usertext_end[];
 /* What a byte that cannot be printed is shown as. */
 #define CAT_REPLACEMENT  '.'
 
+/* --- graphics ----------------------------------------------------------- */
+
+/* Palette layout of the demo picture.
+*
+*  Everything the picture uses lives at index 16 and above, and that is not a
+*  matter of taste: entries 0..15 are the sixteen colours text mode paints the
+*  console with, and the DAC is one single piece of hardware for both modes. A
+*  vga_palette(1, ...) here would therefore come back as a shell whose blue is
+*  no longer blue, long after the mode switch is over. Leaving the first
+*  sixteen entries untouched is what makes the return invisible from the
+*  palette side; the registers and the font are vga_set_mode()'s business.
+*
+*  The DAC takes six bits per channel, so every component below runs 0..63. */
+#define GFX_BLACK        16
+#define GFX_WHITE        17
+#define GFX_TEXT         18   /* labels and captions      */
+#define GFX_AMBER        19   /* title and separators     */
+#define GFX_SHADOW       20   /* drop shadow of the title */
+#define GFX_FRAME        21   /* panel outlines           */
+#define GFX_PANEL        22   /* panel and bar background */
+#define GFX_LEAF         23
+#define GFX_LEAF_DARK    24
+#define GFX_STEM         25
+
+/* Vertical background gradient, one entry per band of the screen. */
+#define GFX_SKY_FIRST    32
+#define GFX_SKY_STEPS    64
+
+/* Shading ramp of the tomato, dark rim to lit highlight. */
+#define GFX_TOMATO_FIRST 96
+#define GFX_TOMATO_STEPS 16
+
+/* Hue sweep for the palette band. 144 entries at two pixels each are exactly
+*  the 288 pixels the band is wide, so every single entry is visible. */
+#define GFX_SPECTRUM_FIRST 112
+#define GFX_SPECTRUM_STEPS 144
+
+/* A background colour of 0xFF means "leave the pixels alone", see vga.h. */
+#define GFX_TRANSPARENT  0xFF
+
+/* Layout of the picture. Three panels of 96 pixels with 8 pixel gutters fill
+*  the 320 pixel width exactly. */
+#define GFX_HEAD_H       27
+#define GFX_PANEL_Y      34
+#define GFX_PANEL_W      96
+#define GFX_PANEL_H      110
+#define GFX_PANEL1_X     8
+#define GFX_PANEL2_X     112
+#define GFX_PANEL3_X     216
+#define GFX_LABEL_DY     98   /* label offset inside a panel */
+#define GFX_BAND_X       16
+#define GFX_BAND_Y       152
+#define GFX_BAND_W       288
+#define GFX_BAND_H       12
+#define GFX_CAPTION_Y    168
+#define GFX_FOOT_Y       176
+#define GFX_FOOT_TEXT_Y  184
+
+/* The tomato: centre, radius and the height its stem reaches above it. */
+#define GFX_TOMATO_CX    56
+#define GFX_TOMATO_CY    80
+#define GFX_TOMATO_R     34
+
+/* Size of the title, in whole font pixels per glyph pixel. */
+#define GFX_TITLE_SCALE  3
+
+/* --- the graphics self-test --------------------------------------------- */
+
+/* Where "gfx -t" writes its single pixel, and with which value. The colour is
+*  deliberately none of 0, 1 or 15, so a read-back that only ever returns a
+*  stuck value cannot pass by accident. */
+#define GFX_TEST_X       100
+#define GFX_TEST_Y       50
+#define GFX_TEST_COLOUR  37
+
+/* The clipping check. A fill that starts 40 pixels to the left of the screen
+*  must appear from column 0 up to GFX_CLIP_X + GFX_CLIP_W - 1 and nowhere
+*  else -- so the guard pixel one column further right has to survive it.
+*
+*  The second guard is the interesting one: it sits at the far right end of
+*  the PREVIOUS row, which is precisely where the negative start column lands
+*  when a drawing routine computes fb[y * 320 + x] without clipping first.
+*  A wrapped row is invisible in a picture and obvious here. */
+#define GFX_GUARD_X      60
+#define GFX_GUARD_Y      60
+#define GFX_GUARD_COLOUR 200
+#define GFX_CLIP_X       (-40)
+#define GFX_CLIP_W       100
+#define GFX_CLIP_COLOUR  100
+
+/* The text screen is 80 by 25 cells of one character plus one attribute. */
+#define GFX_TEXT_CELLS   (80 * 25)
+
 void update_infobar() {
 	while(1)
 	{
@@ -274,6 +368,7 @@ void execute(char *cmd);
 void listdir(char *cmd);
 void printfile(char *cmd);
 void diskfree(char *cmd);
+void graphics(char *cmd);
 void help(void);
 //void network_test(char *cmd);
 
@@ -308,6 +403,23 @@ static void fs_list(const char *path);
 static void fs_cat(const char *path);
 static void fs_df(void);
 
+static void gfx_statusbar_hold(void);
+static void gfx_statusbar_release(void);
+static void gfx_text_store(void);
+static void gfx_text_recall(void);
+static int  gfx_enter(void);
+static int  gfx_leave(void);
+static void gfx_setup_palette(void);
+static void gfx_char_scaled(int x, int y, char c, int scale, uint8_t colour);
+static void gfx_string_scaled(int x, int y, const char *s, int scale,
+                              uint8_t colour);
+static void gfx_string_centred(int cx, int y, const char *s, uint8_t colour);
+static void gfx_panel(int x, const char *label);
+static void gfx_draw_picture(void);
+static void gfx_show(void);
+static void gfx_selftest(void);
+static void gfx_check(int ok);
+
 /* Self-test counters, maintained by mem_check(). */
 static int mem_tests_run = 0;
 static int mem_tests_ok = 0;
@@ -320,6 +432,21 @@ static int page_tests_ok = 0;
 static int user_tests_run = 0;
 static int user_tests_ok = 0;
 
+/* And for gfx_check(). */
+static int gfx_tests_run = 0;
+static int gfx_tests_ok = 0;
+
+/* The pid of the status bar task, so the graphics commands can hold it while
+*  the screen does not belong to the console -- see gfx_statusbar_hold().
+*  Negative until main() has created the task. */
+static int statusbar_pid = -1;
+
+/* Copy of the visible text screen, taken before the mode switch and written
+*  back after it. Mode 13h and text mode share the same video RAM, and the
+*  framebuffer covers what the characters and attributes are stored in, so
+*  drawing a picture wipes the console -- see gfx_text_store(). */
+static unsigned short gfx_text_page[GFX_TEXT_CELLS];
+
 void main()
 {
 	char cmd[256];
@@ -328,7 +455,11 @@ void main()
     printf("eltomato's TomatOS 0.31 [Version 0.31 Build 2011/27/09]\n");
     printf("(c) Copyright 2006-2011 Jens Köhler\n\n");
 
-	taskmgr_task_start(taskmgr_add_task( update_infobar, "Statusbar Update Task", TASK_PRIORITY_HIGH ));
+	/* The pid is kept: "gfx" suspends this task for the duration of the
+	   picture, because the bar writes straight into the text screen and the
+	   screen is not a text screen while the picture is up. */
+	statusbar_pid = taskmgr_add_task( update_infobar, "Statusbar Update Task", TASK_PRIORITY_HIGH );
+	taskmgr_task_start(statusbar_pid);
 	//taskmgr_task_start(taskmgr_add_task( task, "Test Task", TASK_PRIORITY_LOW ));
 
 	do{
@@ -351,6 +482,7 @@ void main()
 		else if(strcmp(word, "ls") == 0) listdir(cmd);
 		else if(strcmp(word, "cat") == 0) printfile(cmd);
 		else if(strcmp(word, "df") == 0) diskfree(cmd);
+		else if(strcmp(word, "gfx") == 0) graphics(cmd);
 		else if(strcmp(word, "reboot") == 0) reboot();
 		else if(strcmp(word, "help") == 0) help();
 		else if(strcmp(word, "start") == 0) taskmgr_task_start(taskmgr_add_task( task, "Test Task", TASK_PRIORITY_LOW ));
@@ -2756,6 +2888,561 @@ void diskfree(char *cmd)
 	fs_df();
 }
 
+/* --- gfx ----------------------------------------------------------------
+*
+*  What leaving text mode really costs, and how the two halves of this
+*  section pay for it.
+*
+*  1. The video RAM is one memory. In mode 13h the framebuffer at 0xA0000 is
+*     chained across all four planes, so the first eight thousand pixels of
+*     the picture land on exactly the bytes that hold the characters and the
+*     attributes of the 80x25 screen. Drawing anything at all therefore
+*     destroys the console. vga_set_mode() saves and restores the font (see
+*     the header), which is a different plane and a different problem; the
+*     visible text is this file's to keep, so gfx_text_store() takes a copy of
+*     the 2000 cells before the switch and gfx_text_recall() writes it back
+*     after the way home. That is what makes the shell come back with its
+*     scrollback rather than with the rubble of the picture.
+*
+*  2. The status bar task keeps running. It writes 80 cells into 0xB8000
+*     every ten ticks, and 0xB8000 is not part of the framebuffer: mode 13h
+*     leaves the graphics controller's memory map at "0xA0000, 64 KiB", so
+*     the hardware discards those writes outright. The picture is safe from
+*     the bar even if nothing is done about it -- but the bar is not safe
+*     from the picture: its output during that window is simply lost, and
+*     the moment the memory map were ever set to the 128 KiB window instead,
+*     the same writes would land in video RAM behind the visible page. The
+*     task is therefore suspended for the duration and started again
+*     afterwards; it repaints itself within ten ticks on its own.
+*
+*  3. The same trap catches printf(). Anything printed between the two mode
+*     switches goes to 0xB8000, is thrown away by the hardware, and still
+*     advances the console cursor and scrolls the screen the copy in
+*     gfx_text_page[] no longer matches. So neither half of this section
+*     prints a single character while the picture is up: the self-test
+*     collects its results in local variables and reports them once the mode
+*     is back. */
+
+/* Suspends the status bar task, if there is one. taskmgr_task_suspend()
+*  complains about pid 0 -- the system task -- so the check is for a pid that
+*  is really the bar's. */
+static void gfx_statusbar_hold(void)
+{
+	if(statusbar_pid > 0)
+	{
+		taskmgr_task_suspend(statusbar_pid);
+	}
+}
+
+static void gfx_statusbar_release(void)
+{
+	if(statusbar_pid > 0)
+	{
+		taskmgr_task_start(statusbar_pid);
+	}
+}
+
+/* Takes the copy of the visible text screen. Read through the direct mapping
+*  like every other access to that buffer in the kernel. */
+static void gfx_text_store(void)
+{
+	volatile unsigned short *screen;
+	int i;
+
+	screen = (volatile unsigned short *)PAGE_VGA_TEXT;
+
+	for(i = 0; i < GFX_TEXT_CELLS; i++)
+	{
+		gfx_text_page[i] = screen[i];
+	}
+}
+
+/* Writes the copy back. Only meaningful in text mode -- in mode 13h the
+*  writes would go nowhere, see the section comment. */
+static void gfx_text_recall(void)
+{
+	volatile unsigned short *screen;
+	int i;
+
+	screen = (volatile unsigned short *)PAGE_VGA_TEXT;
+
+	for(i = 0; i < GFX_TEXT_CELLS; i++)
+	{
+		screen[i] = gfx_text_page[i];
+	}
+}
+
+/* Everything that has to happen before the first pixel: nothing else may
+*  write to the screen, and the screen has to be saved. Returns what
+*  vga_set_mode() returned, and on failure leaves the system exactly as it
+*  was found. */
+static int gfx_enter(void)
+{
+	int rc;
+
+	gfx_statusbar_hold();
+	gfx_text_store();
+
+	rc = vga_set_mode(VGA_MODE_GRAPHICS);
+
+	if(rc != 0)
+	{
+		gfx_statusbar_release();
+	}
+
+	return rc;
+}
+
+/* And the way back, in the opposite order: the mode first, because the
+*  console buffer can only be written once it is a console buffer again. */
+static int gfx_leave(void)
+{
+	int rc;
+
+	rc = vga_set_mode(VGA_MODE_TEXT);
+	gfx_text_recall();
+	gfx_statusbar_release();
+
+	return rc;
+}
+
+/* Loads the palette the picture is painted with. Three ramps and a handful of
+*  named colours, all of them at index 16 and above. */
+static void gfx_setup_palette(void)
+{
+	int i;
+	int pos;
+	int region;
+	int f;
+	int r;
+	int g;
+	int b;
+
+	vga_palette(GFX_BLACK,      0,  0,  0);
+	vga_palette(GFX_WHITE,     63, 63, 63);
+	vga_palette(GFX_TEXT,      44, 46, 54);
+	vga_palette(GFX_AMBER,     63, 46, 12);
+	vga_palette(GFX_SHADOW,     6,  5, 12);
+	vga_palette(GFX_FRAME,     26, 30, 46);
+	vga_palette(GFX_PANEL,      8,  9, 20);
+	vga_palette(GFX_LEAF,      26, 50, 22);
+	vga_palette(GFX_LEAF_DARK, 12, 32, 14);
+	vga_palette(GFX_STEM,      18, 40, 16);
+
+	/* The background: night blue at the top, warming towards the bottom.
+	   All integer -- there is no floating point in this kernel, and a ramp
+	   never needs any: the step is start + i * span / steps. */
+	for(i = 0; i < GFX_SKY_STEPS; i++)
+	{
+		vga_palette((uint8_t)(GFX_SKY_FIRST + i),
+		            (uint8_t)(3 + (i * 18) / GFX_SKY_STEPS),
+		            (uint8_t)(4 + (i * 10) / GFX_SKY_STEPS),
+		            (uint8_t)(12 + (i * 14) / GFX_SKY_STEPS));
+	}
+
+	/* The tomato, from a nearly black rim to a lit skin. */
+	for(i = 0; i < GFX_TOMATO_STEPS; i++)
+	{
+		vga_palette((uint8_t)(GFX_TOMATO_FIRST + i),
+		            (uint8_t)(22 + (i * 41) / (GFX_TOMATO_STEPS - 1)),
+		            (uint8_t)(2 + (i * 40) / (GFX_TOMATO_STEPS - 1)),
+		            (uint8_t)(2 + (i * 32) / (GFX_TOMATO_STEPS - 1)));
+	}
+
+	/* A full turn of hue at full saturation, done the way a hue really is
+	   defined: six sectors of 64 steps, in each of which one channel rises
+	   or falls while the other two stand still. pos runs 0..383 over the
+	   whole sweep, the sector is pos / 64 and the position inside it
+	   pos % 64 -- no trigonometry and no fractions anywhere. */
+	for(i = 0; i < GFX_SPECTRUM_STEPS; i++)
+	{
+		pos = (i * 384) / GFX_SPECTRUM_STEPS;
+		region = pos / 64;
+		f = pos % 64;
+
+		switch(region)
+		{
+			case 0:  r = 63;     g = f;      b = 0;      break;
+			case 1:  r = 63 - f; g = 63;     b = 0;      break;
+			case 2:  r = 0;      g = 63;     b = f;      break;
+			case 3:  r = 0;      g = 63 - f; b = 63;     break;
+			case 4:  r = f;      g = 0;      b = 63;     break;
+			default: r = 63;     g = 0;      b = 63 - f; break;
+		}
+
+		vga_palette((uint8_t)(GFX_SPECTRUM_FIRST + i),
+		            (uint8_t)r, (uint8_t)g, (uint8_t)b);
+	}
+}
+
+/* One glyph of the built-in font, blown up by an integer factor. The font is
+*  part of the contract in vga.h -- one byte per row, most significant bit
+*  leftmost -- so a set bit simply becomes a scale by scale block. */
+static void gfx_char_scaled(int x, int y, char c, int scale, uint8_t colour)
+{
+	unsigned char index;
+	unsigned char bits;
+	int row;
+	int col;
+
+	index = (unsigned char)c;
+	if(index >= 128) return;
+
+	for(row = 0; row < FONT_HEIGHT; row++)
+	{
+		bits = font8x8[index][row];
+
+		for(col = 0; col < FONT_WIDTH; col++)
+		{
+			if(bits & (0x80 >> col))
+			{
+				vga_fill(x + col * scale, y + row * scale,
+				         scale, scale, colour);
+			}
+		}
+	}
+}
+
+static void gfx_string_scaled(int x, int y, const char *s, int scale,
+                              uint8_t colour)
+{
+	while(*s != EOS)
+	{
+		gfx_char_scaled(x, y, *s, scale, colour);
+		x += FONT_WIDTH * scale;
+		s++;
+	}
+}
+
+/* Draws a string so that its middle sits on cx. The same hand counting the
+*  tables in this file do, only in pixels instead of columns. */
+static void gfx_string_centred(int cx, int y, const char *s, uint8_t colour)
+{
+	int width;
+
+	width = (int)strlen(s) * FONT_WIDTH;
+
+	vga_string(cx - width / 2, y, s, colour, GFX_TRANSPARENT);
+}
+
+/* The background and the outline of one of the three panels, with its label
+*  centred along the bottom edge. */
+static void gfx_panel(int x, const char *label)
+{
+	vga_fill(x, GFX_PANEL_Y, GFX_PANEL_W, GFX_PANEL_H, GFX_PANEL);
+	vga_rect(x, GFX_PANEL_Y, GFX_PANEL_W, GFX_PANEL_H, GFX_FRAME);
+
+	gfx_string_centred(x + GFX_PANEL_W / 2, GFX_PANEL_Y + GFX_LABEL_DY,
+	                   label, GFX_TEXT);
+}
+
+static void gfx_draw_picture(void)
+{
+	int i;
+	int cx;
+	int cy;
+
+	/* Background: one horizontal line per row, one palette entry per band.
+	   64 entries over 200 rows means each colour covers three or four rows,
+	   which at this size reads as a smooth wash. */
+	for(i = 0; i < VGA_HEIGHT; i++)
+	{
+		vga_hline(0, i, VGA_WIDTH,
+		          (uint8_t)(GFX_SKY_FIRST + (i * GFX_SKY_STEPS) / VGA_HEIGHT));
+	}
+
+	/* Header bar and the title, with a drop shadow behind it. */
+	vga_fill(0, 0, VGA_WIDTH, GFX_HEAD_H, GFX_PANEL);
+	vga_hline(0, GFX_HEAD_H, VGA_WIDTH, GFX_AMBER);
+	vga_hline(0, GFX_HEAD_H + 1, VGA_WIDTH, GFX_SHADOW);
+
+	gfx_string_scaled(13, 4, "TomatOS", GFX_TITLE_SCALE, GFX_SHADOW);
+	gfx_string_scaled(11, 2, "TomatOS", GFX_TITLE_SCALE, GFX_AMBER);
+
+	vga_string(222, 5, "320x200x256", GFX_TEXT, GFX_TRANSPARENT);
+	vga_string(246, 15, "MODE 13H", GFX_AMBER, GFX_TRANSPARENT);
+
+	/* --- panel 1: a shaded ball out of nested discs ---------------------
+	   Each disc is a little smaller than the last and its centre moves up
+	   and to the left, so the ramp lays itself down as light falling from
+	   that corner. Sixteen steps of two pixels cover the radius. */
+	gfx_panel(GFX_PANEL1_X, "vga_disc");
+
+	cx = GFX_TOMATO_CX;
+	cy = GFX_TOMATO_CY;
+
+	for(i = 0; i < GFX_TOMATO_STEPS; i++)
+	{
+		vga_disc(cx - i / 2, cy - i / 2, GFX_TOMATO_R - 2 * i,
+		         (uint8_t)(GFX_TOMATO_FIRST + i));
+	}
+
+	vga_circle(cx, cy, GFX_TOMATO_R, GFX_TOMATO_FIRST);
+	vga_disc(cx - 12, cy - 12, 3, GFX_WHITE);
+
+	/* Stem and calyx on top of the finished ball. Every leaf is drawn twice,
+	   one pixel apart, because a single Bresenham line is one pixel thin and
+	   disappears against the skin at this size. */
+	vga_vline(cx, cy - 44, 14, GFX_STEM);
+	vga_vline(cx + 1, cy - 44, 14, GFX_LEAF_DARK);
+	vga_disc(cx, cy - 30, 6, GFX_LEAF_DARK);
+
+	for(i = 0; i < 2; i++)
+	{
+		vga_line(cx, cy - 30 + i, cx - 15, cy - 36 + i, GFX_LEAF);
+		vga_line(cx, cy - 30 + i, cx + 15, cy - 36 + i, GFX_LEAF);
+		vga_line(cx, cy - 30 + i, cx - 11, cy - 21 + i, GFX_LEAF);
+		vga_line(cx, cy - 30 + i, cx + 11, cy - 21 + i, GFX_LEAF);
+	}
+
+	/* --- panel 2: a fan of lines and a pair of rectangles ---------------
+	   The fan starts in one corner and ends on the opposite two edges, so
+	   the slopes run from steeper than vertical round to shallower than
+	   horizontal -- every case a line routine has to get right. */
+	gfx_panel(GFX_PANEL2_X, "vga_line");
+
+	for(i = 0; i < 9; i++)
+	{
+		vga_line(118, 100, 118 + i * 11, 40,
+		         (uint8_t)(GFX_SPECTRUM_FIRST + i * 16));
+	}
+
+	for(i = 1; i < 6; i++)
+	{
+		vga_line(118, 100, 206, 40 + i * 11,
+		         (uint8_t)(GFX_SPECTRUM_FIRST + GFX_SPECTRUM_STEPS - i * 16));
+	}
+
+	/* Filled next to outlined, the same size, so the difference between
+	   vga_fill() and vga_rect() is there to be seen. */
+	vga_fill(122, 106, 36, 16, GFX_AMBER);
+	vga_rect(166, 106, 36, 16, GFX_WHITE);
+
+	/* --- panel 3: rings and discs --------------------------------------- */
+	gfx_panel(GFX_PANEL3_X, "vga_circle");
+
+	for(i = 5; i >= 1; i--)
+	{
+		vga_circle(264, 74, i * 6,
+		           (uint8_t)(GFX_SPECTRUM_FIRST + (5 - i) * 28));
+	}
+
+	for(i = 0; i < 3; i++)
+	{
+		vga_disc(240 + i * 24, 114, 8,
+		         (uint8_t)(GFX_SPECTRUM_FIRST + 20 + i * 44));
+	}
+
+	/* --- the palette band ------------------------------------------------
+	   144 entries, two pixels each, framed. This is the part that shows at
+	   a glance that there really are more than sixteen colours here. */
+	vga_rect(GFX_BAND_X - 1, GFX_BAND_Y - 1, GFX_BAND_W + 2, GFX_BAND_H + 2,
+	         GFX_FRAME);
+
+	for(i = 0; i < GFX_SPECTRUM_STEPS; i++)
+	{
+		vga_fill(GFX_BAND_X + i * 2, GFX_BAND_Y, 2, GFX_BAND_H,
+		         (uint8_t)(GFX_SPECTRUM_FIRST + i));
+	}
+
+	gfx_string_centred(VGA_WIDTH / 2, GFX_CAPTION_Y,
+	                   "256-colour DAC, 144-step hue sweep", GFX_TEXT);
+
+	/* --- footer ---------------------------------------------------------- */
+	vga_fill(0, GFX_FOOT_Y, VGA_WIDTH, VGA_HEIGHT - GFX_FOOT_Y, GFX_PANEL);
+	vga_hline(0, GFX_FOOT_Y, VGA_WIDTH, GFX_AMBER);
+
+	gfx_string_centred(VGA_WIDTH / 2, GFX_FOOT_TEXT_Y,
+	                   "Press any key to return to the shell", GFX_WHITE);
+
+	/* Border last, so nothing drawn over it can eat the corners. */
+	vga_rect(0, 0, VGA_WIDTH, VGA_HEIGHT, GFX_FRAME);
+}
+
+static void gfx_show(void)
+{
+	int rc;
+
+	/* A key that was already waiting would be taken by the getch() below
+	   before the picture had been looked at. kb_flush() clears the slot for
+	   the special keys; the ordinary one has a slot of its own, and
+	   getchn() is the non-blocking read that empties it. */
+	kb_flush();
+	getchn();
+
+	rc = gfx_enter();
+
+	if(rc != 0)
+	{
+		printf("Graphics mode could not be entered, vga_set_mode() = %i\n", rc);
+		return;
+	}
+
+	gfx_setup_palette();
+	gfx_draw_picture();
+
+	/* The keyboard IRQ carries on running in graphics mode -- nothing about
+	   the mode touches the PIC or the controller -- so the ordinary blocking
+	   read is all that is needed here. */
+	getch();
+
+	rc = gfx_leave();
+
+	if(rc != 0)
+	{
+		printf("Text mode could not be restored, vga_set_mode() = %i\n", rc);
+		return;
+	}
+
+	printf("Back in text mode, %i by %i pixels drawn.\n",
+	       VGA_WIDTH, VGA_HEIGHT);
+}
+
+/* Records the result of a check, like mem_check() does for the heap. */
+static void gfx_check(int ok)
+{
+	gfx_tests_run++;
+
+	if(ok)
+	{
+		gfx_tests_ok++;
+		printf("  [  OK  ] ");
+	} else {
+		printf("  [FAILED] ");
+	}
+}
+
+static void gfx_selftest(void)
+{
+	uint8_t *fb_text;
+	uint8_t *fb_graphics;
+	uint8_t *fb_back;
+	int mode_text;
+	int mode_graphics;
+	int mode_back;
+	int rc_in;
+	int rc_out;
+	int readback;
+	int edge_left;
+	int edge_right;
+	int guard;
+	int wrap;
+
+	gfx_tests_run = 0;
+	gfx_tests_ok = 0;
+
+	/* Everything is measured first and printed afterwards: see point 3 of
+	   the section comment -- a printf() between the two mode switches is
+	   thrown away by the hardware and scrolls the console out from under
+	   the copy gfx_enter() took. */
+	readback = -1;
+	edge_left = -1;
+	edge_right = -1;
+	guard = -1;
+	wrap = -1;
+	rc_out = -1;
+	mode_graphics = -1;
+
+	mode_text = vga_mode();
+	fb_text = vga_framebuffer();
+	fb_graphics = 0;
+
+	rc_in = gfx_enter();
+
+	if(rc_in == 0)
+	{
+		mode_graphics = vga_mode();
+		fb_graphics = vga_framebuffer();
+
+		vga_clear(GFX_BLACK);
+
+		/* One pixel, written and read straight back. */
+		vga_pixel(GFX_TEST_X, GFX_TEST_Y, GFX_TEST_COLOUR);
+		readback = (int)vga_pixel_at(GFX_TEST_X, GFX_TEST_Y);
+
+		/* The two guards, then the shape that hangs off the left edge. */
+		vga_pixel(GFX_GUARD_X, GFX_GUARD_Y, GFX_GUARD_COLOUR);
+		vga_pixel(VGA_WIDTH - 1, GFX_GUARD_Y - 1, GFX_GUARD_COLOUR);
+
+		vga_fill(GFX_CLIP_X, GFX_GUARD_Y, GFX_CLIP_W, 1, GFX_CLIP_COLOUR);
+
+		edge_left = (int)vga_pixel_at(0, GFX_GUARD_Y);
+		edge_right = (int)vga_pixel_at(GFX_GUARD_X - 1, GFX_GUARD_Y);
+		guard = (int)vga_pixel_at(GFX_GUARD_X, GFX_GUARD_Y);
+		wrap = (int)vga_pixel_at(VGA_WIDTH - 1, GFX_GUARD_Y - 1);
+
+		rc_out = gfx_leave();
+	}
+
+	mode_back = vga_mode();
+	fb_back = vga_framebuffer();
+
+	printf("Graphics self-test:\n");
+	printf("  Text mode is %i, graphics mode is %i\n",
+	       VGA_MODE_TEXT, VGA_MODE_GRAPHICS);
+
+	/* 1. The mode switch itself, and vga_mode() agreeing with it. */
+	gfx_check(rc_in == 0 && mode_graphics == VGA_MODE_GRAPHICS);
+	printf("vga_set_mode(%i) = %i, vga_mode() %i -> %i\n",
+	       VGA_MODE_GRAPHICS, rc_in, mode_text, mode_graphics);
+
+	/* 2. The framebuffer exists exactly while the mode does. */
+	gfx_check(fb_text == 0 && fb_graphics != 0);
+	printf("Framebuffer 0x%X in text mode, 0x%X in graphics mode\n",
+	       (int)fb_text, (int)fb_graphics);
+
+	/* 3. A pixel that is written has to be there afterwards. */
+	gfx_check(readback == GFX_TEST_COLOUR);
+	printf("Pixel (%i,%i): wrote %i, vga_pixel_at() read %i\n",
+	       GFX_TEST_X, GFX_TEST_Y, GFX_TEST_COLOUR, readback);
+
+	/* 4. The clipped shape has to draw the part that is on the screen ... */
+	gfx_check(edge_left == GFX_CLIP_COLOUR && edge_right == GFX_CLIP_COLOUR);
+	printf("Fill x %i..%i drew (0,%i) = %i and (%i,%i) = %i\n",
+	       GFX_CLIP_X, GFX_CLIP_X + GFX_CLIP_W - 1, GFX_GUARD_Y, edge_left,
+	       GFX_GUARD_X - 1, GFX_GUARD_Y, edge_right);
+
+	/* 5. ... and nothing beyond it: neither the next pixel to the right nor
+	      the end of the row above, where an unclipped negative start column
+	      would have wrapped to. */
+	gfx_check(guard == GFX_GUARD_COLOUR && wrap == GFX_GUARD_COLOUR);
+	printf("Guard (%i,%i) = %i, wrap guard (%i,%i) = %i, both set to %i\n",
+	       GFX_GUARD_X, GFX_GUARD_Y, guard, VGA_WIDTH - 1, GFX_GUARD_Y - 1,
+	       wrap, GFX_GUARD_COLOUR);
+
+	/* 6. And the way back, which is the whole point of the exercise. */
+	gfx_check(rc_out == 0 && mode_back == VGA_MODE_TEXT && fb_back == 0);
+	printf("vga_set_mode(%i) = %i, vga_mode() = %i, framebuffer 0x%X\n",
+	       VGA_MODE_TEXT, rc_out, mode_back, (int)fb_back);
+
+	printf("  Result: %i of %i checks passed\n",
+	       gfx_tests_ok, gfx_tests_run);
+}
+
+void graphics(char *cmd)
+{
+	char opt[100];
+
+	if(prmc(cmd) == 0)
+	{
+		gfx_show();
+		return;
+	}
+
+	/* prmv() hands back a pointer into one static buffer, so the option is
+	   copied out before anything else can call prmv() again. */
+	strcpy(opt, prmv(1, cmd));
+
+	if(strcmp(opt, "-t") == 0)
+	{
+		gfx_selftest();
+	} else {
+		printf("Syntax: gfx [-t]\n");
+		printf("\t          Draw the demo picture, any key returns\n");
+		printf("\t-t        Run the graphics mode self-test\n");
+	}
+}
+
 void help(void)
 {
 	printf("TomatOS Help\n");
@@ -2772,6 +3459,7 @@ void help(void)
 	printf("\tls        ls [PATH] lists a directory, the root without PATH\n");
 	printf("\tcat       cat PATH prints a file as text\n");
 	printf("\tdf        Show the mounted filesystem and the drives found\n");
+	printf("\tgfx       Draw the graphics demo, gfx -t tests mode 13h\n");
 	printf("\treboot    Restart the computer\n");
 	printf("\texit      Exit the shell\n");
 }

@@ -23,6 +23,10 @@ typedef enum {false,true} bool;
 
 typedef void (*fp)(void);
 typedef unsigned char uint8_t;
+/* Same definition as in stdint.h, which not every header pulls in. Without
+*  it here, multiboot.h and elf.h only compile when stdint.h happens to have
+*  been included first -- an ordering dependency nothing enforces. */
+typedef unsigned short uint16_t;
 typedef unsigned long int uint32_t;
 
 #endif

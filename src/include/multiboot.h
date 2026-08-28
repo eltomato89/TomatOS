@@ -20,6 +20,13 @@
 #define MULTIBOOT_INFO_MODS         0x00000008
 #define MULTIBOOT_INFO_MEM_MAP      0x00000040  /* mmap_addr / mmap_length valid */
 #define MULTIBOOT_INFO_BOOT_LOADER  0x00000200
+#define MULTIBOOT_INFO_VBE           0x00000800  /* vbe_* fields valid       */
+#define MULTIBOOT_INFO_FRAMEBUFFER   0x00001000  /* framebuffer_* fields valid */
+
+/* framebuffer_type */
+#define MULTIBOOT_FRAMEBUFFER_INDEXED  0   /* palette, one byte per pixel */
+#define MULTIBOOT_FRAMEBUFFER_RGB      1   /* direct colour               */
+#define MULTIBOOT_FRAMEBUFFER_EGA_TEXT 2   /* the usual 0xB8000 text mode */
 
 /* Types of a memory map entry */
 #define MULTIBOOT_MEMORY_AVAILABLE  1
@@ -76,6 +83,48 @@ typedef struct
     uint32_t config_table;
     uint32_t boot_loader_name;
     uint32_t apm_table;
+
+    /* gueltig bei MULTIBOOT_INFO_VBE -- untouched by this kernel, but the
+    *  fields have to be here so the ones after them sit at the right
+    *  offset. */
+    uint32_t vbe_control_info;
+    uint32_t vbe_mode_info;
+    uint16_t vbe_mode;
+    uint16_t vbe_interface_seg;
+    uint16_t vbe_interface_off;
+    uint16_t vbe_interface_len;
+
+    /* gueltig bei MULTIBOOT_INFO_FRAMEBUFFER.
+    *
+    *  This is how a graphics mode reaches the kernel. It cannot be set from
+    *  protected mode -- a VBE mode needs int 0x10, which is real mode only --
+    *  so whoever boots us establishes the mode and describes it here. GRUB
+    *  does it when the video fields are set in the multiboot header, and our
+    *  own stage 2 does the same before it leaves real mode.
+    *
+    *  pitch is the byte distance between two rows and is NOT width * bpp/8:
+    *  hardware commonly pads rows. Computing the row offset from the width
+    *  is the classic way to get a picture that slants across the screen. */
+    /* Split into two halves for the same reason the memory map entries are:
+    *  this kernel has no uint64_t, and 64-bit arithmetic would drag in
+    *  libgcc helpers. A framebuffer above 4 GiB is unreachable for us
+    *  anyway, so framebuffer_addr_high being non-zero means "cannot use
+    *  it". */
+    uint32_t framebuffer_addr_low;
+    uint32_t framebuffer_addr_high;
+    uint32_t framebuffer_pitch;
+    uint32_t framebuffer_width;
+    uint32_t framebuffer_height;
+    uint8_t  framebuffer_bpp;
+    uint8_t  framebuffer_type;
+
+    /* For type RGB: position and size of each channel within a pixel. */
+    uint8_t  framebuffer_red_field_position;
+    uint8_t  framebuffer_red_mask_size;
+    uint8_t  framebuffer_green_field_position;
+    uint8_t  framebuffer_green_mask_size;
+    uint8_t  framebuffer_blue_field_position;
+    uint8_t  framebuffer_blue_mask_size;
 } __attribute__((packed)) multiboot_info;
 
 #endif
