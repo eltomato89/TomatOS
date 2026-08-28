@@ -346,46 +346,10 @@ int do_amd(void) {
 }
 
 
-unsigned long getRamSize(char unit)
-{
-   unsigned long rez;
-   unsigned long memsize;
-   unsigned long last;
-   unsigned char tmp;
-
-   memsize = 1;            // 1MB
-   rez = 0x12;             // Number for teste
-   last = 0x200000-0x1;    // From 2MB of RAM
-
-   /* Die Zugriffe muessen volatile sein: sonst nimmt der Compiler an, dass
-    * das gerade geschriebene Byte unveraendert zurueckgelesen wird, wirft
-    * den Test weg und macht daraus eine Endlosschleife.
-    * Die Obergrenze verhindert zusaetzlich einen Adressueberlauf bei 4 GB. */
-   while (rez == 0x12 && last < 0xFFF00000UL) {
-      tmp = *(volatile char *)last;
-      *(volatile char *)last = rez;
-      rez = *(volatile char *)last;
-      last += 0x100000;
-
-      if (rez == 0x12) {
-         memsize++;
-         *(volatile char *)last = tmp;
-      }
-   }
-
-   switch (unit)
-   {
-        /*case 'M':
-            break;*/
-        case 'K':
-            memsize <<= 0x0A;
-            break;
-        case 'B':
-            memsize <<= 0x14;
-   }
-
-    return memsize;
-};
+/* getRamSize() ist entfallen. Die Funktion ermittelte den Speicher durch
+ * destruktives Testschreiben quer durch den Adressraum - sie war die Ursache
+ * eines Boot-Haengers und ueberschrieb dabei fremde Bereiche. Den Speicher
+ * liefert jetzt die Memory-Map des Bootloaders, siehe pmm_init() in src/pmm.c. */
 
 void init_serial() {
    outportb(PORT + 1, 0x00);    // Disable all interrupts

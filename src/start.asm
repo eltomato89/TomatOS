@@ -11,7 +11,15 @@
 [BITS 32]
 
 global start
-start:   
+start:
+    ; Der Bootloader uebergibt laut Multiboot-Spezifikation die Magic
+    ; 0x2BADB002 in eax und die physische Adresse der Info-Struktur in ebx.
+    ; Beides wird als allererstes weggesichert: einen eigenen Stack haben wir
+    ; hier noch nicht (esp zeigt noch in den Bootloader), pushen ist also
+    ; keine Option. Ab jetzt duerfen eax/ebx beliebig ueberschrieben werden.
+    mov [mboot_magic], eax
+    mov [mboot_info], ebx
+
     mov esp, sys_stack     ; This points the stack to our new stack area
     jmp stublet
 
@@ -36,7 +44,12 @@ mboot:
 ; before the 'jmp $'.
 stublet:
 	 extern kernel
+	 ; cdecl: die Argumente werden von rechts nach links gepusht, fuer
+	 ; kernel(magic, mbi) also erst der mbi-Zeiger, dann die Magic.
+	 push dword [mboot_info]
+	 push dword [mboot_magic]
 	 call kernel
+	 add esp, 8             ; cdecl: der Aufrufer raeumt die Argumente ab
 	 jmp $
 
 ; This will set up our new segment registers. We need to do
@@ -594,6 +607,12 @@ EnableA20Gate:
 	ret
 
 SECTION .bss
+; Kopien der Multiboot-Register aus 'start'. Sie liegen bewusst VOR dem
+; Stackbereich: der Stack waechst von sys_stack nach unten, hinter sys_stack
+; abgelegte Werte wuerde der erste push zerstoeren.
+mboot_magic: resd 1
+mboot_info:  resd 1
+
     resb 8192               ; This reserves 8KBytes of memory here
 sys_stack:
 

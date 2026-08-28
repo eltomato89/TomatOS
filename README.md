@@ -37,7 +37,7 @@ QEMU lädt den Multiboot-ELF direkt per `-kernel`, ganz ohne Bootloader —
 das ist der schnellste Weg zum Ausprobieren. Beenden mit `Ctrl-C` im
 Terminal oder `Strg-Alt-Q` im QEMU-Fenster.
 
-An der Shell stehen `help`, `taskmgr`, `start`, `reboot` und `exit` zur
+An der Shell stehen `help`, `taskmgr`, `start`, `mem`, `reboot` und `exit` zur
 Verfügung. `taskmgr` ohne Argument zeigt seine eigene Syntax.
 
 ### Tastaturlayout

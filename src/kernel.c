@@ -9,6 +9,7 @@
 #include <system.h>
 #include <stdio.h>
 #include <hardware.h>
+#include <mm.h>
 #define cpuid(in, a, b, c, d) __asm__("cpuid": "=a" (a), "=b" (b), "=c" (c), "=d" (d) : "a" (in));
 
 void *memcpy(void *dest, const void *src, size_t count)
@@ -82,14 +83,75 @@ int checkCPUID(void)
    }
 }
 
-int kernel()
+/* Gibt die nutzbaren Bereiche der Multiboot-Memory-Map aus. Bewusst kompakt:
+*  der Textmodus hat nur 25 Zeilen, und die Bootmeldungen sollen hineinpassen.
+*  Reservierte Bereiche interessieren hier nicht, die wertet pmm_init() aus.
+*/
+static void print_memory_map(multiboot_info *mbi)
+{
+	multiboot_mmap_entry *entry;
+	uint32_t offset;
+	uint32_t laenge_kib;
+	uint32_t summe_kib;
+	int gezeigt;
+
+	if(!(mbi->flags & MULTIBOOT_INFO_MEM_MAP))
+	{
+		printf("Memory-Map: keine vom Bootloader erhalten\n");
+		return;
+	}
+
+	summe_kib = 0;
+	gezeigt = 0;
+	offset = 0;
+
+	printf("Memory-Map (nutzbar):\n");
+	while(offset < mbi->mmap_length)
+	{
+		entry = (multiboot_mmap_entry *)(mbi->mmap_addr + offset);
+		/* size zaehlt erst ab dem Feld dahinter, daher die zusaetzlichen 4 */
+		offset += entry->size + 4;
+
+		if(entry->type != MULTIBOOT_MEMORY_AVAILABLE) continue;
+		/* Oberhalb von 4 GiB kommt ein 32-Bit-Kernel ohnehin nicht hin */
+		if(entry->addr_high != 0) continue;
+
+		if(entry->len_high != 0)
+			laenge_kib = (0xFFFFFFFFu - entry->addr_low) / 1024u;
+		else
+			laenge_kib = entry->len_low / 1024u;
+
+		summe_kib += laenge_kib;
+
+		if(gezeigt < 6)
+			printf("  0x%X  %i KiB  Typ %i\n", entry->addr_low, laenge_kib, entry->type);
+		else if(gezeigt == 6)
+			printf("  ...\n");
+		gezeigt++;
+	}
+
+	printf("  Summe: %i KiB (%i MiB) in %i Bereichen\n",
+		summe_kib, (summe_kib / 1024u), gezeigt);
+}
+
+int kernel(uint32_t magic, multiboot_info *mbi)
 {
 	extern void main();
 	int task_console;
 
     init_video();
     printf("\n\nTomatOS/x86 boot v0.2\n");
-	
+
+	/* Ohne die Magic wissen wir nicht, ob ebx ueberhaupt auf eine
+	*  Multiboot-Info-Struktur zeigt. Alles Weitere waere geraten. */
+	if(magic != MULTIBOOT_BOOTLOADER_MAGIC)
+	{
+		printf("Multiboot-Magic: %X erwartet, %X erhalten\n",
+			MULTIBOOT_BOOTLOADER_MAGIC, magic);
+		panic("Kein Multiboot-konformer Bootloader.\nTomatOS braucht die Speicherinformationen des Bootloaders.");
+		return 0;
+	}
+
 	detect_cpu();
 	if(checkCPUID()==1)
 	   {
@@ -99,7 +161,20 @@ int kernel()
 		panic("An unsupported CPU ID has been detected\nTomatOS requires a i386 or above");
 		return 0;
 	   }
-	printf("%i MB Memory (%i KB)\n", (getRamSize('K')/1024), getRamSize('K'));
+	/* Speicherverwaltung aufsetzen. Die Groesse kommt jetzt aus der
+	*  Memory-Map des Bootloaders - kein destruktives Testschreiben quer durch
+	*  den Adressraum mehr.
+	*  Reihenfolge: pmm_init() braucht nur die Memory-Map, heap_init() setzt
+	*  auf einem fertigen pmm auf, und beide muessen vor mt_install() stehen,
+	*  damit auch Tasks Speicher anfordern koennen. */
+	print_memory_map(mbi);
+	pmm_init(mbi);
+	heap_init();
+	printf("%i MB Memory (%i KB) in %i Frames\n",
+		(pmm_total_bytes() / (1024u * 1024u)),
+		(pmm_total_bytes() / 1024u),
+		pmm_total_frames());
+
 	printf("\n\nLoading TomatOS/x86\n");
 	printf("Loading Driver Components.\n");
     gdt_install();    

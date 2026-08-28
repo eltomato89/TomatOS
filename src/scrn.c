@@ -6,6 +6,7 @@
 #include <system.h>
 #include <stdarg.h>
 #include <string.h>
+#include <mm.h>
 /* These define our textpointer, our background and foreground
 *  colors (attributes), and x and y cursor coordinates */
 volatile unsigned short *textmemptr;
@@ -287,161 +288,188 @@ int printf(char * string, ...)
 	return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* Statusleiste                                                        */
+/* ------------------------------------------------------------------ */
+
+/* Die Leiste ist die oberste Bildschirmzeile und damit genau 80 Spalten
+*  breit. */
+#define STATUSBAR_WIDTH     80
+
+/* Die Uhr steht rechtsbündig: "hh:mm:ss" belegt acht Spalten ab Spalte 70,
+*  die beiden letzten Spalten bleiben leer (dort stand früher die
+*  Abschlussnull des Zeitstrings, die als Leerzeichen erschien). */
+#define STATUSBAR_CLOCK_LEN 8
+#define STATUSBAR_CLOCK_COL (STATUSBAR_WIDTH - 2 - STATUSBAR_CLOCK_LEN)
+
+/* Frames pro Megabyte: 1 MiB / 4 KiB = 256. Die Anzeige rechnet bewusst in
+*  Frames statt in Bytes -- ein Bytewert liefe bei 4 GiB über, die Zahl der
+*  Frames passt immer bequem in 32 Bit. */
+#define STATUSBAR_FRAMES_PER_MB (1024 * 1024 / PMM_FRAME_SIZE)
+
+/* Schreibt text mit dem aktuell eingestellten attrib ab Spalte col in die
+*  Leiste und liefert die erste freie Spalte zurück. Was in den Bereich der
+*  Uhr laufen würde, wird verworfen: so kann weder eine lange Zahl noch eine
+*  hohe Taskzahl die Zeile sprengen oder in die nächste überlaufen. */
+static int statusbar_puts(int col, const char *text)
+{
+	volatile unsigned short *pos;
+
+	while(*text != EOS && col < STATUSBAR_CLOCK_COL)
+	{
+		pos = textmemptr + col;
+		*pos = (unsigned char)*text | (attrib << 8);
+		col++;
+		text++;
+	}
+
+	return col;
+}
+
+/* Wie statusbar_puts(), aber für ein einzelnes Zeichen -- gebraucht für den
+*  Aktivitätspunkt 0xFE, der in keinem gewöhnlichen String steht. */
+static int statusbar_putc(int col, unsigned char c)
+{
+	volatile unsigned short *pos;
+
+	if(col < STATUSBAR_CLOCK_COL)
+	{
+		pos = textmemptr + col;
+		*pos = c | (attrib << 8);
+		col++;
+	}
+
+	return col;
+}
+
 void display_update_statusbar()
 {
-	__asm__ __volatile__ ("cli");
-	int org_attrib = attrib;
-	
 	volatile unsigned short *pos;
-	int i=0, x=0;
-	int back=0x7;
-	
-	for(i=0; i <= 79; i++)
+	unsigned long flags;
+	int org_attrib;
+	int i;
+	int x;
+	int back = 0x7;
+	int taskcount;
+	uint32_t total_frames;
+	uint32_t used_frames;
+	datetime now;
+	char mem[24];
+	char time[9] = "00:00:00";
+
+	/* Die Uhrzeit vor der kritischen Sektion holen: cmos_readtime() wartet
+	*  unter Umständen auf das Ende eines RTC-Updates und sichert die
+	*  Interrupts bereits selbst ab. Innerhalb unseres cli zu warten würde
+	*  die Sperre unnötig lange halten. */
+	now = cmos_readtime();
+
+	/* EFLAGS sichern und erst dann sperren. Ein bedingungsloses sti am Ende
+	*  würde die Interrupts auch dann einschalten, wenn der Aufrufer sie
+	*  absichtlich gesperrt hatte. Die Sperre selbst ist nötig, weil hier
+	*  direkt in den VGA-Puffer geschrieben wird, während der Konsolen-Task
+	*  dasselbe über putch() tut. */
+	__asm__ __volatile__ ("pushfl; popl %0; cli" : "=r" (flags) : : "memory");
+
+	org_attrib = attrib;
+
+	/* Kennzahlen und Zahlenformatierung gehören in die kritische Sektion:
+	*  itoa() liefert einen Zeiger auf einen statischen Puffer, den sich
+	*  alle Tasks teilen. */
+	taskcount = taskmgr_get_taskcount();
+	total_frames = pmm_total_frames();
+	used_frames = pmm_used_frames();
+
+	if(total_frames == 0)
 	{
-		settextcolor(0x00, 0x7);
+		/* Speicherverwaltung noch nicht aufgesetzt -- ehrlicher als eine
+		*  erfundene Zahl. */
+		strcpy(mem, "n/a");
+	}
+	else
+	{
+		/* Belegt wird aufgerundet, damit eine kleine, aber vorhandene
+		*  Belegung nicht als "0" erscheint; die Gesamtgröße wird
+		*  abgerundet, damit die Leiste nie mehr Speicher verspricht, als
+		*  wirklich da ist. */
+		strcpy(mem, itoa((int)((used_frames + STATUSBAR_FRAMES_PER_MB - 1)
+		                       / STATUSBAR_FRAMES_PER_MB)));
+		strcat(mem, "/");
+		/* Erst jetzt darf itoa() erneut laufen: der statische Puffer mit
+		*  dem ersten Wert ist oben weggesichert. */
+		strcat(mem, itoa((int)(total_frames / STATUSBAR_FRAMES_PER_MB)));
+		strcat(mem, "mb");
+	}
+
+	/* Hintergrund der ganzen Zeile: schwarze Schrift auf hellgrau. */
+	settextcolor(0x00, 0x7);
+	for(i = 0; i < STATUSBAR_WIDTH; i++)
+	{
 		pos = textmemptr + i;
 		*pos = ' ' | (attrib << 8);
 	}
-	i=0;
-	
-	/*
-	//TomatOS x.x.x
-	settextcolor(0x00, 0x7); //Schwarz
-	char version[14] = "TomatOS 0.3.2 ";
-	for(x=0; x <= 13; x++)
+
+	i = 0;
+
+	/* [cpu: .] -- Klammern schwarz, Beschriftung weiß */
+	i = statusbar_puts(i, "[");
+	settextcolor(15, back);
+	i = statusbar_puts(i, "cpu: ");
+	i = statusbar_putc(i, 0xFE);	/* Aktivitätspunkt, CPU */
+	settextcolor(0x00, 0x7);
+	i = statusbar_puts(i, "] ");
+
+	/* [mem: belegt/gesamt mb] */
+	i = statusbar_puts(i, "[");
+	settextcolor(15, back);
+	i = statusbar_puts(i, "mem: ");
+	i = statusbar_puts(i, mem);
+	settextcolor(0x00, 0x7);
+	i = statusbar_puts(i, "] ");
+
+	/* [task: ..] -- ein Punkt je laufendem Task */
+	i = statusbar_puts(i, "[");
+	settextcolor(15, back);
+	i = statusbar_puts(i, "task: ");
+	for(x = 0; x < taskcount; x++)
 	{
-		pos = textmemptr + (i++);
-		*pos = version[x] | (attrib << 8);
+		i = statusbar_putc(i, 0xFE);
 	}
-	*/
-	//>>>>>>>>>>>>>>>>>>>>>>>>>>> [ cpu: x ] <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-	
-	pos = textmemptr + (i++);
-	*pos = '[' | (attrib << 8);
-	
-	settextcolor(15,back); //Weiß
-	
-	pos = textmemptr + (i++);
-	*pos = 'c' | (attrib << 8);
-	pos = textmemptr + (i++);
-	*pos = 'p' | (attrib << 8);
-	pos = textmemptr + (i++);
-	*pos = 'u' | (attrib << 8);
-	pos = textmemptr + (i++);
-	*pos = ':' | (attrib << 8);	
-	pos = textmemptr + (i++);
-	*pos = 0x20 | (attrib << 8);
-	pos = textmemptr + (i++);
-	
-	*pos = 0xFE | (attrib << 8); // Activity Indicator, CPU
-	
-	settextcolor(0x00, 0x7); //Schwarz
-	pos = textmemptr + (i++);
-	*pos = ']' | (attrib << 8);
-	pos = textmemptr + (i++);
-	*pos = 0x20 | (attrib << 8);
-	
-	//>>>>>>>>>>>>>>>>>>>>>>>>>>>> [memory: 0 mb] <<<<<<<<<<<<<<<<<<<<<<<<<
-	pos = textmemptr + (i++);
-	*pos = '[' | (attrib << 8);
-	
-	settextcolor(15,back); //Weiß
-	
-	pos = textmemptr + (i++);
-	*pos = 'm' | (attrib << 8);
-	pos = textmemptr + (i++);
-	*pos = 'e' | (attrib << 8);
-	pos = textmemptr + (i++);
-	*pos = 'm' | (attrib << 8);
-	pos = textmemptr + (i++);
-	*pos = ':' | (attrib << 8);	
-	pos = textmemptr + (i++);
-	*pos = 0x20 | (attrib << 8);
-	pos = textmemptr + (i++);
-	
-	*pos = '0' | (attrib << 8); // Activity Indicator, Memory
-	
-	pos = textmemptr + (i++);
-	*pos = 'm' | (attrib << 8);
-	pos = textmemptr + (i++);
-	*pos = 'b' | (attrib << 8);
-	settextcolor(0x00, 0x7); //Schwarz
-	pos = textmemptr + (i++);
-	*pos = ']' | (attrib << 8);
-	pos = textmemptr + (i++);
-	*pos = 0x20 | (attrib << 8);
-	//>>>>>>>>>>>>>>>>>>>>>>>>> [tasks: xxx] <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-	
-	pos = textmemptr + (i++);
-	*pos = '[' | (attrib << 8);
-	
-	settextcolor(15,back); //Weiß
-	
-	pos = textmemptr + (i++);
-	*pos = 't' | (attrib << 8);
-	pos = textmemptr + (i++);
-	*pos = 'a' | (attrib << 8);
-	pos = textmemptr + (i++);
-	*pos = 's' | (attrib << 8);
-	pos = textmemptr + (i++);
-	*pos = 'k' | (attrib << 8);
-	pos = textmemptr + (i++);
-	*pos = ':' | (attrib << 8);
-	pos = textmemptr + (i++);
-	*pos = 0x20 | (attrib << 8);
-	
-	for(x = 0; x <= taskmgr_get_taskcount()-1; x++)
-	{
-		pos = textmemptr + (i++);
-		
-		*pos = 0xFE | (attrib << 8);
-	}
-	
-	
-	settextcolor(0x00, 0x7); //Schwarz
-	
-	pos = textmemptr + (i++);
-	*pos = ']' | (attrib << 8);
-	
-	settextcolor(15,0);
-	
-	//>>>>>>>>>>>>>>>>>>>>> Clock <<<<<<<<<<<<<<<<<<<<<<<
-	settextcolor(0x00, 0x7); //Schwarz
-	
-	datetime now = cmos_readtime();
-	char time[9] = "00:00:00";
-	
+	settextcolor(0x00, 0x7);
+	i = statusbar_puts(i, "]");
+
+	/* Uhr, rechtsbündig. attrib steht bereits auf schwarz/hellgrau. */
 	if(now.hours < 10) {
 		time[1] = now.hours + '0';
 	} else {
 		time[0] = (int)(now.hours) / 10 + '0';
 		time[1] = now.hours % 10 + '0';
 	}
-	
+
 	if(now.minutes < 10) {
 		time[4] = now.minutes + '0';
 	} else {
 		time[3] = (int)(now.minutes) / 10 + '0';
 		time[4] = now.minutes % 10 + '0';
 	}
-	
+
 	if(now.seconds < 10) {
 		time[7] = now.seconds + '0';
 	} else {
 		time[6] = (int)(now.seconds) / 10 + '0';
 		time[7] = now.seconds % 10 + '0';
 	}
-	
-	for(x=0; x <= 8; x++)
+
+	for(x = 0; x < STATUSBAR_CLOCK_LEN; x++)
 	{
-		pos = textmemptr + (79-9+x);
+		pos = textmemptr + (STATUSBAR_CLOCK_COL + x);
 		*pos = time[x] | (attrib << 8);
 	}
-	
-	
+
 	attrib = org_attrib;
-	
-	__asm__ __volatile__ ("sti");	
+
+	/* EFLAGS zurück -- die Interrupts sind danach genau so gesperrt oder
+	*  freigegeben wie beim Eintritt. */
+	__asm__ __volatile__ ("pushl %0; popfl" : : "r" (flags) : "memory", "cc");
 }
 
 void panic(char *desc)

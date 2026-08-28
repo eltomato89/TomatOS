@@ -2,7 +2,6 @@ extern int detect_cpu(void);
 extern int do_intel(void);
 extern void printregs(int eax, int ebx, int ecx, int edx);
 extern int do_amd(void);
-extern unsigned long getRamSize(char unit);
 extern void init_serial();
 extern int serial_received();
 extern char read_serial();

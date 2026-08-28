@@ -1,3 +1,8 @@
+/* Mehrfachinklusion verhindern: mm.h zieht typedefs.h direkt und ueber
+*  multiboot.h ein zweites Mal herein. */
+#ifndef __TYPEDEFS_H
+#define __TYPEDEFS_H
+
 typedef int size_t;
 typedef char                sbyte;
 typedef unsigned char       ubyte;
@@ -19,3 +24,5 @@ typedef enum {false,true} bool;
 typedef void (*fp)(void);
 typedef unsigned char uint8_t;
 typedef unsigned long int uint32_t;
+
+#endif
