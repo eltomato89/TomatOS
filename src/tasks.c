@@ -59,35 +59,49 @@ void init_multitasking(void)
  
 struct regs* schedule(struct regs* cpu)
 {
+	int i;
+	int slot;
+	int next;
+	int start;
+
 	//Wenn Task laeuft, Zustand sichern.
     if (current_task >= 0) {
         task_states[current_task] = cpu;
     }
-	
-	if(tasks[current_task].cpu_time <= 0)
+
+	//Beim allerersten Aufruf ist current_task noch -1, dann direkt einen Task suchen
+	//(kein Zugriff auf tasks[-1]).
+	if(current_task < 0 || tasks[current_task].cpu_time <= 0)
 	{
-		tasks[current_task].cpu_time = tasks[current_task].priority;
-		
-	
-		//nächsten auszuführenden Task suchen
-		int i;
-		for(i=current_task+1; i <= MAX_TASKS-1; i++)
+		if(current_task >= 0)
 		{
-			if(tasks[i].state == TASK_STATE_RUNNING)
+			tasks[current_task].cpu_time = tasks[current_task].priority;
+		}
+
+		//nächsten auszuführenden Task suchen, höchstens ein kompletter Umlauf
+		next = -1;
+		start = current_task + 1;	//bei current_task == -1 also ab Slot 0
+		for(i=0; i <= MAX_TASKS-1; i++)
+		{
+			slot = (start + i) % MAX_TASKS;
+			if(tasks[slot].state == TASK_STATE_RUNNING && task_states[slot] != 0)
 			{
-				current_task = i;
-				break;			
-			} else {
-				if(i == MAX_TASKS-1) i = -1;
+				next = slot;
+				break;
 			}
 		}
-		
+
+		//Kein lauffähiger Task gefunden: bisherigen Kontext unverändert weiterbenutzen
+		if(next < 0) return cpu;
+
+		current_task = next;
+
 	} else {
 		tasks[current_task].cpu_time--;
 	}
-	
+
     cpu = task_states[current_task];
-	
+
     return cpu;
 }
 

@@ -355,15 +355,19 @@ unsigned long getRamSize(char unit)
    rez = 0x12;             // Number for teste
    last = 0x200000-0x1;    // From 2MB of RAM
 
-   while (rez == 0x12) {
-      tmp = *(char *)last;
-      *(char *)last = rez;   
-      rez = *(char *)last;
+   /* Die Zugriffe muessen volatile sein: sonst nimmt der Compiler an, dass
+    * das gerade geschriebene Byte unveraendert zurueckgelesen wird, wirft
+    * den Test weg und macht daraus eine Endlosschleife.
+    * Die Obergrenze verhindert zusaetzlich einen Adressueberlauf bei 4 GB. */
+   while (rez == 0x12 && last < 0xFFF00000UL) {
+      tmp = *(volatile char *)last;
+      *(volatile char *)last = rez;
+      rez = *(volatile char *)last;
       last += 0x100000;
 
       if (rez == 0x12) {
          memsize++;
-         *(char *)last = tmp;
+         *(volatile char *)last = tmp;
       }
    }
 

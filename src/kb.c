@@ -13,7 +13,7 @@
 unsigned char kbdde_s[128] =
 {
     0,  27, '1', '2', '3', '4', '5', '6', '7', '8',	/* 9 */
-  '9', '0', 223 /* ß */, '´', '\b',	/* Backspace */
+  '9', '0', 223 /* ß */, 0xB4 /* ´ */, '\b',	/* Backspace */
   '\t',			/* Tab */
   'q', 'w', 'e', 'r',	/* 19 */
   't', 'z', 'u', 'i', 'o', 'p', 252 /* ü */, '+', '\n',		/* Enter key */
@@ -51,14 +51,14 @@ unsigned char kbdde_s[128] =
 };
 unsigned char kbdde_b[128] =
 {
-    0,  27, '!', '\"', '§', '$', '%', '&', '/', '(',	/* 9 */
+    0,  27, '!', '\"', 0xA7 /* § */, '$', '%', '&', '/', '(',	/* 9 */
   ')', '=', 223 /* ß */, '`', '\b',	/* Backspace */
   '\t',			/* Tab */
   'Q', 'W', 'E', 'R',	/* 19 */
   'T', 'Z', 'U', 'I', 'O', 'P', 252 /* ü */, '*', '\n',		/* Enter key */
     0,			/* 29   - Control */
   'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', 246 /* ö */,	/* 39 */
- 228/* ä */, '°',   0,		/* Left shift */
+ 228/* ä */, 0xB0 /* ° */,   0,		/* Left shift */
  0x27, 'Y', 'X', 'C', 'V', 'B', 'N',			/* 49 */
   'M', ';', ':', '_',   0,					/* Right shift */
   '*',
@@ -90,8 +90,8 @@ unsigned char kbdde_b[128] =
 };
 
 
-unsigned char last_key;
-unsigned char special_key = EOS;
+volatile unsigned char last_key;
+volatile unsigned char special_key = EOS;
 int shift = 0;
  
  void keyboard_handler(struct regs *r)

@@ -8,7 +8,7 @@
 #include <string.h>
 /* These define our textpointer, our background and foreground
 *  colors (attributes), and x and y cursor coordinates */
-unsigned short *textmemptr;
+volatile unsigned short *textmemptr;
 int attrib = 0x0F;
 int csr_x = 0, csr_y = 0;
 
@@ -27,11 +27,11 @@ void scroll(void)
         /* Move the current text chunk that makes up the screen
         *  back in the buffer by a line */
         temp = csr_y - 25 + 1;
-        memcpy (textmemptr, textmemptr + temp * 80, (25 - temp) * 80 * 2);
+        memcpy ((void *)textmemptr, (const void *)(textmemptr + temp * 80), (25 - temp) * 80 * 2);
 
         /* Finally, we set the chunk of memory that occupies
         *  the last line of text to our 'blank' character */
-        memsetw (textmemptr + (25 - temp) * 80, blank, 80);
+        memsetw ((unsigned short *)(textmemptr + (25 - temp) * 80), blank, 80);
         csr_y = 25 - 1;
     }
 	
@@ -77,7 +77,7 @@ void cls(void)
     /* Sets the entire screen to spaces in our current
     *  color */
     for(i = 0; i < 25; i++)
-        memsetw (textmemptr + i * 80, blank, 80);
+        memsetw ((unsigned short *)(textmemptr + i * 80), blank, 80);
 
     /* Update out virtual cursor, and then move the
     *  hardware cursor */
@@ -90,7 +90,7 @@ void cls(void)
 /* Puts a single character on the screen */
 void putch(unsigned char c)
 {
-    unsigned short *where;
+    volatile unsigned short *where;
     unsigned att = attrib << 8;
 
     /* Handle a backspace, by moving the cursor back one space */
@@ -165,7 +165,7 @@ void settextcolor(unsigned char forecolor, unsigned char backcolor)
 /* Sets our text-mode VGA pointer, then clears the screen for us */
 void init_video(void)
 {
-    textmemptr = (unsigned short *)0xB8000;
+    textmemptr = (volatile unsigned short *)0xB8000;
     cls();
 }
 
@@ -174,7 +174,9 @@ int printf(char * string, ...)
 	int i;
   int stringlen;
   int tmp;
-  
+  unsigned char uc;
+  unsigned char uc2;
+
 	va_list argzeiger;
 	va_start(argzeiger, string);
 		
@@ -227,36 +229,55 @@ int printf(char * string, ...)
       }
     else
       {
-        switch(string[i])
-        {
-          case 'Ä':
-            printf("\x8E");
-            break;
-          case 'ä':
-            printf("\x84");
-            break;
-          case 'Ö':
-            printf("\x99");
-            break;
-          case 'ö':
-            printf("\x94");
-            break;
-            
-          case 'Ü':
-            printf("\x9A");
-            break;
-          case 'ü':
-            printf("\x81");
-            break;
-            
-          case 'ß':
-            printf("\xE1");
-            break;
-          
-          default:
+        /* Umlauts are UTF-8 encoded: they all start with the lead
+        *  byte 0xC3, the following byte selects the character.
+        *  We translate them to their CP437 codes. */
+        uc = (unsigned char)string[i];
+        if(uc == 0xC3 && i < stringlen)
+          {
+            uc2 = (unsigned char)string[i+1];
+            switch(uc2)
+            {
+              case 0x84: /* AE */
+                putch(0x8E);
+                i++;
+                break;
+              case 0xA4: /* ae */
+                putch(0x84);
+                i++;
+                break;
+              case 0x96: /* OE */
+                putch(0x99);
+                i++;
+                break;
+              case 0xB6: /* oe */
+                putch(0x94);
+                i++;
+                break;
+              case 0x9C: /* UE */
+                putch(0x9A);
+                i++;
+                break;
+              case 0xBC: /* ue */
+                putch(0x81);
+                i++;
+                break;
+              case 0x9F: /* sz */
+                putch(0xE1);
+                i++;
+                break;
+
+              default:
+                /* Unknown sequence: emit the lead byte as-is and let
+                *  the next iteration handle the following byte. */
+                putch(uc);
+                break;
+            }
+          }
+        else
+          {
             putch(string[i]);
-        }        
-        //putch(string[i]);
+          }
       }
   }
 
@@ -271,7 +292,7 @@ void display_update_statusbar()
 	__asm__ __volatile__ ("cli");
 	int org_attrib = attrib;
 	
-	unsigned short *pos;
+	volatile unsigned short *pos;
 	int i=0, x=0;
 	int back=0x7;
 	
