@@ -99,4 +99,55 @@ extern uint32_t vmm_directory_phys(void);
 /* Faulting address of the last page fault, taken from CR2 by the handler. */
 extern uint32_t vmm_read_cr2(void);
 
+/* --- Address spaces ------------------------------------------------------
+*
+*  Every task can own a page directory. The upper quarter of it -- entries
+*  768..1023, i.e. everything from KERNEL_VIRTUAL_BASE up -- is SHARED with
+*  the kernel directory: the same page tables, not copies. That is what lets
+*  an interrupt or a system call run in any task's address space, since the
+*  kernel code, its data and the task's kernel stack stay mapped throughout.
+*
+*  The lower three quarters are private. Two tasks can hold the same virtual
+*  address with different contents, and neither can reach the other's.
+*
+*  Caveat worth knowing: sharing happens at directory-entry granularity. A
+*  kernel mapping inside an already existing table is visible everywhere at
+*  once, but a kernel mapping that needs a BRAND NEW page table would only
+*  land in the directory that was active at the time. All RAM is mapped up
+*  front by vmm_init(), so this does not arise today.
+*
+*  An address space is identified by the physical address of its directory,
+*  which is exactly the value CR3 takes.
+*/
+typedef uint32_t addrspace_t;
+
+/* The kernel's own address space, built by vmm_init(). */
+extern addrspace_t vmm_kernel_space(void);
+
+/* Fresh address space: kernel half shared, user half empty. 0 on failure. */
+extern addrspace_t vmm_create_space(void);
+
+/* Releases a space and every user-half frame and page table it owns. The
+*  kernel half is shared and must not be touched. Refuses the kernel space
+*  and the currently active one. */
+extern void vmm_destroy_space(addrspace_t space);
+
+/* Loads CR3. Safe from inside an interrupt handler because the kernel half
+*  is identical in every space -- code, stack and tables stay mapped across
+*  the switch. */
+extern void vmm_switch_space(addrspace_t space);
+extern addrspace_t vmm_current_space(void);
+
+/* Same as vmm_map/vmm_unmap/vmm_get_phys but for a space that is not the
+*  active one. Reaches the foreign tables through the direct mapping. */
+extern int vmm_map_in(addrspace_t space, uint32_t virt, uint32_t phys, uint32_t flags);
+extern int vmm_unmap_in(addrspace_t space, uint32_t virt);
+extern uint32_t vmm_get_phys_in(addrspace_t space, uint32_t virt);
+
+/* Non-zero if virt is mapped AND reachable from ring 3 in the active space,
+*  i.e. the PAGE_USER bit is set in both the directory and the table entry.
+*  This is the check a system call needs for a pointer it was handed: being
+*  mapped is not enough, the caller must actually be allowed to see it. */
+extern int vmm_is_user_mapped(uint32_t virt);
+
 #endif

@@ -212,6 +212,26 @@ int kernel(uint32_t magic, multiboot_info *mbi_phys)
 	*  mapped range, and all three must come before mt_install() so that
 	*  tasks can request memory as well.
 	*
+	*  Address spaces make that last point stricter rather than adding a step.
+	*  From mt_install() on, a task may own a page directory of its own, and
+	*  it shares only the upper quarter - everything from KERNEL_VIRTUAL_BASE
+	*  up - with the kernel space vmm_init() built. Sharing works at
+	*  directory-entry granularity (see vmm.h), so a kernel mapping that needs
+	*  a brand new page table would end up in the directory that happens to be
+	*  active and nowhere else. Every kernel page table must therefore exist
+	*  before the first task space is created:
+	*    - vmm_init() maps all usable RAM up front, so the kernel half is
+	*      complete the moment it returns. Nothing has to be inserted between
+	*      it and mt_install().
+	*    - heap_init(), and every later heap growth, only takes frames out of
+	*      that already mapped window via P2V() and never calls vmm_map(). It
+	*      adds no page table, which is why the heap stays visible in every
+	*      task space even though it keeps growing long after mt_install().
+	*  Anything added later that maps a fresh kernel range belongs here, in
+	*  front of mt_install(), for exactly this reason. vmm_create_space()
+	*  itself needs nothing but a ready pmm and the direct mapping, both of
+	*  which are in place well before the first task exists.
+	*
 	*  The kernel is linked for 0xC0100000 but loaded at 0x00100000, and by
 	*  the time this function runs it already executes from the higher half:
 	*  start.asm puts up a provisional mapping and jumps up there before
@@ -245,8 +265,11 @@ int kernel(uint32_t magic, multiboot_info *mbi_phys)
 	print_memory_map(mbi);
 	pmm_init(mbi);
 	vmm_init();
-	printf("Paging on: %i page tables, directory at 0x%X\n",
-		vmm_table_count(), vmm_directory_phys());
+	/* No extra line for the address space: the directory this prints IS the
+	*  kernel space, so naming it here costs nothing, while a second message
+	*  would cost one of the 25 rows the boot output has to fit into. */
+	printf("Paging on: %i page tables, kernel space 0x%X\n",
+		vmm_table_count(), vmm_kernel_space());
 	heap_init();
 	printf("%i MB Memory (%i KB) in %i Frames\n",
 		(pmm_total_bytes() / (1024u * 1024u)),

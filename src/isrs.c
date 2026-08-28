@@ -161,27 +161,46 @@ static char *hex32(uint32_t value, char *buf)
 	return buf;
 }
 
-/* Prints what the CPU tells us about a page fault: where it happened, which
-*  instruction caused it and what exactly was not allowed. cr2 is handed in
-*  instead of read here, so that the value is the one from the moment the
-*  exception was taken. */
-static void page_fault_report(struct regs *r, uint32_t cr2)
+/* Prints what the CPU tells us about a page fault: where it happened, in
+*  which address space, which instruction caused it and what exactly was not
+*  allowed. cr2 is handed in instead of read here, so that the value is the
+*  one from the moment the exception was taken.
+*
+*  The address alone stopped being an answer once tasks got their own page
+*  directories: below KERNEL_VIRTUAL_BASE the very same virtual address means
+*  something different in every space, so the report names the active space -
+*  the CR3 value, which is what identifies an address space (see vmm.h).
+*
+*  PF_USER decides how the whole thing reads. A fault from ring 3 is a task
+*  reaching outside what its own space maps, i.e. the isolation working as
+*  intended; a fault in the kernel is the kernel itself being wrong. Those
+*  are two different findings and must not look alike in the log.
+*
+*  space is handed in for the same reason as cr2: by the time this runs the
+*  task has already been aborted, and whoever cleans up after it may well
+*  have loaded a different CR3 in the meantime. */
+static void page_fault_report(struct regs *r, uint32_t cr2, addrspace_t space)
 {
 	char addr[11];
 	char eip[11];
+	char cr3[11];
 	unsigned int err;
+	int user;
 
 	err = r->err_code;
+	user = (err & PF_USER) != 0;
 
-	printf("Page fault at %s", hex32(cr2, addr));
-	printf(" (eip %s): ", hex32(r->eip, eip));
+	printf("%s page fault at %s", user ? "Ring 3" : "Kernel",
+	       hex32(cr2, addr));
+	printf(" (eip %s", hex32(r->eip, eip));
+	printf(", space %s)\n", hex32((uint32_t)space, cr3));
 
 	/* Bit 0 separates the two fundamentally different cases: nothing is
 	*  mapped there at all, or something is mapped but the access was not
 	*  permitted (e.g. a write to a read-only page). */
-	printf("%s, ", (err & PF_PROTECTION) ? "protection" : "not present");
+	printf("  %s, ", (err & PF_PROTECTION) ? "protection" : "not present");
 	printf("%s, ", (err & PF_WRITE) ? "write" : "read");
-	printf("%s", (err & PF_USER) ? "user" : "supervisor");
+	printf("%s", user ? "user" : "supervisor");
 
 	/* Both are rare and each has exactly one cause, so they are only
 	*  mentioned when they actually occurred. */
@@ -191,10 +210,15 @@ static void page_fault_report(struct regs *r, uint32_t cr2)
 
 	/* Page zero is deliberately never mapped (see vmm.h). Anything faulting
 	*  inside the first page is therefore a null pointer plus an offset - the
-	*  offset being the member or array index the code was reaching for. */
+	*  offset being the member or array index the code was reaching for.
+	*  That reading holds in every space and therefore comes first. */
 	if(cr2 < PAGE_SIZE)
 	{
 		printf("  -> NULL pointer dereference, offset %u\n", (int)cr2);
+	}
+	else if(user)
+	{
+		printf("  -> address not available to ring 3 here, no kernel bug\n");
 	}
 }
 
@@ -204,6 +228,7 @@ void fault_handler(struct regs *r)
 	int i;
 	struct regs *next;
 	uint32_t cr2;
+	addrspace_t space;
 	char eipbuf[11];
 
 	pid = taskmgr_get_currpid();
@@ -212,6 +237,13 @@ void fault_handler(struct regs *r)
 	*  overwrites it. Read it right away, before any printf() runs. It is
 	*  meaningless for every other exception and simply stays unused there. */
 	cr2 = vmm_read_cr2();
+
+	/* Same idea for the address space the fault happened in: the exception
+	*  entered the kernel through an interrupt gate, so CR3 is still the one
+	*  of the faulting task - but only until the task is aborted and the next
+	*  one is switched in. Below KERNEL_VIRTUAL_BASE the address in cr2 is
+	*  worth nothing without it. */
+	space = vmm_current_space();
 
 	/* If a running task trips over an exception, it is aborted and the
 	*  context is redirected to the next runnable task. If we simply returned
@@ -231,8 +263,9 @@ void fault_handler(struct regs *r)
 		       pid, exception_messages[r->int_no], r->err_code, eipbuf);
 
 		/* "Page Fault" alone says nothing about what went wrong, so the
-		*  decoded details follow directly below it. */
-		if(r->int_no == EXCEPTION_PAGE_FAULT) page_fault_report(r, cr2);
+		*  decoded details follow directly below it - including which
+		*  address space the task was running in. */
+		if(r->int_no == EXCEPTION_PAGE_FAULT) page_fault_report(r, cr2, space);
 
 		settextcolor(15,0);
 
@@ -296,8 +329,9 @@ void fault_handler(struct regs *r)
 	  printf("Error code %i\nError: %s\n", r->err_code, exception_messages[r->int_no]);
 
 	  /* Same here: for a page fault the generic name is replaced by the
-	  *  address, the instruction and the decoded error code. */
-	  if(r->int_no == EXCEPTION_PAGE_FAULT) page_fault_report(r, cr2);
+	  *  address, the active space, the instruction and the decoded error
+	  *  code. */
+	  if(r->int_no == EXCEPTION_PAGE_FAULT) page_fault_report(r, cr2, space);
 
 	  printf("\nPID: %i\n", pid);
 	  printf("CPU HALT\n");

@@ -69,10 +69,19 @@
 #define USER_MSG_BYE     (USER_PAGE_VIRT + 0x0C0)
 #define USER_MSG_TEST    (USER_PAGE_VIRT + 0x100)
 
+/* The pieces the isolation tasks print. Both tasks read them from the same
+   frame -- that page is shared on purpose, unlike the one they write to. */
+#define USER_MSG_ISO_PID   (USER_PAGE_VIRT + 0x140)
+#define USER_MSG_ISO_WROTE (USER_PAGE_VIRT + 0x180)
+#define USER_MSG_ISO_AND   (USER_PAGE_VIRT + 0x1C0)
+#define USER_MSG_ISO_READ  (USER_PAGE_VIRT + 0x200)
+#define USER_MSG_ISO_OWN   (USER_PAGE_VIRT + 0x240)
+#define USER_MSG_ISO_LOST  (USER_PAGE_VIRT + 0x280)
+
 /* Pages of kernel text that user_setup() opens for ring 3, counted from the
-   page user_demo() starts in. The routine is a few hundred bytes long, so it
-   fits in one page and can at worst straddle one boundary -- two pages cover
-   it either way. */
+   page a ring 3 routine starts in. Each of them is well under 4 KiB long, so
+   it fits in one page and can at worst straddle one boundary -- two pages
+   cover it either way. */
 #define USER_TEXT_PAGES  2
 
 /* A call number that is not in the table, for the SYS_ENOSYS check. Well
@@ -81,10 +90,71 @@
 
 #define USER_DEMO_SLEEP  120  /* ms the ring 3 demo sleeps */
 #define USER_TEST_SLEEP  50   /* ms "user -t" sleeps       */
-#define USER_DEMO_WAIT   500  /* ms the shell waits for the demo to finish */
+#define USER_DEMO_WAIT   800  /* ms the shell waits for the demo to finish */
 
-/* tasks.c grew this alongside taskmgr_add_task(); system.h has not caught up
-   yet, and this file may not edit headers. Same signature as there. */
+/* --- address spaces ----------------------------------------------------- */
+
+/* Every ring 3 task now runs in a page directory of its own, of which only
+*  the quarter from KERNEL_VIRTUAL_BASE up is shared with the kernel (see the
+*  address space block in vmm.h). Everything below that -- the string page,
+*  the test page, the task's stack -- is private to one task.
+*
+*  That has a direct consequence for this file: a vmm_map() done here maps
+*  into the SHELL's directory, and a ring 3 task will not see it. Pages a task
+*  is meant to have are therefore put into the task's own space with
+*  vmm_map_in(), which needs the space, which in turn only exists once the
+*  task exists. So every ring 3 routine below begins with a sleep, long enough
+*  for the shell to furnish its address space while it waits.
+*
+*  How the shell learns which space a task got: it watches. vmm_current_space()
+*  reads CR3, so calling it inside a timer interrupt that hit a given task
+*  yields exactly that task's directory -- the interrupt handler runs before
+*  schedule() and therefore still in the interrupted task's address space. See
+*  user_space_probe(). No task manager bookkeeping is needed for it, and the
+*  identifier printed for a task is the very value vmm_current_space() returned
+*  while that task was on the CPU. */
+
+/* ms a fresh ring 3 task waits before touching any of its own pages. Has to
+*  outlast the shell's side of the handover, i.e. the waiting below for as
+*  many tasks as one command starts -- two of them, so 2 * USER_SPACE_WAIT,
+*  plus room for the mapping itself. */
+#define USER_MAP_DELAY   500
+
+/* How long, and how finely, the shell waits for a task's space to show up.
+*  A task that has been started is normally on the CPU within a tick or two;
+*  the limit only exists so a task that never runs cannot hang the shell. */
+#define USER_SPACE_WAIT  150
+#define USER_SPACE_POLL  10
+
+/* --- isolation test ----------------------------------------------------- */
+
+/* The one virtual address BOTH isolation tasks use. One page above the string
+*  page, so still in the private lower three quarters, and mapped in each
+*  task's own directory to a frame of its own. Two tasks holding this address
+*  with different contents is the property the whole test is about. */
+#define USER_ISO_VIRT    0x40001000u
+
+/* Word indices inside that page. The cell is what a task writes and reads
+*  back. Role and value are parameters: the shell writes them into each frame
+*  through the direct mapping before the task starts, so the two tasks find
+*  different numbers at the same address before they have executed a single
+*  instruction -- the first thing the test demonstrates. */
+#define USER_ISO_CELL    0
+#define USER_ISO_ROLE    1
+#define USER_ISO_VALUE   2
+
+/* One task writes 111111 and then 111112, the other 222222 and then 222223.
+*  Far apart, so a clobbered read-back is obvious in the output. */
+#define USER_ISO_VALUE_A 111111u
+#define USER_ISO_VALUE_B 222222u
+
+/* Length of one step of the interleaving schedule, see user_iso_task(). */
+#define USER_ISO_STEP    100
+
+/* ms the shell waits for both tasks to finish. The later task is done after
+*  USER_MAP_DELAY + 5 steps = 1000 ms, counted from its start, and the shell
+*  begins this wait at most 300 ms into that. */
+#define USER_ISO_WAIT    1200
 
 void update_infobar() {
 	while(1)
@@ -120,9 +190,11 @@ static void page_fault_demo(void);
 static void page_check(int ok);
 
 static void user_demo(void);
+static void user_iso_task(void);
 static int  user_setup(void);
 static void user_run(void);
 static void user_selftest(void);
+static void user_isolation(void);
 static void user_check(int ok);
 
 /* Self-test counters, maintained by mem_check(). */
@@ -915,12 +987,20 @@ USER_INLINE void u_putuint(unsigned int value)
 *  a number.
 *
 *  The other rule is that this function must not return: a freshly built user
-*  stack has no return address on it. SYS_EXIT is the way out. */
+*  stack has no return address on it. SYS_EXIT is the way out.
+*
+*  Since tasks got address spaces of their own, the string page is no longer
+*  there when this task starts: it is mapped in the shell's directory, and
+*  this task has its own. The shell puts it into this task's space while the
+*  sleep below runs -- SYS_SLEEP needs no memory beyond the stack, so it is
+*  the one call that is safe to make before that has happened. */
 static void user_demo(void)
 {
 	int pid;
 	int before;
 	int after;
+
+	u_sleep(USER_MAP_DELAY);
 
 	u_write((char *)USER_MSG_HELLO);
 
@@ -941,6 +1021,91 @@ static void user_demo(void)
 
 	/* Not reached. If SYS_EXIT ever did come back, spinning here is still
 	   better than returning into nothing. */
+	for(;;);
+}
+
+/* The ring 3 half of the isolation test. Both tasks run THIS function -- what
+*  makes them behave differently is not their code but what they find at
+*  USER_ISO_VIRT, and that is the point: the same instructions, reading the
+*  same address, get different numbers, because the two tasks look at
+*  different frames.
+*
+*  The schedule is built so that the writes of the two tasks fall between each
+*  other's write and read-back. With one step of USER_ISO_STEP ms, and the
+*  second task starting one step late:
+*
+*      t = 0    task A writes A
+*      t = 1    task B writes B
+*      t = 2    task A reads back -- and writes A + 1
+*      t = 3    task B reads back -- and writes B + 1
+*      t = 4    task A reads back
+*      t = 5    task B reads back
+*
+*  On one shared page every single one of those four read-backs would return
+*  the value the *other* task wrote in the meantime: A would read B at t = 2,
+*  B would read A + 1 at t = 3, and so on. There is no ordering of two tasks
+*  sharing one page in which all four read-backs still return their own value,
+*  so the test cannot pass by luck of scheduling -- it can only pass if the
+*  two writes went to two different frames.
+*
+*  Sleeping is what buys that ordering: SYS_SLEEP waits for wall clock time,
+*  not for a time slice, so "the other task has written by now" is true even
+*  if the scheduler runs the two tasks in a lopsided way.
+*
+*  Everything else follows the rules user_demo() lays out: strings come out of
+*  the string page, the routine never returns, and it must not touch a page
+*  before the shell has mapped it -- hence the sleep at the top. */
+static void user_iso_task(void)
+{
+	volatile uint32_t *page;
+	unsigned int role;
+	unsigned int value;
+	unsigned int first;
+	unsigned int second;
+	int ok;
+
+	u_sleep(USER_MAP_DELAY);
+
+	page = (volatile uint32_t *)USER_ISO_VIRT;
+	role = page[USER_ISO_ROLE];
+	value = page[USER_ISO_VALUE];
+
+	/* The second task starts one step later than the first, so that the two
+	   writes end up between each other's write and read-back. */
+	if(role != 0) u_sleep(USER_ISO_STEP);
+
+	page[USER_ISO_CELL] = value;
+	u_sleep(2 * USER_ISO_STEP);
+	first = page[USER_ISO_CELL];
+
+	page[USER_ISO_CELL] = value + 1;
+	u_sleep(2 * USER_ISO_STEP);
+	second = page[USER_ISO_CELL];
+
+	ok = (first == value && second == value + 1);
+
+	u_write((char *)USER_MSG_ISO_PID);
+	u_putuint((unsigned int)u_getpid());
+	u_write((char *)USER_MSG_ISO_WROTE);
+	u_putuint(value);
+	u_write((char *)USER_MSG_ISO_AND);
+	u_putuint(value + 1);
+	u_write((char *)USER_MSG_ISO_READ);
+	u_putuint(first);
+	u_write((char *)USER_MSG_ISO_AND);
+	u_putuint(second);
+
+	if(ok)
+	{
+		u_write((char *)USER_MSG_ISO_OWN);
+	} else {
+		u_write((char *)USER_MSG_ISO_LOST);
+	}
+
+	/* The status is what the task manager records for the slot, so the
+	   verdict survives the task -- "taskmgr -l" shows it. */
+	u_exit(ok ? 0 : 1);
+
 	for(;;);
 }
 
@@ -983,12 +1148,39 @@ static void user_store(uint32_t at, char *text)
 *  from ring 3 as well. A grown-up kernel links user code into a section of its
 *  own and maps only that. What is deliberately *not* opened is .rodata -- the
 *  strings stay in the user page precisely so this stays a text-only exception. */
-static int user_setup(void)
+/* Opens the pages holding one ring 3 routine for CPL 3. Called once per such
+*  routine, because the linker is free to place them anywhere in .text -- two
+*  functions next to each other in this file need not end up in the same page,
+*  and overlapping calls simply re-write the same entry with the same flags.
+*
+*  Kernel text sits above KERNEL_VIRTUAL_BASE, i.e. in the quarter every
+*  address space shares, so one vmm_map() here is visible to every task. */
+static int user_open_text(uint32_t addr)
 {
 	uint32_t page;
 	uint32_t phys;
 	int i;
 
+	page = addr & ~((uint32_t)PAGE_SIZE - 1);
+
+	for(i = 0; i < USER_TEXT_PAGES; i++)
+	{
+		phys = vmm_get_phys(page);
+		if(phys == 0 || vmm_map(page, phys, PAGE_PRESENT | PAGE_USER) != 0)
+		{
+			printf("user: kernel text at ");
+			page_print_hex(page, 8);
+			printf(" could not be opened for ring 3.\n");
+			return 0;
+		}
+		page += PAGE_SIZE;
+	}
+
+	return 1;
+}
+
+static int user_setup(void)
+{
 	if(user_page_ready) return 1;
 
 	if(!vmm_enabled())
@@ -1021,22 +1213,155 @@ static int user_setup(void)
 	user_store(USER_MSG_BYE,   " ms, now exit(0).\n");
 	user_store(USER_MSG_TEST,  "SYS_WRITE through a user page\n");
 
-	page = (uint32_t)user_demo & ~((uint32_t)PAGE_SIZE - 1);
-	for(i = 0; i < USER_TEXT_PAGES; i++)
-	{
-		phys = vmm_get_phys(page);
-		if(phys == 0 || vmm_map(page, phys, PAGE_PRESENT | PAGE_USER) != 0)
-		{
-			printf("user: kernel text at ");
-			page_print_hex(page, 8);
-			printf(" could not be opened for ring 3.\n");
-			return 0;
-		}
-		page += PAGE_SIZE;
-	}
+	user_store(USER_MSG_ISO_PID,   "[ring 3] pid ");
+	user_store(USER_MSG_ISO_WROTE, " wrote ");
+	user_store(USER_MSG_ISO_AND,   " and ");
+	user_store(USER_MSG_ISO_READ,  ", read back ");
+	user_store(USER_MSG_ISO_OWN,   " -- own values throughout\n");
+	user_store(USER_MSG_ISO_LOST,  " -- CLOBBERED, the page is shared!\n");
+
+	if(!user_open_text((uint32_t)user_demo)) return 0;
+	if(!user_open_text((uint32_t)user_iso_task)) return 0;
 
 	user_page_ready = 1;
 	return 1;
+}
+
+/* --- handing pages to a task -------------------------------------------- */
+
+/* Which address space a task runs in, sampled from the timer interrupt.
+*  Filled in by user_space_probe() below, read by user_space_wait(). */
+#define USER_SPACE_SLOTS 2
+
+static volatile int user_watch_pid[USER_SPACE_SLOTS] = { -1, -1 };
+static volatile uint32_t user_watch_space[USER_SPACE_SLOTS] = { 0, 0 };
+static int user_watch_active = 0;
+
+/* Timer handler, so it runs on every tick, in the context of whatever task
+*  the tick interrupted -- irq_handler() calls the installed handlers before
+*  schedule(), so CR3 and taskmgr_get_currpid() both still describe that task
+*  and not the one that will run next. vmm_current_space() called here
+*  therefore returns the directory of the interrupted task, which is how the
+*  shell learns the identifier of a task other than itself.
+*
+*  A slot is written once and then left alone, so the value cannot change
+*  under the reader. */
+static void user_space_probe(struct regs *r)
+{
+	int pid;
+	int i;
+
+	(void)r;
+
+	pid = taskmgr_get_currpid();
+	if(pid < 0) return;
+
+	for(i = 0; i < USER_SPACE_SLOTS; i++)
+	{
+		if(user_watch_pid[i] == pid && user_watch_space[i] == 0)
+		{
+			user_watch_space[i] = (uint32_t)vmm_current_space();
+		}
+	}
+}
+
+/* Arms a slot for a pid. Must happen before the task is started, otherwise
+*  the task could run past its opening sleep unobserved. The handler is
+*  installed once for however many slots are armed, so it stays one call per
+*  tick no matter how many tasks are being watched. */
+static void user_watch_arm(int slot, int pid)
+{
+	user_watch_pid[slot] = pid;
+	user_watch_space[slot] = 0;
+
+	if(!user_watch_active)
+	{
+		if(timer_install_handler(user_space_probe) < 0)
+		{
+			printf("user: no free timer handler -- address spaces stay unknown.\n");
+			return;
+		}
+		user_watch_active = 1;
+	}
+}
+
+static void user_watch_stop(void)
+{
+	int i;
+
+	if(user_watch_active) timer_uninstall_handler(user_space_probe);
+	user_watch_active = 0;
+
+	for(i = 0; i < USER_SPACE_SLOTS; i++)
+	{
+		user_watch_pid[i] = -1;
+		user_watch_space[i] = 0;
+	}
+}
+
+/* Waits until the task in that slot has been seen on the CPU, at most
+*  USER_SPACE_WAIT ms. Sleeping is what lets it get there in the first place.
+*  Returns 0 if the task never ran -- the caller then has nothing to map into
+*  and says so instead of guessing. */
+static addrspace_t user_space_wait(int slot)
+{
+	int waited;
+
+	for(waited = 0; waited < USER_SPACE_WAIT; waited += USER_SPACE_POLL)
+	{
+		if(user_watch_space[slot] != 0) break;
+		sleep(USER_SPACE_POLL);
+	}
+
+	return (addrspace_t)user_watch_space[slot];
+}
+
+/* Hands a page to a task, at the same address the shell knows it by. Returns
+*  1 on success.
+*
+*  A space of 0 means the task was never seen on the CPU, so there is no
+*  directory to map into and no amount of trying will produce one -- refused
+*  here rather than passed to vmm_map_in(), which would take the 0 for a
+*  physical address and walk a directory that is not there.
+*
+*  The shell's own space is deliberately NOT refused: if the task manager ever
+*  handed out no separate directories at all, mapping both test pages there is
+*  what makes the failure visible instead of turning it into a page fault. */
+static int user_open_page(addrspace_t space, uint32_t virt, uint32_t phys,
+                          uint32_t flags)
+{
+	if(space == 0) return 0;
+
+	return vmm_map_in(space, virt, phys, flags) == 0;
+}
+
+/* vmm_get_phys_in() for a space that may not exist. A space of 0 is not an
+*  empty directory but no directory at all, and handing that number on would
+*  have the walk start at P2V(0), i.e. in the middle of the kernel window --
+*  it would read something, which is worse than reading nothing. */
+static uint32_t user_phys_in(addrspace_t space, uint32_t virt)
+{
+	if(space == 0) return 0;
+
+	return vmm_get_phys_in(space, virt);
+}
+
+/* Takes a page back out of a task's space once the task is done with it.
+*
+*  Not politeness: vmm_destroy_space() frees every frame it finds in the user
+*  half, and the string page belongs to the shell, not to the task. Leaving it
+*  mapped in a dying task's directory would have the frame freed underneath
+*  the shell. The check makes sure we only remove what we put there.
+*
+*  The shell's own space is refused outright: pages are only ever handed to a
+*  foreign directory, so a match there would be the shell's own mapping and
+*  removing it would be a bug, not a cleanup. */
+static void user_close_page(addrspace_t space, uint32_t virt, uint32_t phys)
+{
+	if(space == 0 || space == vmm_current_space()) return;
+	if(user_phys_in(space, virt) != phys) return;
+
+	vmm_unmap_in(space, virt);
 }
 
 /* "user": start the demo and say what came of it. The demo is a task of its
@@ -1045,6 +1370,7 @@ static int user_setup(void)
    reports what the syscall counter saw in the meantime. */
 static void user_run(void)
 {
+	addrspace_t space;
 	uint32_t before;
 	uint32_t after;
 	int pid;
@@ -1057,19 +1383,45 @@ static void user_run(void)
 	printf("  kernel text, opened for ring 3\n");
 	printf("  Strings: ");
 	page_print_hex((uint32_t)USER_PAGE_VIRT, 8);
-	printf("  user page, PAGE_USER | PAGE_WRITE\n");
+	printf("  user page, writable here, read only in the task\n");
 
 	before = syscall_count();
 
 	pid = taskmgr_add_user_task(user_demo, "Ring 3 Demo", TASK_PRIORITY_NORMAL);
 	if(pid < 0) return;
 
+	user_watch_arm(0, pid);
 	taskmgr_task_start(pid);
 	printf("  Task %i started in ring 3, waiting for it to exit.\n", pid);
 
-	/* Its own sleep plus a margin, so the shell is back at the prompt only
+	/* The demo opens with a sleep; this is the window in which its string
+	   page is put into its own address space. Read only -- the demo prints
+	   the strings, it does not write them. */
+	space = user_space_wait(0);
+	user_watch_stop();
+
+	printf("  Space:   ");
+	page_print_hex((uint32_t)space, 8);
+	if(space == 0)
+	{
+		printf("  the task never reached the CPU\n");
+	}
+	else if(space == vmm_current_space())
+	{
+		printf("  the shell's own space -- no separation here\n");
+	} else {
+		printf("  private to task %i, string page mapped into it\n", pid);
+		user_open_page(space, (uint32_t)USER_PAGE_VIRT, user_page_frame,
+		               PAGE_PRESENT | PAGE_USER);
+	}
+
+	/* Its own sleeps plus a margin, so the shell is back at the prompt only
 	   after the demo has run its course. */
 	sleep(USER_DEMO_WAIT);
+
+	/* The shell keeps that frame, so it must not stay in a directory that
+	   will be torn down with the task -- see user_close_page(). */
+	user_close_page(space, (uint32_t)USER_PAGE_VIRT, user_page_frame);
 
 	after = syscall_count();
 	printf("  Back in the shell, %u system calls served in between.\n",
@@ -1195,7 +1547,19 @@ static void user_selftest(void)
 	page_print_hex((uint32_t)kernel_text, 8);
 	printf(") = %i, kernel memory stayed unread\n", fault);
 
-	/* 8. All of the above went through the one entry point, so the kernel's
+	/* 8. The rule the previous check enforces, asked of the page tables
+	      directly: reachable from ring 3 means present AND PAGE_USER in both
+	      the directory and the table entry, which is what
+	      vmm_is_user_mapped() answers. The string page has that bit, kernel
+	      text does not -- and that is the difference between a pointer a
+	      system call may follow and one it must refuse. */
+	user_check(vmm_is_user_mapped((uint32_t)USER_PAGE_VIRT) &&
+	           !vmm_is_user_mapped((uint32_t)kernel_text));
+	printf("vmm_is_user_mapped: user page %i, kernel memory %i\n",
+	       vmm_is_user_mapped((uint32_t)USER_PAGE_VIRT),
+	       vmm_is_user_mapped((uint32_t)kernel_text));
+
+	/* 9. All of the above went through the one entry point, so the kernel's
 	      own counter must have moved by at least the ten calls made here. */
 	after = syscall_count();
 	user_check(after >= before + 10);
@@ -1204,6 +1568,240 @@ static void user_selftest(void)
 	printf("  Result: %i of %i checks passed\n",
 	       user_tests_ok, user_tests_run);
 	printf("  Not covered: SYS_EXIT -- from ring 0 it would end the shell.\n");
+	printf("  Not covered: address space separation -- \"user -i\" does that.\n");
+}
+
+/* "user -i".
+*
+*  A separate subcommand rather than another block inside "user -t", for the
+*  reason "user -t" states about itself: those checks are issued from ring 0
+*  and deliberately prove nothing about the privilege drop. This one is the
+*  opposite in every respect -- it starts two real ring 3 tasks, takes a good
+*  second and a half of wall clock time, and its verdict comes out of what
+*  those tasks read back rather than out of a return value. Folding the two
+*  together would blur exactly the distinction the self-test is careful to
+*  make, and would make the quick check slow.
+*
+*  The shape of the test:
+*
+*    - two tasks, one function, one virtual address, two frames
+*    - each writes its own value and reads it back while the other writes
+*    - the shell states the property directly: vmm_get_phys_in() on the two
+*      spaces must return different frames for that one address
+*    - and confirms afterwards, from the kernel side, that each frame really
+*      holds the value of the task that owns it
+*
+*  If separation were silently absent, this does not merely fail to prove
+*  anything -- it fails loudly: both tasks would report CLOBBERED, the two
+*  frame numbers would be equal, and the shell would find the second task's
+*  value in the first task's page. */
+static void user_isolation(void)
+{
+	addrspace_t space_a;
+	addrspace_t space_b;
+	addrspace_t shell;
+	volatile uint32_t *page_a;
+	volatile uint32_t *page_b;
+	uint32_t frame_a;
+	uint32_t frame_b;
+	uint32_t phys_a;
+	uint32_t phys_b;
+	uint32_t shared_a;
+	uint32_t shared_b;
+	int pid_a;
+	int pid_b;
+	int mapped;
+
+	user_tests_run = 0;
+	user_tests_ok = 0;
+
+	printf("Address space isolation test:\n");
+
+	if(!user_setup()) return;
+
+	frame_a = (uint32_t)pmm_alloc_frame();
+	frame_b = (uint32_t)pmm_alloc_frame();
+	if(frame_a == 0 || frame_b == 0)
+	{
+		printf("  No free frames for the two test pages.\n");
+		pmm_free_frame((void *)frame_a);
+		pmm_free_frame((void *)frame_b);
+		return;
+	}
+
+	/* Both frames are prepared through the direct mapping, i.e. from the
+	   kernel window at P2V(frame). No user mapping is needed for that, and
+	   the same window is how the results are read back at the end -- the
+	   shell never needs the test address in its own space, which is the
+	   first thing the property means. */
+	page_a = (volatile uint32_t *)P2V(frame_a);
+	page_b = (volatile uint32_t *)P2V(frame_b);
+	memset((void *)page_a, (char)0, (size_t)PAGE_SIZE);
+	memset((void *)page_b, (char)0, (size_t)PAGE_SIZE);
+
+	page_a[USER_ISO_ROLE] = 0;
+	page_a[USER_ISO_VALUE] = (uint32_t)USER_ISO_VALUE_A;
+	page_b[USER_ISO_ROLE] = 1;
+	page_b[USER_ISO_VALUE] = (uint32_t)USER_ISO_VALUE_B;
+
+	pid_a = taskmgr_add_user_task(user_iso_task, "Ring 3 Isolation A",
+	                              TASK_PRIORITY_NORMAL);
+	pid_b = taskmgr_add_user_task(user_iso_task, "Ring 3 Isolation B",
+	                              TASK_PRIORITY_NORMAL);
+	if(pid_a < 0 || pid_b < 0)
+	{
+		if(pid_a >= 0) taskmgr_task_abort(pid_a, 0, "isolation test not started");
+		if(pid_b >= 0) taskmgr_task_abort(pid_b, 0, "isolation test not started");
+		pmm_free_frame((void *)frame_a);
+		pmm_free_frame((void *)frame_b);
+		return;
+	}
+
+	printf("  Address:  ");
+	page_print_hex((uint32_t)USER_ISO_VIRT, 8);
+	printf("  used by both tasks\n");
+	printf("  Task %i writes %u, task %i writes %u -- one page each\n",
+	       pid_a, (int)USER_ISO_VALUE_A, pid_b, (int)USER_ISO_VALUE_B);
+	printf("  Each writes, sleeps while the other writes, then reads back.\n");
+
+	/* Both tasks open with a sleep, so they are on the CPU -- and their
+	   directories therefore observable -- before they touch any of their
+	   pages. */
+	user_watch_arm(0, pid_a);
+	user_watch_arm(1, pid_b);
+	taskmgr_task_start(pid_a);
+	taskmgr_task_start(pid_b);
+
+	space_a = user_space_wait(0);
+	space_b = user_space_wait(1);
+	user_watch_stop();
+	shell = vmm_current_space();
+
+	/* 1. Two tasks, two directories. Every check below rests on this one, so
+	      it is stated before anything is mapped. */
+	user_check(space_a != 0 && space_b != 0 && space_a != space_b);
+	printf("Task %i in space ", pid_a);
+	page_print_hex((uint32_t)space_a, 8);
+	printf(", task %i in ", pid_b);
+	page_print_hex((uint32_t)space_b, 8);
+	printf("\n");
+
+	/* 2. And neither of them is the one the shell runs in, which is the
+	      kernel's. */
+	user_check(shell == vmm_kernel_space() && space_a != shell &&
+	           space_b != shell);
+	printf("Shell in ");
+	page_print_hex((uint32_t)shell, 8);
+	printf(" = vmm_kernel_space(), neither task is\n");
+
+	/* The two pages every task needs: its own test page, writable, and the
+	   string page it prints through, read only -- it reads those strings, it
+	   has no business writing them. */
+	mapped = 1;
+	if(!user_open_page(space_a, (uint32_t)USER_ISO_VIRT, frame_a,
+	                   PAGE_PRESENT | PAGE_WRITE | PAGE_USER)) mapped = 0;
+	if(!user_open_page(space_b, (uint32_t)USER_ISO_VIRT, frame_b,
+	                   PAGE_PRESENT | PAGE_WRITE | PAGE_USER)) mapped = 0;
+	if(!user_open_page(space_a, (uint32_t)USER_PAGE_VIRT, user_page_frame,
+	                   PAGE_PRESENT | PAGE_USER)) mapped = 0;
+	if(!user_open_page(space_b, (uint32_t)USER_PAGE_VIRT, user_page_frame,
+	                   PAGE_PRESENT | PAGE_USER)) mapped = 0;
+
+	/* 3. The property itself, stated as plainly as it can be: one virtual
+	      address, translated in two address spaces, must come out as two
+	      different physical frames. */
+	phys_a = user_phys_in(space_a, (uint32_t)USER_ISO_VIRT);
+	phys_b = user_phys_in(space_b, (uint32_t)USER_ISO_VIRT);
+	user_check(mapped && phys_a == frame_a && phys_b == frame_b &&
+	           phys_a != phys_b);
+	printf("One address, two frames: ");
+	page_print_hex(phys_a, 8);
+	printf(" and ");
+	page_print_hex(phys_b, 8);
+	printf("\n");
+
+	/* 4. The control for it. The string page is mapped into both spaces on
+	      purpose, at the same address and from the same frame -- so
+	      vmm_get_phys_in() returning two different numbers above is a real
+	      difference between the spaces and not the function answering
+	      differently for each of them. Sharing is a decision here, not the
+	      default. */
+	shared_a = user_phys_in(space_a, (uint32_t)USER_PAGE_VIRT);
+	shared_b = user_phys_in(space_b, (uint32_t)USER_PAGE_VIRT);
+	user_check(mapped && shared_a == user_page_frame &&
+	           shared_b == user_page_frame);
+	printf("String page shared on purpose: both show ");
+	page_print_hex(shared_a, 8);
+	printf("\n");
+
+	/* 5. And the shell, in its own space, has nothing at that address at
+	      all -- the test page exists twice without existing here once. */
+	user_check(!vmm_is_mapped((uint32_t)USER_ISO_VIRT) &&
+	           vmm_get_phys((uint32_t)USER_ISO_VIRT) == 0);
+	printf("Nothing mapped at ");
+	page_print_hex((uint32_t)USER_ISO_VIRT, 8);
+	printf(" in the shell's space\n");
+
+	if(!mapped)
+	{
+		printf("  The test pages could not be mapped -- stopping both tasks.\n");
+		taskmgr_task_abort(pid_a, 0, "isolation test setup failed");
+		taskmgr_task_abort(pid_b, 0, "isolation test setup failed");
+	} else {
+		printf("  Both tasks are waiting for their page, letting them run:\n");
+
+		/* The two ring 3 lines appear during this sleep, as does the task
+		   manager's note about each exit. */
+		sleep(USER_ISO_WAIT);
+
+		/* 6. What the tasks said, checked from the kernel side rather than
+		      taken on trust: each frame has to hold the last value ITS task
+		      wrote. Read through the direct mapping, so this looks at the
+		      frames themselves, not at either task's view of them. */
+		user_check(page_a[USER_ISO_CELL] == (uint32_t)USER_ISO_VALUE_A + 1 &&
+		           page_b[USER_ISO_CELL] == (uint32_t)USER_ISO_VALUE_B + 1);
+		printf("Frames hold %u and %u, each its own task's last write\n",
+		       (int)page_a[USER_ISO_CELL], (int)page_b[USER_ISO_CELL]);
+	}
+
+	/* Both tasks are done with their pages, so the pages come back out of
+	   their directories before anything can tear those down with the frames
+	   still in them. */
+	user_close_page(space_a, (uint32_t)USER_ISO_VIRT, frame_a);
+	user_close_page(space_b, (uint32_t)USER_ISO_VIRT, frame_b);
+	user_close_page(space_a, (uint32_t)USER_PAGE_VIRT, user_page_frame);
+	user_close_page(space_b, (uint32_t)USER_PAGE_VIRT, user_page_frame);
+
+	/* Only reachable if there were no separate spaces to map into: then the
+	   test page landed in the shell's own directory. */
+	if(vmm_get_phys((uint32_t)USER_ISO_VIRT) == frame_a ||
+	   vmm_get_phys((uint32_t)USER_ISO_VIRT) == frame_b)
+	{
+		vmm_unmap((uint32_t)USER_ISO_VIRT);
+	}
+
+	pmm_free_frame((void *)frame_a);
+	pmm_free_frame((void *)frame_b);
+
+	printf("  Result: %i of %i checks passed\n",
+	       user_tests_ok, user_tests_run);
+
+	if(user_tests_ok == user_tests_run)
+	{
+		printf("  Proven: two ring 3 tasks held one virtual address at the same\n");
+		printf("  time, each read back only its own writes while the other was\n");
+		printf("  writing to that address, and the frames behind it differ.\n");
+	} else {
+		printf("  Proven: nothing -- a check above failed, so whatever the two\n");
+		printf("  tasks printed says nothing about separate address spaces.\n");
+	}
+
+	printf("  Not proven either way: that nothing else leaks between the two.\n");
+	printf("  One page was tested, the quarter above ");
+	page_print_hex((uint32_t)KERNEL_VIRTUAL_BASE, 8);
+	printf(" is shared by\n");
+	printf("  design, and both tasks are kernel routines opened for ring 3\n");
+	printf("  rather than programs loaded from anywhere.\n");
 }
 
 void usermode(char *cmd)
@@ -1221,10 +1819,16 @@ void usermode(char *cmd)
 	if(strcmp(opt, "-t") == 0)
 	{
 		user_selftest();
+	}
+	else if(strcmp(opt, "-i") == 0)
+	{
+		user_isolation();
 	} else {
-		printf("Syntax: user [-t]\n");
+		printf("Syntax: user [-t] [-i]\n");
 		printf("\t          Run the ring 3 demo\n");
 		printf("\t-t        Run the system call self-test\n");
+		printf("\t-i        Run the address space isolation test:\n");
+		printf("\t          two ring 3 tasks, one address, two pages\n");
 	}
 }
 
@@ -1237,7 +1841,8 @@ void help(void)
 	printf("\tstart     Start a test task\n");
 	printf("\tmem       Show memory usage, mem -t tests the heap\n");
 	printf("\tpage      Show paging state, page -t tests paging\n");
-	printf("\tuser      Run the ring 3 demo, user -t tests the system calls\n");
+	printf("\tuser      Ring 3 demo, user -t tests the system calls,\n");
+	printf("\t          user -i tests the address space isolation\n");
 	printf("\treboot    Restart the computer\n");
 	printf("\texit      Exit the shell\n");
 }

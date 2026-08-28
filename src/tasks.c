@@ -18,6 +18,13 @@
 *  addresses - where a user program image would eventually be loaded - clear,
 *  and it is the classic layout of code low / stack high.
 *
+*  Every ring 3 task now runs in an address space of its own, so two tasks
+*  could just as well put their stack at the very same virtual address without
+*  ever seeing each other. The per slot layout below is kept anyway: it costs
+*  nothing, it keeps a stack address unique across the system - which makes a
+*  page fault report readable, since the faulting address alone names the slot
+*  - and it survives a task deciding to share memory with another one later.
+*
 *  Every task owns an 8 KiB slot of which only the upper 4 KiB are mapped. The
 *  unmapped lower half is a guard page: a task that runs its stack over the
 *  edge hits a page fault instead of silently scribbling into the stack of the
@@ -47,9 +54,26 @@ task_settings tasks[MAX_TASKS];
 *  is accessed as struct regs, i.e. as 32 bit words. */
 static uint8_t task_kernel_stacks[MAX_TASKS][KERNEL_STACK_SIZE] __attribute__((aligned(16)));
 
-/* Physical frame backing the user stack of a slot, 0 when the slot has none.
-*  Doubles as the "this slot belongs to a ring 3 task" marker. */
-static uint32_t user_stack_frame[MAX_TASKS];
+/* The address space a slot runs in, or 0 for "the kernel space".
+*
+*  A ring 3 task gets a private space from vmm_create_space(): kernel half
+*  shared, user half its own. Its user stack frame and the page table holding
+*  it belong to that space and are released with it - there is deliberately no
+*  second record of the frame here, so it cannot be freed twice.
+*
+*  A ring 0 task has no user half worth isolating and keeps running in the
+*  kernel space, which is what the 0 stands for. 0 is never a valid space
+*  either: a directory is a physical frame and the pmm never hands out frame
+*  zero. Zero initialised statics therefore give the right default before the
+*  first task exists.
+*
+*  Non-zero doubles as the "this slot belongs to a ring 3 task" marker. */
+static addrspace_t task_space[MAX_TASKS];
+
+/* A space whose task is gone but that was still loaded in CR3 when its slot
+*  was recycled, see task_space_release(). It is destroyed as soon as somebody
+*  asks for a new task while running somewhere else. */
+static addrspace_t pending_space;
 
 static struct regs* task_states[MAX_TASKS];
 
@@ -101,54 +125,95 @@ static uint32_t user_stack_top(int slot)
 	return USER_STACK_REGION_TOP - (uint32_t) slot * USER_STACK_SLOT_SIZE;
 }
 
-/* Gives a slot a user stack: one physical frame, mapped user readable and
-*  writable at the slot's fixed virtual address. Returns the initial user esp,
-*  or 0 if no frame was left or the mapping failed.
+/* Gives a slot a user stack inside the given address space: one physical
+*  frame, mapped user readable and writable at the slot's fixed virtual
+*  address. Returns the initial user esp, or 0 if no frame was left or the
+*  mapping failed.
 *
-*  A slot that still carries the stack of a previous ring 3 task keeps the
-*  frame and the mapping - both are per slot, not per task - but the page is
-*  wiped either way, see below. */
-static uint32_t user_stack_create(int slot)
+*  The space is brand new and not the active one, so the mapping goes in with
+*  vmm_map_in() and the page cannot be written through its user address - it
+*  is not in the directory the MMU is currently reading. The frame is reached
+*  through the direct mapping instead, which is why the zeroing below works on
+*  P2V(frame) and not on the user address. */
+static uint32_t user_stack_create(int slot, addrspace_t space)
 {
 	void*    frame;
 	uint32_t page;
 
 	page = user_stack_top(slot) - PAGE_SIZE;
 
-	if(user_stack_frame[slot] == 0)
+	frame = pmm_alloc_frame();
+	if(frame == 0) return 0;
+
+	if(vmm_map_in(space, page, (uint32_t) frame, PAGE_PRESENT | PAGE_WRITE | PAGE_USER) != 0)
 	{
-		frame = pmm_alloc_frame();
-		if(frame == 0) return 0;
-
-		if(vmm_map(page, (uint32_t) frame, PAGE_PRESENT | PAGE_WRITE | PAGE_USER) != 0)
-		{
-			pmm_free_frame(frame);
-			return 0;
-		}
-
-		user_stack_frame[slot] = (uint32_t) frame;
+		pmm_free_frame(frame);
+		return 0;
 	}
 
-	/* The pmm hands out frames uncleared, and a recycled slot still holds the
-	*  previous task's stack. Either way the new task would start out looking
-	*  at data that is none of its business - and it could read it from ring 3.
-	*  The kernel may write here regardless of PAGE_USER, the flag only
-	*  restricts ring 3. */
-	memset((void*) page, (char) 0, (size_t) PAGE_SIZE);
+	/* The pmm hands out frames uncleared, so the new task would start out
+	*  looking at whatever the previous owner of this frame left behind - and
+	*  it could read it from ring 3. Wipe it before the task ever sees it.
+	*  Every frame the pmm knows about lies inside the direct mapping, so
+	*  P2V() is valid here. */
+	memset(P2V((uint32_t) frame), (char) 0, (size_t) PAGE_SIZE);
 
 	return user_stack_top(slot);
 }
 
-/* Drops the user stack of a slot again. Called when a ring 0 task moves into
-*  a slot a ring 3 task used before, so the frame does not leak and ring 3
-*  memory does not stay mapped for a task that has no business with it. */
-static void user_stack_release(int slot)
+/* Hands a slot's address space back, with it the user stack frame and the
+*  page tables of the user half. Called when a slot is recycled: a ring 0 task
+*  moving in has no business with ring 3 memory, and a new ring 3 task gets a
+*  space of its own rather than inheriting the dead task's.
+*
+*  The one case that needs care is a task that killed itself. Nothing frees
+*  anything at abort time - the slot and everything in it deliberately stay
+*  around until somebody recycles them - and by then the scheduler has long
+*  since elected another task and moved CR3 with it, so the space is cold and
+*  goes away here and now. But the corner case exists where the aborted task
+*  is still the current one: it aborted itself and has not been preempted yet,
+*  or it is simply the only task left, so schedule() kept returning its
+*  context unchanged. CR3 then still points at exactly this space, and
+*  vmm_destroy_space() rightly refuses to pull the directory out from under
+*  the CPU that is reading it. Freeing the frames would be no better: the very
+*  next ring 3 instruction would touch a stack that has been handed back.
+*
+*  So such a space is parked in pending_space and destroyed by
+*  reap_pending_space() on the next task creation, which by definition runs
+*  after the caller returned to whatever it was doing - and only if CR3 has
+*  moved on by then. At most one space can ever be parked, because only the
+*  single active space can reach this branch and its slot is cleared on the
+*  way out. */
+static void task_space_release(int slot)
 {
-	if(user_stack_frame[slot] == 0) return;
+	addrspace_t space;
 
-	vmm_unmap(user_stack_top(slot) - PAGE_SIZE);
-	pmm_free_frame((void*) user_stack_frame[slot]);
-	user_stack_frame[slot] = 0;
+	space = task_space[slot];
+	if(space == 0) return;
+
+	task_space[slot] = 0;
+
+	if(space == vmm_current_space())
+	{
+		pending_space = space;
+		return;
+	}
+
+	vmm_destroy_space(space);
+}
+
+/* Destroys a parked space once the CPU has left it. Called from task context
+*  only, never from schedule(): vmm_destroy_space() walks back into the pmm,
+*  and the timer IRQ can hit in the middle of a frame allocation somewhere
+*  else - the scheduler must not touch the allocator the code it interrupted
+*  may be halfway through. */
+static void reap_pending_space(void)
+{
+	if(pending_space == 0) return;
+	if(pending_space == vmm_current_space()) return;
+
+	vmm_destroy_space(pending_space);
+	pending_space = 0;
 }
 
 
@@ -235,6 +300,7 @@ struct regs* schedule(struct regs* cpu)
 	int slot;
 	int next;
 	int start;
+	addrspace_t space;
 
 	//If a task is running, save its state.
     if (current_task >= 0) {
@@ -281,6 +347,14 @@ struct regs* schedule(struct regs* cpu)
 		//esp0 always names the current task's kernel stack. That also covers
 		//the case of a ring 0 task dropping into ring 3 on its own via
 		//enter_user_mode().
+		//
+		//Order against the CR3 load further down does not matter. The TSS is
+		//kernel data and esp0 is a kernel address, so both are identical in
+		//every space and neither write depends on which directory is loaded.
+		//Nor can anything observe an in-between state: this runs inside an
+		//interrupt gate with IF cleared, and esp0 is read by the CPU only on
+		//an entry from ring 3 - impossible while we are the ring 0 code
+		//between these two lines.
 		if(next != current_task)
 		{
 			tss_set_kernel_stack(kernel_stack_top(next));
@@ -290,6 +364,34 @@ struct regs* schedule(struct regs* cpu)
 
 	} else {
 		tasks[current_task].cpu_time--;
+	}
+
+	//Give the CPU the elected task's address space. Deliberately the last
+	//thing that happens, and driven by the space rather than by the slot
+	//number: the else branch above re-elects the running task without ever
+	//looking at next, and a slot whose space was swapped underneath it would
+	//be missed by a "did the task change" test. Comparing against CR3 covers
+	//both and costs one register read per tick.
+	//
+	//This is safe here for one reason: entries 768..1023 of every directory
+	//are the same page tables, so everything the kernel is standing on right
+	//now keeps its mapping across the load.
+	//  - the code: schedule() and its caller are linked above
+	//    KERNEL_VIRTUAL_BASE, so the instruction after the write to CR3 is
+	//    fetched from a still valid mapping,
+	//  - the stack: esp points into task_kernel_stacks[] in the kernel's bss,
+	//    so the return address and the locals survive,
+	//  - the value returned: task_states[] points into that same array, so the
+	//    pointer irq_common_stub loads into esp and pops the new context from
+	//    is mapped in the new space as well.
+	//Nothing below this line reads user memory, which is the other half of the
+	//argument - the old user half is gone the moment CR3 changes.
+	space = task_space[current_task];
+	if(space == 0) space = vmm_kernel_space();
+
+	if(space != vmm_current_space())
+	{
+		vmm_switch_space(space);
 	}
 
     cpu = task_states[current_task];
@@ -338,7 +440,13 @@ static void occupy_slot(int slot, const char *name, int prio)
 
 int taskmgr_add_task( void* tfunct, const char *name, int prio)
 {
-	int i = find_free_slot();
+	int i;
+
+	//Before the slot search, so a space that was still active the last time a
+	//slot was recycled gives its frames back in time to be used again here.
+	reap_pending_space();
+
+	i = find_free_slot();
 
 	if(i < 0)
 	{
@@ -346,9 +454,11 @@ int taskmgr_add_task( void* tfunct, const char *name, int prio)
 		return -1;
 	}
 
-	//A ring 0 task has no business with a user stack. If a ring 3 task used
-	//this slot before, its mapping goes away here instead of staying reachable.
-	user_stack_release(i);
+	//A ring 0 task has no business with a user half. If a ring 3 task used
+	//this slot before, its address space - and with it its user stack - goes
+	//away here instead of staying allocated. The slot falls back to
+	//task_space[i] == 0, the kernel space, which is where a ring 0 task runs.
+	task_space_release(i);
 
 	occupy_slot(i, name, prio);
 
@@ -359,12 +469,16 @@ int taskmgr_add_task( void* tfunct, const char *name, int prio)
 }
 
 //Starts a task that begins life in ring 3. Same slot handling and same
-//priorities as taskmgr_add_task(), it only differs in what the task gets:
-//a user stack of its own, and an initial context that iret drops into ring 3.
+//priorities as taskmgr_add_task(), it only differs in what the task gets: an
+//address space of its own, a user stack inside it, and an initial context
+//that iret drops into ring 3.
 int taskmgr_add_user_task( void* tfunct, const char *name, int prio)
 {
-	uint32_t user_esp;
-	int i;
+	uint32_t    user_esp;
+	addrspace_t space;
+	int         i;
+
+	reap_pending_space();
 
 	i = find_free_slot();
 	if(i < 0)
@@ -373,14 +487,30 @@ int taskmgr_add_user_task( void* tfunct, const char *name, int prio)
 		return -1;
 	}
 
-	//Before anything about the slot is changed, so a failure here leaves no
-	//half built task behind.
-	user_esp = user_stack_create(i);
+	//Whatever the previous occupant of the slot left behind goes first: the
+	//new task gets a space of its own and must not inherit the dead one, and
+	//the frames come back early enough to serve the allocations below.
+	task_space_release(i);
+
+	space = vmm_create_space();
+	if(space == 0)
+	{
+		printf("ERR: Task '%s' could not be started, no memory for its address space!\n", name);
+		return -1;
+	}
+
+	//Still before anything about the slot is changed, so a failure here leaves
+	//no half built task behind - only the released space of the previous
+	//occupant, which was dead anyway.
+	user_esp = user_stack_create(i, space);
 	if(user_esp == 0)
 	{
+		vmm_destroy_space(space);
 		printf("ERR: Task '%s' could not be started, no memory for its user stack!\n", name);
 		return -1;
 	}
+
+	task_space[i] = space;
 
 	occupy_slot(i, name, prio);
 

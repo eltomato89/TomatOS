@@ -35,6 +35,11 @@
 *  just enough to get a higher-half kernel running. vmm_init() replaces it and
 *  does NOT reproduce the identity half - see the comment there.
 *
+*  On top of that single kernel directory the file provides per-task address
+*  spaces: a private lower three quarters, a kernel half shared by entry copy
+*  with every other space. The section "Address spaces" at the end of this file
+*  explains the split and the rules that come with it.
+*
 *  Notes: No warranty expressed or implied. Use at own risk.
 */
 
@@ -63,6 +68,13 @@ extern char text_end[];
 *  limit points into nothing. */
 #define BOOT_MAP_LIMIT  0x00400000UL
 
+/* Where the shared kernel half of a page directory begins. Every address from
+*  KERNEL_VIRTUAL_BASE up is described by the entries at this index and above,
+*  and those entries are identical in every address space - see the address
+*  space section at the bottom of this file. */
+#define KERNEL_DIR_FIRST   (KERNEL_VIRTUAL_BASE >> 22)              /* 768 */
+#define KERNEL_DIR_ENTRIES (PAGE_ENTRIES - KERNEL_DIR_FIRST)        /* 256 */
+
 /* --- State ---------------------------------------------------------------- */
 
 static uint32_t *page_directory = 0;    /* VIRTUAL pointer to the directory   */
@@ -88,6 +100,38 @@ static uint32_t *table_of(uint32_t pde)
 	return (uint32_t *)P2V(pde & PAGE_ADDR_MASK);
 }
 
+/* Physical address of the directory the processor is translating through right
+*  now. That is what an address space *is* here, so this doubles as
+*  vmm_current_space(). Paging is already on when this file starts running -
+*  start.asm turned it on - so CR3 always holds something meaningful. */
+static uint32_t read_cr3(void)
+{
+	uint32_t value;
+
+	__asm__ __volatile__("movl %%cr3, %0" : "=r"(value));
+	return value & PAGE_ADDR_MASK;
+}
+
+/* Kernel view of a directory given by its physical address. Works for any
+*  space, the active one included, because every directory frame lies inside
+*  the direct mapping - vmm_create_space() refuses a frame that does not. */
+static uint32_t *dir_of(uint32_t space)
+{
+	return (uint32_t *)P2V(space & PAGE_ADDR_MASK);
+}
+
+/* The space vmm_map() and friends work on: whatever CR3 points at.
+*
+*  Before vmm_init() has switched CR3 that is still start.asm's boot directory,
+*  and the directory we are busy filling in is our own - so answer with ours
+*  during the bring-up. Afterwards the two coincide until the first task
+*  switch, so nothing about the existing behaviour changes. */
+static uint32_t active_space(void)
+{
+	if (!paging_active) return directory_phys;
+	return read_cr3();
+}
+
 /* Highest physical address the kernel can currently reach through P2V().
 *  Before vmm_init() switches CR3 that is whatever start.asm's boot directory
 *  covers; afterwards it is the full direct mapping window. A page table has
@@ -101,14 +145,42 @@ static uint32_t reachable_limit(void)
 
 /* --- Mapping -------------------------------------------------------------- */
 
-int vmm_map(uint32_t virt, uint32_t phys, uint32_t flags)
+/* Does a TLB shootdown for one page make sense in this space?
+*
+*  invlpg drops the translation for a linear address out of the TLB of the
+*  address space that is loaded RIGHT NOW. The x86 TLB carries no space
+*  identifier (no PCID at this level), so entries cached for a foreign
+*  directory simply do not exist while that directory is not in CR3: touching
+*  another space's tables cannot leave a stale entry behind, and invalidating
+*  for it would only throw away a translation of the *active* space that
+*  happens to share the linear address. Pointless at best, harmful at worst.
+*
+*  What guarantees correctness for the foreign case is the CR3 load in
+*  vmm_switch_space(): writing CR3 flushes every non-global entry, and this
+*  kernel never sets PAGE_GLOBAL, so a space picks up all edits made while it
+*  was parked the moment it becomes active again.
+*
+*  For the active space the flush is mandatory - the entry may well be cached. */
+static int space_is_active(uint32_t space)
 {
+	return space == read_cr3();
+}
+
+/* Core of vmm_map()/vmm_map_in(). Works on the directory given by its physical
+*  address, which may or may not be the one in CR3. */
+static int map_page(uint32_t space, uint32_t virt, uint32_t phys, uint32_t flags)
+{
+	uint32_t *dir;
 	uint32_t  di;
 	uint32_t  ti;
 	uint32_t *table;
 	void     *frame;
 
-	if (page_directory == 0) return -1;
+	/* A directory the kernel cannot reach through P2V() cannot be edited,
+	*  and a space of 0 is the "no such space" value of addrspace_t. */
+	if (space == 0 || space > DIRECT_MAP_LIMIT) return -1;
+
+	dir = dir_of(space);
 
 	virt &= PAGE_ADDR_MASK;
 	phys &= PAGE_ADDR_MASK;
@@ -116,7 +188,7 @@ int vmm_map(uint32_t virt, uint32_t phys, uint32_t flags)
 	di = virt >> 22;			/* directory index: bits 31..22 */
 	ti = (virt >> 12) & 0x3FF;		/* table index:     bits 21..12 */
 
-	if (!(page_directory[di] & PAGE_PRESENT))
+	if (!(dir[di] & PAGE_PRESENT))
 	{
 		frame = pmm_alloc_frame();
 		if (frame == 0) return -1;
@@ -152,19 +224,19 @@ int vmm_map(uint32_t virt, uint32_t phys, uint32_t flags)
 		*  The entry stays permissive: the effective rights of a page
 		*  are the AND of directory and table entry, so a read-only page
 		*  needs its table entry read-only, not this one. */
-		page_directory[di] = (V2P(table) & PAGE_ADDR_MASK) |
-		                     PAGE_PRESENT | PAGE_WRITE |
-		                     (flags & PAGE_USER);
+		dir[di] = (V2P(table) & PAGE_ADDR_MASK) |
+		          PAGE_PRESENT | PAGE_WRITE |
+		          (flags & PAGE_USER);
 		tables_in_use++;
 	}
 	else
 	{
-		table = table_of(page_directory[di]);
+		table = table_of(dir[di]);
 
 		/* A user page below an entry that is not user accessible would
 		*  stay unreachable, so widen the directory entry if needed. */
 		if (flags & PAGE_USER)
-			page_directory[di] |= PAGE_USER;
+			dir[di] |= PAGE_USER;
 	}
 
 	if (!(table[ti] & PAGE_PRESENT))
@@ -174,25 +246,29 @@ int vmm_map(uint32_t virt, uint32_t phys, uint32_t flags)
 	*  resolve this page to, so no conversion here. */
 	table[ti] = phys | (flags & PAGE_FLAG_MASK) | PAGE_PRESENT;
 
-	tlb_flush_page(virt);
+	if (space_is_active(space)) tlb_flush_page(virt);
 	return 0;
 }
 
-int vmm_unmap(uint32_t virt)
+/* Core of vmm_unmap()/vmm_unmap_in(). */
+static int unmap_page(uint32_t space, uint32_t virt)
 {
+	uint32_t *dir;
 	uint32_t  di;
 	uint32_t  ti;
 	uint32_t *table;
 
-	if (page_directory == 0) return -1;
+	if (space == 0 || space > DIRECT_MAP_LIMIT) return -1;
+
+	dir = dir_of(space);
 
 	virt &= PAGE_ADDR_MASK;
 	di = virt >> 22;
 	ti = (virt >> 12) & 0x3FF;
 
-	if (!(page_directory[di] & PAGE_PRESENT)) return -1;
+	if (!(dir[di] & PAGE_PRESENT)) return -1;
 
-	table = table_of(page_directory[di]);
+	table = table_of(dir[di]);
 	if (!(table[ti] & PAGE_PRESENT)) return -1;
 
 	table[ti] = 0;
@@ -201,49 +277,85 @@ int vmm_unmap(uint32_t virt)
 	/* A table that has just lost its last entry is kept and stays hooked
 	*  into the directory. Giving the frame back would mean counting the
 	*  remaining entries on every unmap, and a table that is empty now is
-	*  quite likely to be needed again in a moment. Refinement for later. */
+	*  quite likely to be needed again in a moment. Refinement for later.
+	*  vmm_destroy_space() collects them all in one go. */
 
-	tlb_flush_page(virt);
+	if (space_is_active(space)) tlb_flush_page(virt);
 	return 0;
 }
 
-uint32_t vmm_get_phys(uint32_t virt)
+/* Walks the two levels for virt and hands back the table entry, or 0 if the
+*  page is not present. A present entry always has bit 0 set and is therefore
+*  never 0, so the sentinel is unambiguous.
+*
+*  pde_out, if given, receives the directory entry. The caller needs it because
+*  rights live on both levels: the effective permission of a page is the AND of
+*  the two entries, and the directory entry alone can revoke user access to a
+*  whole 4 MiB region. */
+static uint32_t walk_page(uint32_t space, uint32_t virt, uint32_t *pde_out)
 {
+	uint32_t *dir;
 	uint32_t  di;
 	uint32_t  ti;
 	uint32_t *table;
 
-	if (page_directory == 0) return 0;
+	if (pde_out != 0) *pde_out = 0;
+	if (space == 0 || space > DIRECT_MAP_LIMIT) return 0;
+
+	dir = dir_of(space);
 
 	di = virt >> 22;
 	ti = (virt >> 12) & 0x3FF;
 
-	if (!(page_directory[di] & PAGE_PRESENT)) return 0;
+	if (!(dir[di] & PAGE_PRESENT)) return 0;
+	if (pde_out != 0) *pde_out = dir[di];
 
-	table = table_of(page_directory[di]);
+	table = table_of(dir[di]);
 	if (!(table[ti] & PAGE_PRESENT)) return 0;
+
+	return table[ti];
+}
+
+/* Core of vmm_get_phys()/vmm_get_phys_in(). */
+static uint32_t phys_of(uint32_t space, uint32_t virt)
+{
+	uint32_t pte;
+
+	pte = walk_page(space, virt, 0);
+	if (pte == 0) return 0;
 
 	/* Frame address plus the offset inside the page - the caller asked
 	*  about an address, not about a frame. The result is physical by
 	*  definition, so it is the one place here that must not use P2V(). */
-	return (table[ti] & PAGE_ADDR_MASK) | (virt & PAGE_FLAG_MASK);
+	return (pte & PAGE_ADDR_MASK) | (virt & PAGE_FLAG_MASK);
+}
+
+int vmm_map(uint32_t virt, uint32_t phys, uint32_t flags)
+{
+	if (page_directory == 0) return -1;
+	return map_page(active_space(), virt, phys, flags);
+}
+
+int vmm_unmap(uint32_t virt)
+{
+	if (page_directory == 0) return -1;
+	return unmap_page(active_space(), virt);
+}
+
+uint32_t vmm_get_phys(uint32_t virt)
+{
+	if (page_directory == 0) return 0;
+	return phys_of(active_space(), virt);
 }
 
 int vmm_is_mapped(uint32_t virt)
 {
-	uint32_t  di;
-	uint32_t  ti;
-	uint32_t *table;
-
 	if (page_directory == 0) return 0;
 
-	di = virt >> 22;
-	ti = (virt >> 12) & 0x3FF;
-
-	if (!(page_directory[di] & PAGE_PRESENT)) return 0;
-
-	table = table_of(page_directory[di]);
-	return (table[ti] & PAGE_PRESENT) != 0;
+	/* Asking walk_page() rather than vmm_get_phys(), because a page may
+	*  legitimately resolve to physical frame 0 - it holds the real mode
+	*  interrupt vector table and is mapped at P2V(0) like any other frame. */
+	return walk_page(active_space(), virt, 0) != 0;
 }
 
 /* --- Statistics and registers --------------------------------------------- */
@@ -442,4 +554,215 @@ void vmm_init(void)
 
 	printf("VMM: paging on, %d pages in %d tables, page 0 left unmapped\n",
 	       (int)pages_mapped, (int)tables_in_use);
+}
+
+/* --- Address spaces -------------------------------------------------------
+*
+*  A page directory has 1024 entries, each describing 4 MiB. The split this
+*  kernel uses is:
+*
+*      entries    0 .. 767    private  ->  0x00000000 .. 0xBFFFFFFF, user
+*      entries  768 .. 1023   SHARED   ->  0xC0000000 .. 0xFFFFFFFF, kernel
+*
+*  "Shared" means the entries are copied, not the tables. Every space points
+*  its upper 256 entries at the very same page tables the kernel directory
+*  uses, so kernel code, kernel data, the direct mapping of all RAM and each
+*  task's kernel stack keep their translation no matter which directory sits in
+*  CR3. That is precisely what makes it safe to take an interrupt, or to enter
+*  a system call, from inside any address space: the CPU switches privilege but
+*  not the mapping it needs to survive.
+*
+*  The flip side is the rule that governs vmm_destroy_space(): those 256
+*  entries do not belong to the space that holds them. Handing one of their
+*  tables back to the pmm would pull the kernel's own mapping out from under
+*  every other space at once.
+*/
+
+addrspace_t vmm_kernel_space(void)
+{
+	return directory_phys;
+}
+
+addrspace_t vmm_current_space(void)
+{
+	return read_cr3();
+}
+
+addrspace_t vmm_create_space(void)
+{
+	void     *frame;
+	uint32_t *dir;
+
+	if (page_directory == 0) return 0;
+
+	frame = pmm_alloc_frame();
+	if (frame == 0) return 0;
+
+	/* The directory has to be written by the kernel, so it must live inside
+	*  the direct mapping - the same requirement a page table has. */
+	if ((uint32_t)frame > reachable_limit())
+	{
+		pmm_free_frame(frame);
+		return 0;
+	}
+
+	dir = (uint32_t *)P2V(frame);
+
+	/* The private half starts out empty. The pmm hands out frames without
+	*  clearing them, and a leftover bit 0 in the user half would be a live
+	*  mapping to a random frame the instant this directory reached CR3 -
+	*  reachable from ring 3 if the stale entry also had PAGE_USER set. So
+	*  the lower 768 entries are zeroed before anything else touches them. */
+	memset(dir, (char)0, (size_t)(KERNEL_DIR_FIRST * sizeof(uint32_t)));
+
+	/* The kernel half is taken over verbatim from the kernel directory.
+	*  Copying the ENTRIES is the whole trick: each one still carries the
+	*  physical address of a kernel page table, so both directories walk
+	*  into the same table and see the same pages. No copy is made and none
+	*  is wanted - a later kernel mapping inside an existing table becomes
+	*  visible in every space at once.
+	*
+	*  Between the memset and this memcpy every one of the 1024 entries has
+	*  been written, so no byte of the frame keeps its previous content. */
+	memcpy(&dir[KERNEL_DIR_FIRST], &page_directory[KERNEL_DIR_FIRST],
+	       (size_t)(KERNEL_DIR_ENTRIES * sizeof(uint32_t)));
+
+	/* The space is named by the physical address of its directory, which is
+	*  exactly the value CR3 takes. pmm_alloc_frame() already returns one. */
+	return (addrspace_t)frame;
+}
+
+void vmm_destroy_space(addrspace_t space)
+{
+	uint32_t *dir;
+	uint32_t  di;
+	uint32_t  ti;
+	uint32_t *table;
+
+	if (space == 0) return;
+
+	if (space > DIRECT_MAP_LIMIT)
+	{
+		printf("VMM: cannot destroy space 0x%X, outside the direct mapping\n",
+		       (uint32_t)space);
+		return;
+	}
+
+	/* The kernel directory owns the shared half. Freeing it would free the
+	*  tables every other space borrows. */
+	if (space == directory_phys)
+	{
+		printf("VMM: refusing to destroy the kernel address space\n");
+		return;
+	}
+
+	/* And the space we are standing in: the moment its tables go back to
+	*  the pmm they can be handed out and overwritten, while CR3 still walks
+	*  them. Switch to another space first, then destroy this one. */
+	if (space == read_cr3())
+	{
+		printf("VMM: refusing to destroy the active address space 0x%X\n",
+		       (uint32_t)space);
+		return;
+	}
+
+	dir = dir_of(space);
+
+	/* Strictly di < KERNEL_DIR_FIRST: the loop stops one entry short of the
+	*  shared half and never looks at 768..1023. Those tables belong to the
+	*  kernel and are still in use by every other space. */
+	for (di = 0; di < KERNEL_DIR_FIRST; di++)
+	{
+		if (!(dir[di] & PAGE_PRESENT)) continue;
+
+		table = table_of(dir[di]);
+
+		/* Every frame this table maps is a frame the task owns - the
+		*  user half is never used for shared or memory mapped pages in
+		*  this kernel, so giving them all back is right. */
+		for (ti = 0; ti < PAGE_ENTRIES; ti++)
+		{
+			if (!(table[ti] & PAGE_PRESENT)) continue;
+
+			pmm_free_frame((void *)(table[ti] & PAGE_ADDR_MASK));
+			table[ti] = 0;
+			if (pages_mapped > 0) pages_mapped--;
+		}
+
+		/* Then the table itself. Clearing the directory entry first
+		*  keeps the directory consistent for the rest of the loop. */
+		pmm_free_frame((void *)(dir[di] & PAGE_ADDR_MASK));
+		dir[di] = 0;
+		if (tables_in_use > 0) tables_in_use--;
+	}
+
+	/* Finally the directory frame. No TLB work is needed: this space is not
+	*  in CR3, so the processor holds no translation of it, and the next
+	*  CR3 load flushes what it does hold anyway. */
+	pmm_free_frame((void *)space);
+}
+
+void vmm_switch_space(addrspace_t space)
+{
+	if (space == 0 || space > DIRECT_MAP_LIMIT) return;
+
+	space &= PAGE_ADDR_MASK;
+
+	/* Reloading the same directory would flush the whole TLB for nothing. */
+	if (space == read_cr3()) return;
+
+	/* Safe from inside an interrupt handler, and that is not luck: the
+	*  handler's code, its stack and the IDT all live above
+	*  KERNEL_VIRTUAL_BASE, i.e. in the half every directory shares, so the
+	*  instruction after this one is fetched from the same physical byte and
+	*  ESP still points at the same memory. Only the private half changes.
+	*
+	*  Writing CR3 also flushes all non-global entries, which is what makes
+	*  edits done to a parked space through vmm_map_in() take effect here. */
+	__asm__ __volatile__("movl %0, %%cr3" : : "r"(space) : "memory");
+}
+
+int vmm_map_in(addrspace_t space, uint32_t virt, uint32_t phys, uint32_t flags)
+{
+	if (page_directory == 0) return -1;
+	return map_page(space, virt, phys, flags);
+}
+
+int vmm_unmap_in(addrspace_t space, uint32_t virt)
+{
+	if (page_directory == 0) return -1;
+	return unmap_page(space, virt);
+}
+
+uint32_t vmm_get_phys_in(addrspace_t space, uint32_t virt)
+{
+	if (page_directory == 0) return 0;
+	return phys_of(space, virt);
+}
+
+int vmm_is_user_mapped(uint32_t virt)
+{
+	uint32_t pde;
+	uint32_t pte;
+
+	if (page_directory == 0) return 0;
+
+	pde = 0;
+	pte = walk_page(active_space(), virt, &pde);
+	if (pte == 0) return 0;
+
+	/* Both levels have to grant user access. The processor computes the
+	*  effective rights of a page as the AND of the directory entry and the
+	*  table entry, so a page whose table entry says PAGE_USER but whose
+	*  directory entry does not is unreachable from ring 3 - the fault comes
+	*  before the table is ever consulted. Checking only the table entry
+	*  would let a system call happily dereference a pointer the caller
+	*  cannot touch itself, which is the exact hole this function exists to
+	*  close: the question is not "is something mapped here" but "may the
+	*  caller see it".
+	*
+	*  This also makes an explicit KERNEL_VIRTUAL_BASE test unnecessary. The
+	*  kernel half is mapped without PAGE_USER, so a user pointer into it
+	*  fails right here. */
+	return (pde & PAGE_USER) != 0 && (pte & PAGE_USER) != 0;
 }

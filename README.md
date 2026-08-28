@@ -80,10 +80,31 @@ User stacks sit below the kernel window with an unmapped guard page beneath
 each, and are zeroed on allocation — the frame allocator hands out dirty
 memory and ring 3 must not see what the previous owner left there.
 
-Pointer arguments from ring 3 are validated by address range and mapping
-before the kernel follows them. Note the current limits: all tasks share one
-page directory, so these checks stop kernel reads and unmapped pages but do
-**not** provide process isolation.
+### Address spaces
+
+Every ring 3 task owns a page directory. Its upper quarter — entries 768 and
+up, everything from `KERNEL_VIRTUAL_BASE` — is **shared**: the same page
+tables, not copies. That is what lets an interrupt or a system call be taken
+in any task's address space, since kernel code, kernel data and the task's
+kernel stack stay mapped across a `CR3` load. The lower three quarters are
+private, so two tasks can hold the same virtual address with different
+contents and neither can reach the other's.
+
+`user -i` demonstrates it: two ring 3 tasks write different values to one
+address, each reads back only its own, and the kernel confirms the two
+spaces resolve that address to different physical frames.
+
+Pointer arguments from ring 3 are resolved in the caller's own directory —
+a system call does not change `CR3` — and must carry `PAGE_USER` in both the
+directory and the table entry, since the effective rights are the AND of the
+two. Being mapped is not the question; being permitted is.
+
+Sharing happens at directory-entry granularity, which has one consequence
+worth knowing: a kernel mapping inside an existing page table shows up in
+every address space at once, but one that needs a **new** page table would
+only land in whichever directory is active. All RAM is mapped up front by
+`vmm_init()`, so this does not arise today — but anything added later that
+maps a fresh kernel range has to happen before the first task space exists.
 
 ### Display
 

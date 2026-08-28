@@ -6,10 +6,12 @@
 *  eax holds the call number, ebx/ecx/edx the arguments, and the result is
 *  written back into r->eax so that the iret delivers it to the caller.
 *
-*  Everything in this file runs on behalf of ring 3. That makes it the one
-*  place where the kernel touches values it did not produce itself, so every
-*  argument is treated as hostile until it has been checked -- see
-*  user_string_len() below.
+*  Everything in this file runs on behalf of ring 3, and -- just as important
+*  since tasks own separate page directories -- it runs *in the caller's
+*  address space*. Entering through a gate changes cs, ss and esp, never CR3.
+*  That makes this the one place where the kernel touches values it did not
+*  produce itself, so every argument is treated as hostile until it has been
+*  checked -- see user_byte_ok() and user_string_len() below.
 *
 *  Notes: No warranty expressed or implied. Use at own risk.
 */
@@ -52,23 +54,46 @@ typedef int (*syscall_fn)(struct regs *r);
 
 /* Non-zero if a single byte at addr may be read on behalf of ring 3.
 *
+*  "Is this address readable" only has an answer relative to an address
+*  space, and the space that counts is the caller's. It is also the active
+*  one: the CPU did not reload CR3 on the way in, so the directory the checks
+*  below walk is the very directory the calling task was running under. That
+*  is what makes the question well posed at all now that tasks no longer
+*  share one directory.
+*
 *  Three rules, and each of them exists because of a concrete attack:
 *    - address zero and the rest of the first page are rejected outright.
 *      Page zero is deliberately never mapped (see vmm.h), so a null pointer
 *      would fault anyway -- but faulting inside the kernel with a user
 *      pointer is precisely what we are trying not to do.
-*    - anything at or above KERNEL_VIRTUAL_BASE belongs to the kernel. Ring 3
-*      cannot read there itself; without this test it could ask the kernel to
-*      read it out loud through SYS_WRITE and dump kernel memory to screen.
-*    - the page must actually be present. vmm_is_mapped() answers that
-*      question without touching the memory, which is the whole point: a
+*    - anything at or above KERNEL_VIRTUAL_BASE belongs to the kernel. This
+*      is not redundant with the permission test below, tempting as that
+*      sounds: the upper quarter of the directory is shared by every address
+*      space and it is not entirely free of PAGE_USER, because user_setup()
+*      in main.c opens the kernel text pages around user_demo() to ring 3 so
+*      that the demo can be executed where it was linked. Those pages pass a
+*      PAGE_USER test. Without this line, a pointer into one of them would
+*      let ring 3 have SYS_WRITE read kernel memory out loud.
+*    - the page must be present *and* carry PAGE_USER in both the directory
+*      entry and the table entry, which is exactly what vmm_is_user_mapped()
+*      reports. Mere presence is the weaker question and no longer the
+*      interesting one: with a private lower half per task, a page that
+*      exists but is not user accessible is a page the caller was never meant
+*      to see, and following such a pointer would hand it kernel-side data
+*      through a call it is allowed to make. The test answers from the page
+*      tables without touching the memory, which is the whole point -- a
 *      dereference to find out would already be the page fault we are
-*      avoiding. */
+*      avoiding.
+*
+*  What this deliberately does not establish is writability. Nothing in this
+*  file writes to user memory, so PAGE_WRITE is never asked about; a call
+*  that ever hands a result back through a user pointer has to check for it
+*  on its own. */
 static int user_byte_ok(uint32_t addr)
 {
 	if(addr < PAGE_SIZE) return 0;
 	if(addr >= KERNEL_VIRTUAL_BASE) return 0;
-	if(!vmm_is_mapped(addr)) return 0;
+	if(!vmm_is_user_mapped(addr)) return 0;
 
 	return 1;
 }
@@ -77,11 +102,11 @@ static int user_byte_ok(uint32_t addr)
 *  safe to read.
 *
 *  The check has to walk the string, because a mapping only ever covers one
-*  page: a string may start in a mapped page and run straight into an
-*  unmapped one. Rather than validating every single byte (vmm_is_mapped()
-*  walks the page directory, that would be one table lookup per character),
-*  the page is validated once at the start and then again at every 4 KiB
-*  boundary the string crosses.
+*  page: a string may start in a page the caller may read and run straight
+*  into one it may not, or into none at all. Rather than validating every
+*  single byte (vmm_is_user_mapped() walks directory and table, that would be
+*  two lookups per character), the page is validated once at the start and
+*  then again at every 4 KiB boundary the string crosses.
 *
 *  The length is deliberately established before the first character is
 *  printed. Validating and printing in one pass would mean a bad pointer
@@ -159,7 +184,14 @@ static int sys_exit(struct regs *r)
 
 	/* schedule() hands back the context it was given until the current time
 	*  slice is used up, so it is called until a different one comes out --
-	*  bounded, because this runs inside an interrupt. */
+	*  bounded, because this runs inside an interrupt.
+	*
+	*  schedule() is also the only place that elects a task, and therefore the
+	*  only place that loads CR3. When it returns a foreign context, the
+	*  address space belonging to that context is already active. Nothing here
+	*  switches anything, and nothing here should: this file is never told
+	*  which space a task owns, and a second switch would only be an
+	*  opportunity to disagree with the scheduler. */
 	next = r;
 	for(i = 0; i < SYSCALL_SCHEDULE_TRIES; i++)
 	{
@@ -171,7 +203,16 @@ static int sys_exit(struct regs *r)
 	{
 		/* The stub restores every register from exactly this memory and
 		*  then irets. Replacing the contents therefore switches tasks
-		*  without a single line of assembler. */
+		*  without a single line of assembler.
+		*
+		*  The copy is indifferent to which address space is loaded while it
+		*  runs, and that is not luck: r points into the exiting task's kernel
+		*  stack and next into the incoming task's, and both stacks live above
+		*  KERNEL_VIRTUAL_BASE, in the quarter of the directory every space
+		*  shares. Same memory, same contents, in either space. The iret at
+		*  the end of the stub is the first instruction that actually needs
+		*  the new space -- it is the one that reaches user code again -- and
+		*  by then schedule() has long since loaded it. */
 		*r = *next;
 		return 0;
 	}
@@ -303,12 +344,39 @@ uint32_t syscall_count(void)
 *  itself. A trap gate leaves IF as the caller had it, so a system call is
 *  preemptible.
 *
-*  The price is a theoretical time-of-check/time-of-use window: the pointer
-*  validation below and the subsequent read are two separate passes, and a
-*  preemption in between could see a page unmapped. That is acceptable here
-*  because all tasks share one page directory anyway -- these checks stop
-*  kernel reads and unmapped pages, they are not process isolation. Once
-*  tasks get separate address spaces this needs revisiting.
+*  The price is a time-of-check/time-of-use window: the pointer validation
+*  and the reads that follow it are separate passes, and the timer IRQ can
+*  land between them. Two different things could change in that gap, and they
+*  are worth keeping apart.
+*
+*  The mapping itself does not. Everything user_byte_ok() lets through lies
+*  below KERNEL_VIRTUAL_BASE, i.e. in the private three quarters of the
+*  caller's own directory, and the only ring 3 code that edits that half is
+*  the caller -- which is parked inside this system call and not running. A
+*  task that preempts us edits its own space. While all tasks shared one
+*  directory this was a genuine race; per-task spaces closed it, and that,
+*  not the pointer checks by themselves, is where the isolation comes from.
+*
+*  The address space the *re-checks* are answered in could. user_string_len()
+*  asks again at every 4 KiB boundary, and such a question must not be put to
+*  a stranger's directory. It is not: schedule() elects a task and loads its
+*  CR3 in one step, so the active space always belongs to the current task,
+*  and a call resumed after a preemption walks the same directory it walked
+*  before. This file depends on that invariant and does not maintain it --
+*  tasks.c does.
+*
+*  Two gaps remain, and neither is closed by paging:
+*    - the read is a ring 0 read, and supervisor accesses ignore the U/S bit.
+*      PAGE_USER is therefore checked by software, not enforced by the CPU at
+*      the moment of the read. Only the kernel could clear that bit mid-call,
+*      so today nothing exploits it, but a future vmm_unmap() from another
+*      task's context would not be stopped by hardware here.
+*    - a task aborted from outside while parked mid-call is simply never
+*      re-elected, so its half-finished frame is abandoned rather than
+*      resumed against a directory that may since have been torn down. That
+*      is a property of the scheduler's policy, not a guarantee this file
+*      obtains, and it would have to be re-examined if aborted tasks ever
+*      became resumable.
 *
 *  This is the only descriptor ring 3 is allowed to reach. Every exception
 *  and IRQ vector keeps DPL 0, so user code cannot software-trigger a page
