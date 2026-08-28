@@ -15,23 +15,23 @@ char *itoa(int val)
 {
 	char itoa_single(int);
 	static char ret[50];
-	int stellen = 1;
+	int digits = 1;
 	int i;
-	int zahl;
+	int value;
 
-	zahl = val;
+	value = val;
 
 	if(val >= 10){
-		while(zahl >= 10)
+		while(value >= 10)
 		{
-		  zahl = zahl / 10;
-		  stellen++;
+		  value = value / 10;
+		  digits++;
 		}
 	}
 
-	ret[stellen] = EOS; /* end of the string (indices start at 0) */
+	ret[digits] = EOS; /* end of the string (indices start at 0) */
 	
-	for(i = stellen -1; i >= 0; i--)
+	for(i = digits -1; i >= 0; i--)
 	{
 		ret[i] = itoa_single((int)(val % 10));
 		val = val / 10;
@@ -173,8 +173,8 @@ char *strsplit(char *str, int num, char delimiter)
 	   invalid after the return. */
 	static char ret[100];
 	int i;
-	int wnum=0;
-	int cnum=0;
+	int word_index=0;
+	int out_pos=0;
 
 	ret[0] = EOS;	/* definitely terminated, even if nothing is found */
 
@@ -182,14 +182,14 @@ char *strsplit(char *str, int num, char delimiter)
 	{
 		if(str[i] == delimiter)
 		{
-			wnum++;
+			word_index++;
 		} else {
-			if(wnum == num && cnum < (int)sizeof(ret)-1)
+			if(word_index == num && out_pos < (int)sizeof(ret)-1)
 			{
 
-				ret[cnum] = str[i];
-				cnum++;
-				ret[cnum] = EOS;
+				ret[out_pos] = str[i];
+				out_pos++;
+				ret[out_pos] = EOS;
 
 			}
 		}
@@ -295,8 +295,8 @@ char *prmv(int num, char *str)
 	   invalid after the return. */
 	static char ret[100];
 	int i;
-	int wnum=0;
-	int cnum=0;
+	int word_index=0;
+	int out_pos=0;
 
 	/* Important: terminate immediately. Otherwise, for prmv(1, "taskmgr"),
 	   the result of the previous call would still be in the buffer. */
@@ -306,14 +306,14 @@ char *prmv(int num, char *str)
 	{
 		if(str[i] == ' ')
 		{
-			wnum++;
+			word_index++;
 		} else {
-			if(wnum == num && cnum < (int)sizeof(ret)-1)
+			if(word_index == num && out_pos < (int)sizeof(ret)-1)
 			{
 
-				ret[cnum] = str[i];
-				cnum++;
-				ret[cnum] = EOS;
+				ret[out_pos] = str[i];
+				out_pos++;
+				ret[out_pos] = EOS;
 
 			}
 		}

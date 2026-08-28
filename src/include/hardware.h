@@ -11,5 +11,5 @@ extern void writes_serial(char*);
 extern void setup_pit();
 extern void audio_switch_on();
 extern void audio_switch_off();
-extern void audio_sound(unsigned frequenz);
-extern void audio_beep(unsigned frequenz, int duration);
+extern void audio_sound(unsigned frequency);
+extern void audio_beep(unsigned frequency, int duration);

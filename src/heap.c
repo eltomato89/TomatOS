@@ -396,7 +396,7 @@ void *calloc(size_t num, size_t size)
 void *realloc(void *ptr, size_t size)
 {
     struct heap_block *blk;
-    void *neu;
+    void *newptr;
     uint32_t need;
     uint32_t copy;
 
@@ -451,8 +451,8 @@ void *realloc(void *ptr, size_t size)
         return ptr;
     }
 
-    neu = malloc(size);
-    if(neu == 0)
+    newptr = malloc(size);
+    if(newptr == 0)
         return 0;               /* the old block stays untouched and valid */
 
     /* Copy only as much as the old block really had -- here it is always
@@ -461,10 +461,10 @@ void *realloc(void *ptr, size_t size)
     if(copy > need)
         copy = need;
 
-    memcpy(neu, ptr, (size_t)copy);
+    memcpy(newptr, ptr, (size_t)copy);
     free(ptr);
 
-    return neu;
+    return newptr;
 }
 
 /* In use: the payload of the used blocks plus their management headers.

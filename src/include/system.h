@@ -119,7 +119,7 @@ extern void kb_flush();
 /* MULTITASKING.C */
 extern void mt_install();
 extern void taskmgr_list_tasks();
-extern int taskmgr_add_task( void* tfunct, const char *bezeichnung, int cpu_time);
+extern int taskmgr_add_task( void* tfunct, const char *name, int cpu_time);
 extern int taskmgr_get_currpid();
 extern void taskmgr_task_abort(int pid, int error_number, const char *error_descr);
 extern void taskmgr_task_start(int pid);

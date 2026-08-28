@@ -422,20 +422,20 @@ void audio_switch_off()
 	outportb(0x61,inportb(0x61) &~3);
 }
 
-void audio_sound(unsigned frequenz)
+void audio_sound(unsigned frequency)
 {
-	unsigned teiler;
-	teiler = 1193180L/frequenz;
+	unsigned divisor;
+	divisor = 1193180L/frequency;
 	outportb(0x43,0xB6);
-	outportb(0x42,teiler&0xFF);
-	outportb(0x42,teiler >> 8);
+	outportb(0x42,divisor&0xFF);
+	outportb(0x42,divisor >> 8);
 	
 }
 
-void audio_beep(unsigned frequenz, int duration)
+void audio_beep(unsigned frequency, int duration)
 {
 	audio_switch_on();
-	audio_sound(frequenz);
+	audio_sound(frequency);
 	sleep(duration);
 	audio_switch_off();
 }

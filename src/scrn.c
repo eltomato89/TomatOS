@@ -178,8 +178,8 @@ int printf(char * string, ...)
   unsigned char uc;
   unsigned char uc2;
 
-	va_list argzeiger;
-	va_start(argzeiger, string);
+	va_list argptr;
+	va_start(argptr, string);
 		
 	stringlen = (int)strlen(string);
 	
@@ -191,13 +191,13 @@ int printf(char * string, ...)
         switch(string[i+1])
         {
           case 's':
-            puts(va_arg(argzeiger, char *));
+            puts(va_arg(argptr, char *));
             i++;
             break;
           case 'u':
 		  case 'd':
           case 'i':
-            tmp = va_arg(argzeiger, int);
+            tmp = va_arg(argptr, int);
             if(tmp <0)
             {
               printf("-");
@@ -207,15 +207,15 @@ int printf(char * string, ...)
             i++;
             break;
           case 'c':
-            putch(va_arg(argzeiger, char));
+            putch(va_arg(argptr, char));
             i++;
             break;
           case 'p':
-            puts(itoa(va_arg(argzeiger, int)));
+            puts(itoa(va_arg(argptr, int)));
             i++;
             break;
           case 'X':
-            hextoa(va_arg(argzeiger, int));
+            hextoa(va_arg(argptr, int));
             i++;
             break;
           case '%':
@@ -282,7 +282,7 @@ int printf(char * string, ...)
       }
   }
 
-	va_end(argzeiger);
+	va_end(argptr);
 	
 	
 	return 0;

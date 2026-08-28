@@ -128,7 +128,7 @@ void mt_install()
 	}
 }
 
-int taskmgr_add_task( void* tfunct, const char *bezeichnung, int prio)
+int taskmgr_add_task( void* tfunct, const char *name, int prio)
 {
 	int i;
 	for(i=0; i <= MAX_TASKS-1; i++)
@@ -136,13 +136,13 @@ int taskmgr_add_task( void* tfunct, const char *bezeichnung, int prio)
 		if(tasks[i].state == TASK_STATE_NULL)
 		{
 			tasks[i].pid = i;
-			copy_bounded(tasks[i].name, bezeichnung, sizeof(tasks[i].name));
+			copy_bounded(tasks[i].name, name, sizeof(tasks[i].name));
 			tasks[i].priority = prio;
 			tasks[i].state = TASK_STATE_SUSPENDED;
 			
 			task_states[i] = init_task(task_stacks[i], tfunct);
 			
-			//printf("Task '%s' started with PID %i\n", bezeichnung, i);
+			//printf("Task '%s' started with PID %i\n", name, i);
 			return i;
 		}
 	}
@@ -153,13 +153,13 @@ int taskmgr_add_task( void* tfunct, const char *bezeichnung, int prio)
 		if(tasks[i].state == TASK_STATE_ABORTED)
 		{
 			tasks[i].pid = i;
-			copy_bounded(tasks[i].name, bezeichnung, sizeof(tasks[i].name));
+			copy_bounded(tasks[i].name, name, sizeof(tasks[i].name));
 			tasks[i].priority = prio;
 			tasks[i].state = TASK_STATE_SUSPENDED;
 			
 			task_states[i] = init_task(task_stacks[i], tfunct);
 			
-			//printf("Task '%s' started with PID %i\n", bezeichnung, i);
+			//printf("Task '%s' started with PID %i\n", name, i);
 			return i;
 		}
 	}

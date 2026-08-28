@@ -91,9 +91,9 @@ static void print_memory_map(multiboot_info *mbi)
 {
 	multiboot_mmap_entry *entry;
 	uint32_t offset;
-	uint32_t laenge_kib;
-	uint32_t summe_kib;
-	int gezeigt;
+	uint32_t len_kib;
+	uint32_t total_kib;
+	int shown;
 
 	if(!(mbi->flags & MULTIBOOT_INFO_MEM_MAP))
 	{
@@ -101,8 +101,8 @@ static void print_memory_map(multiboot_info *mbi)
 		return;
 	}
 
-	summe_kib = 0;
-	gezeigt = 0;
+	total_kib = 0;
+	shown = 0;
 	offset = 0;
 
 	printf("Memory map (usable):\n");
@@ -117,21 +117,21 @@ static void print_memory_map(multiboot_info *mbi)
 		if(entry->addr_high != 0) continue;
 
 		if(entry->len_high != 0)
-			laenge_kib = (0xFFFFFFFFu - entry->addr_low) / 1024u;
+			len_kib = (0xFFFFFFFFu - entry->addr_low) / 1024u;
 		else
-			laenge_kib = entry->len_low / 1024u;
+			len_kib = entry->len_low / 1024u;
 
-		summe_kib += laenge_kib;
+		total_kib += len_kib;
 
-		if(gezeigt < 6)
-			printf("  0x%X  %i KiB  type %i\n", entry->addr_low, laenge_kib, entry->type);
-		else if(gezeigt == 6)
+		if(shown < 6)
+			printf("  0x%X  %i KiB  type %i\n", entry->addr_low, len_kib, entry->type);
+		else if(shown == 6)
 			printf("  ...\n");
-		gezeigt++;
+		shown++;
 	}
 
 	printf("  Total: %i KiB (%i MiB) in %i regions\n",
-		summe_kib, (summe_kib / 1024u), gezeigt);
+		total_kib, (total_kib / 1024u), shown);
 }
 
 int kernel(uint32_t magic, multiboot_info *mbi)
