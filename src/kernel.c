@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <hardware.h>
 #include <mm.h>
+#include <vmm.h>
 #define cpuid(in, a, b, c, d) __asm__("cpuid": "=a" (a), "=b" (b), "=c" (c), "=d" (d) : "a" (in));
 
 void *memcpy(void *dest, const void *src, size_t count)
@@ -164,11 +165,32 @@ int kernel(uint32_t magic, multiboot_info *mbi)
 	/* Set up memory management. The size now comes from the bootloader's
 	*  memory map - no more destructive test writes across the address
 	*  space.
-	*  Order: pmm_init() only needs the memory map, heap_init() builds on a
-	*  ready pmm, and both must come before mt_install() so that tasks can
-	*  request memory as well. */
+	*  Order: pmm_init() only needs the memory map, vmm_init() takes its page
+	*  tables from the ready pmm, heap_init() then grows into an already
+	*  mapped range, and all three must come before mt_install() so that
+	*  tasks can request memory as well.
+	*
+	*  Paging goes on here, before idt_install()/isrs_install(), i.e. without
+	*  a page fault handler. That is deliberate:
+	*    - The IDT gates reference a GDT selector, so pulling idt_install()
+	*      forward would mean pulling gdt_install() forward as well and
+	*      rearranging the whole driver block for no real gain.
+	*    - vmm_init() identity maps the kernel and all usable RAM, so every
+	*      pointer keeps its value across the write to CR0.PG. There is no
+	*      access in this window that could legitimately fault.
+	*    - Should it fault anyway, it happens on the very first instruction
+	*      after paging is switched on: a reproducible triple fault right
+	*      after this message, not a subtle bug. A handler would not help
+	*      either, because a broken mapping would just as likely swallow the
+	*      handler itself.
+	*  The page fault handler is for the faults that come later - null
+	*  pointer dereferences, writes into the read-only kernel text - and
+	*  those all happen well after isrs_install(). */
 	print_memory_map(mbi);
 	pmm_init(mbi);
+	vmm_init();
+	printf("Paging on: %i page tables, directory at 0x%X\n",
+		vmm_table_count(), vmm_directory_phys());
 	heap_init();
 	printf("%i MB Memory (%i KB) in %i Frames\n",
 		(pmm_total_bytes() / (1024u * 1024u)),

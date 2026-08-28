@@ -24,9 +24,19 @@ SECTIONS
     kernel_start = .;
     _kernel_start = .;
 
-    /* Code. The Multiboot header lives at the top of this section. */
+    /* Code. The Multiboot header lives at the top of this section.
+     *
+     * The vmm maps everything between text_start and text_end read-only, so
+     * both boundaries have to be page boundaries. ALIGN(4K) on the output
+     * section only guarantees the start; the trailing ". = ALIGN(4K)" pads
+     * the section out to a full page so that text_end is aligned too.
+     * Without that padding the last page of .text would also hold the first
+     * bytes of the following section, and marking it read-only would fault
+     * on the first write to a variable living there. */
     .text ALIGN(4K) :
     {
+        text_start = .;
+
         /* If start.asm ever grows a dedicated section for the header,
          * it is honoured here and comes first. KEEP() protects it from
          * --gc-sections. */
@@ -40,20 +50,31 @@ SECTIONS
 
         *(.text .text.*)
         *(.gnu.linkonce.t.*)
+
+        . = ALIGN(4K);
+        text_end = .;
     }
 
-    /* Read-only data. */
+    /* Read-only data. Same padding rule as .text: the range is a candidate
+     * for a read-only mapping of its own. */
     .rodata ALIGN(4K) :
     {
+        rodata_start = .;
         *(.rodata .rodata.*)
         *(.gnu.linkonce.r.*)
+        . = ALIGN(4K);
+        rodata_end = .;
     }
 
-    /* Initialised data. */
+    /* Initialised data. Writable, so the padding here is only for symmetry
+     * and to keep .bss starting on its own page. */
     .data ALIGN(4K) :
     {
+        data_start = .;
         *(.data .data.*)
         *(.gnu.linkonce.d.*)
+        . = ALIGN(4K);
+        data_end = .;
     }
 
     /* Zero-initialised data (incl. the kernel stack from start.asm). */

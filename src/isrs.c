@@ -9,6 +9,7 @@
 #include <system.h>
 #include <string.h>
 #include <stdio.h>
+#include <vmm.h>
 
 /* settextcolor() lives in scrn.c, but does not (yet) have a prototype in any
 *  header. Declare it locally so that -Wall does not complain here. */
@@ -135,13 +136,81 @@ char *exception_messages[] =
     "Reserved"
 };
 
+/* Number of the page fault exception. */
+#define EXCEPTION_PAGE_FAULT 14
+
+/* Formats value as "0xXXXXXXXX" into buf and returns buf. buf needs 11 bytes.
+*  Our printf() knows neither field widths nor %08X, and hextoa() would drop
+*  the leading zeros ("0x0" instead of "0x00000000"). The padding is therefore
+*  done by hand: addresses of the same length line up under each other, and a
+*  bare "0" does not read like an address at all - which is exactly the case
+*  that matters most, the null pointer. */
+static char *hex32(uint32_t value, char *buf)
+{
+	static const char digits[] = "0123456789ABCDEF";
+	int i;
+
+	buf[0] = '0';
+	buf[1] = 'x';
+	for(i = 0; i < 8; i++)
+	{
+		buf[2 + i] = digits[(value >> (28 - 4 * i)) & 0x0F];
+	}
+	buf[10] = '\0';
+
+	return buf;
+}
+
+/* Prints what the CPU tells us about a page fault: where it happened, which
+*  instruction caused it and what exactly was not allowed. cr2 is handed in
+*  instead of read here, so that the value is the one from the moment the
+*  exception was taken. */
+static void page_fault_report(struct regs *r, uint32_t cr2)
+{
+	char addr[11];
+	char eip[11];
+	unsigned int err;
+
+	err = r->err_code;
+
+	printf("Page fault at %s", hex32(cr2, addr));
+	printf(" (eip %s): ", hex32(r->eip, eip));
+
+	/* Bit 0 separates the two fundamentally different cases: nothing is
+	*  mapped there at all, or something is mapped but the access was not
+	*  permitted (e.g. a write to a read-only page). */
+	printf("%s, ", (err & PF_PROTECTION) ? "protection" : "not present");
+	printf("%s, ", (err & PF_WRITE) ? "write" : "read");
+	printf("%s", (err & PF_USER) ? "user" : "supervisor");
+
+	/* Both are rare and each has exactly one cause, so they are only
+	*  mentioned when they actually occurred. */
+	if(err & PF_RESERVED) printf(", reserved bit");
+	if(err & PF_FETCH) printf(", fetch");
+	printf("\n");
+
+	/* Page zero is deliberately never mapped (see vmm.h). Anything faulting
+	*  inside the first page is therefore a null pointer plus an offset - the
+	*  offset being the member or array index the code was reaching for. */
+	if(cr2 < PAGE_SIZE)
+	{
+		printf("  -> NULL pointer dereference, offset %u\n", (int)cr2);
+	}
+}
+
 void fault_handler(struct regs *r)
 {
 	int pid;
 	int i;
 	struct regs *next;
+	uint32_t cr2;
 
 	pid = taskmgr_get_currpid();
+
+	/* CR2 holds the faulting address, but only until the next page fault
+	*  overwrites it. Read it right away, before any printf() runs. It is
+	*  meaningless for every other exception and simply stays unused there. */
+	cr2 = vmm_read_cr2();
 
 	/* If a running task trips over an exception, it is aborted and the
 	*  context is redirected to the next runnable task. If we simply returned
@@ -155,6 +224,11 @@ void fault_handler(struct regs *r)
 		settextcolor(4,0);
 		printf("Task %i aborted: %s (error code %i, eip %i)\n",
 		       pid, exception_messages[r->int_no], r->err_code, r->eip);
+
+		/* "Page Fault" alone says nothing about what went wrong, so the
+		*  decoded details follow directly below it. */
+		if(r->int_no == EXCEPTION_PAGE_FAULT) page_fault_report(r, cr2);
+
 		settextcolor(15,0);
 
 		/* schedule() only switches tasks once their time slice is used up,
@@ -214,8 +288,13 @@ void fault_handler(struct regs *r)
 	  printf("----------------------------------------------------------\n");
 	  settextcolor(15,0);
 	  printf("The kernel made a boo-boo and couldn't fix it.\n");
-	  printf("Error code %i\nError: %s\n\n", r->err_code, exception_messages[r->int_no]);
-	  printf("PID: %i\n", pid);
+	  printf("Error code %i\nError: %s\n", r->err_code, exception_messages[r->int_no]);
+
+	  /* Same here: for a page fault the generic name is replaced by the
+	  *  address, the instruction and the decoded error code. */
+	  if(r->int_no == EXCEPTION_PAGE_FAULT) page_fault_report(r, cr2);
+
+	  printf("\nPID: %i\n", pid);
 	  printf("CPU HALT\n");
 
 	} else {
@@ -229,6 +308,7 @@ void fault_handler(struct regs *r)
 
 void dump(struct regs *r)
 {
+	char addr[11];
 
 	printf("TomatOS CPU Dump\n");
 	printf("gs: %i, fs: %i, es: %i, ds: %i\n", r->gs, r->fs, r->es, r->ds);
@@ -236,6 +316,15 @@ void dump(struct regs *r)
 	printf("eax: %i, ebx: %i, ecx: %i, edx: %i\n", r->eax, r->ebx, r->ecx, r->edx);
 	printf("int_no: %i, err_code: %i\n", r->int_no, r->err_code);
 	printf("eip: %i, cs: %i, ss: %i\n", r->eip, r->cs, r->ss);
-	printf("eflags: %i, useresp: %i\n\n", r->eflags, r->useresp);
+	printf("eflags: %i, useresp: %i\n", r->eflags, r->useresp);
+
+	/* CR2 is not part of struct regs, so without this line the one address
+	*  that explains the crash would be missing from the dump. */
+	if(r->int_no == EXCEPTION_PAGE_FAULT)
+	{
+		printf("cr2: %s (faulting address)\n", hex32(vmm_read_cr2(), addr));
+	}
+
+	printf("\n");
 
 }

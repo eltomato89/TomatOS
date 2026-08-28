@@ -7,6 +7,7 @@
 #include <asm.h>
 #include <math.h>
 #include <mm.h>
+#include <vmm.h>
 //#include <wmessages.h>
 
 #define NULL 0
@@ -16,6 +17,25 @@
 #define MEM_TEST_SIZE   64
 #define MEM_TEST_SMALL  32
 #define MEM_TEST_LARGE  128
+
+/* Text mode video memory -- identity mapped like everything else, and the
+   one address in the system whose physical location is common knowledge. */
+#define PAGE_VGA_TEXT   0xB8000
+
+/* Offset inside a page for the test that vmm_get_phys() does not just
+   translate the frame but keeps the offset. Deliberately not aligned. */
+#define PAGE_TEST_OFFSET 0x123
+
+/* Where "page -t" starts looking for a free virtual address for its
+   map/unmap test: far above any physical RAM this kernel will see, and far
+   below the top 4 MiB, which a recursive directory mapping would occupy.
+   The address is not used as is -- it is only the starting point of a probe
+   with vmm_is_mapped(), see page_find_free_virt(). */
+#define PAGE_TEST_VIRT   0xE0000000
+#define PAGE_TEST_PROBES 1024
+
+/* Pattern written through the freshly created mapping. */
+#define PAGE_TEST_PATTERN 0xC0FFEE01
 
 void update_infobar() {
 	while(1)
@@ -34,6 +54,7 @@ void task() {
 
 void taskmanager(char *cmd);
 void memory(char *cmd);
+void paging(char *cmd);
 void help(void);
 //void network_test(char *cmd);
 
@@ -42,9 +63,19 @@ static void mem_show_status(void);
 static void mem_selftest(void);
 static void mem_check(int ok);
 
+static void page_print_hex(uint32_t value, int digits);
+static void page_show_status(void);
+static void page_selftest(void);
+static void page_fault_demo(void);
+static void page_check(int ok);
+
 /* Self-test counters, maintained by mem_check(). */
 static int mem_tests_run = 0;
 static int mem_tests_ok = 0;
+
+/* The same for page_check(). */
+static int page_tests_run = 0;
+static int page_tests_ok = 0;
 
 void main()
 {
@@ -70,6 +101,7 @@ void main()
 		/* strcmp() now returns 0 on equality (the usual C semantics). */
 		if(strcmp(word, "taskmgr") == 0) taskmanager(cmd);
 		else if(strcmp(word, "mem") == 0) memory(cmd);
+		else if(strcmp(word, "page") == 0) paging(cmd);
 		else if(strcmp(word, "reboot") == 0) reboot();
 		else if(strcmp(word, "help") == 0) help();
 		else if(strcmp(word, "start") == 0) taskmgr_task_start(taskmgr_add_task( task, "Test Task", TASK_PRIORITY_LOW ));
@@ -397,6 +429,307 @@ void memory(char *cmd)
 	}
 }
 
+/* --- page --------------------------------------------------------------- */
+
+/* Prints value as a zero padded hex number with a fixed number of digits.
+   printf("%X") writes as many digits as the value needs, which would make
+   the address columns dance around -- so the digits are put out by hand,
+   the same idea as mem_print_right() for decimal numbers. */
+static void page_print_hex(uint32_t value, int digits)
+{
+	char *hexdigit = "0123456789ABCDEF";
+	int i;
+
+	printf("0x");
+	for(i = digits - 1; i >= 0; i--)
+	{
+		putch((unsigned char)hexdigit[(value >> (i * 4)) & 0xF]);
+	}
+}
+
+/* One row of the translation table: label, virtual address, physical
+   address behind it and whether the page is mapped at all. The label
+   carries its own padding so the columns line up. */
+static void page_print_translation(char *label, uint32_t virt)
+{
+	printf("%s", label);
+	page_print_hex(virt, 8);
+	printf(" -> ");
+
+	if(vmm_is_mapped(virt))
+	{
+		page_print_hex(vmm_get_phys(virt), 8);
+		printf("  mapped\n");
+	} else {
+		/* Same width as an address, so the last column stays put. */
+		printf("----------  unmapped\n");
+	}
+}
+
+static void page_show_status(void)
+{
+	uint32_t pages;
+	unsigned char *block;
+
+	printf("Paging state:\n");
+
+	if(!vmm_enabled())
+	{
+		printf("  Paging is not enabled.\n");
+		return;
+	}
+
+	pages = vmm_mapped_pages();
+
+	printf("  Status:          enabled\n");
+	printf("  Page directory:  ");
+	page_print_hex(vmm_directory_phys(), 8);
+	printf("  (CR3)\n");
+
+	printf("  Page tables:  ");
+	mem_print_right(vmm_table_count(), 5);
+	printf("   Mapped pages: ");
+	mem_print_right(pages, 7);
+	printf(" (");
+	mem_print_right(pages / (1024 * 1024 / PAGE_SIZE), 5);
+	printf(" MiB)\n");
+
+	/* A few translations that make the identity mapping tangible. The heap
+	   block is only borrowed for the duration of the printout. */
+	block = (unsigned char *)malloc(MEM_TEST_SIZE);
+
+	printf("  Translations:\n");
+	page_print_translation("    Kernel code  ", (uint32_t)main);
+	page_print_translation("    VGA text     ", (uint32_t)PAGE_VGA_TEXT);
+	if(block != 0)
+	{
+		page_print_translation("    Heap block   ", (uint32_t)block);
+	}
+	page_print_translation("    Page zero    ", (uint32_t)0);
+
+	free(block);
+}
+
+/* Records the result of a check and writes the marker to the start of the
+   line. The rest of the line is printed by the caller. Both markers are
+   eight characters wide, so the text behind them lines up. */
+static void page_check(int ok)
+{
+	page_tests_run++;
+
+	if(ok)
+	{
+		page_tests_ok++;
+		printf("  [  OK  ] ");
+	} else {
+		printf("  [FAILED] ");
+	}
+}
+
+/* Identity mapping for one address: the physical address must be the
+   virtual one. */
+static void page_check_identity(char *label, uint32_t virt)
+{
+	uint32_t phys;
+
+	phys = vmm_get_phys(virt);
+	page_check(virt != 0 && phys == virt);
+	printf("%s", label);
+	page_print_hex(virt, 8);
+	printf(" -> ");
+	page_print_hex(phys, 8);
+	printf(" identity\n");
+}
+
+/* First virtual address from PAGE_TEST_VIRT upwards whose page is not
+   mapped. Asking the vmm itself is the only way to be sure the address
+   collides with nothing in use. Returns 0 if everything probed is taken. */
+static uint32_t page_find_free_virt(void)
+{
+	uint32_t virt;
+	int i;
+
+	virt = (uint32_t)PAGE_TEST_VIRT;
+	for(i = 0; i < PAGE_TEST_PROBES; i++)
+	{
+		if(!vmm_is_mapped(virt)) return virt;
+		virt += PAGE_SIZE;
+	}
+
+	return 0;
+}
+
+static void page_selftest(void)
+{
+	unsigned char *block;
+	uint32_t *frame;
+	volatile uint32_t *window;
+	uint32_t virt;
+	uint32_t base;
+	uint32_t base_phys;
+	uint32_t off_phys;
+	uint32_t heap_addr;
+	uint32_t seen;
+	int mapped;
+	int ok;
+
+	page_tests_run = 0;
+	page_tests_ok = 0;
+
+	printf("Paging self-test:\n");
+
+	if(!vmm_enabled())
+	{
+		printf("  Paging is not enabled -- nothing to test.\n");
+		return;
+	}
+
+	printf("  Directory ");
+	page_print_hex(vmm_directory_phys(), 8);
+	printf(", %u tables, %u pages mapped\n",
+	       (int)vmm_table_count(), (int)vmm_mapped_pages());
+
+	/* 1.-3. The identity mapping must hold everywhere, not just where the
+	         kernel happens to live -- code, heap and the VGA buffer sit in
+	         three different regions. */
+	block = (unsigned char *)malloc(MEM_TEST_SIZE);
+	heap_addr = (uint32_t)block;
+
+	page_check_identity("Kernel   ", (uint32_t)main);
+	page_check_identity("VGA text ", (uint32_t)PAGE_VGA_TEXT);
+	page_check_identity("Heap     ", heap_addr);
+
+	/* 4. A translation must keep the offset within the page. An address in
+	      the middle of a page therefore has to come out that much behind
+	      the physical address of the page start. */
+	base = (uint32_t)main & ~((uint32_t)PAGE_SIZE - 1);
+	base_phys = vmm_get_phys(base);
+	off_phys = vmm_get_phys(base + PAGE_TEST_OFFSET);
+	page_check(base_phys != 0 && off_phys == base_phys + PAGE_TEST_OFFSET);
+	printf("Offset: page ");
+	page_print_hex(base, 8);
+	printf(" + 0x123 -> ");
+	page_print_hex(off_phys, 8);
+	printf("\n");
+
+	/* 5. Page zero stays unmapped, so a null pointer faults instead of
+	      quietly reading the interrupt vector table. Checked by asking the
+	      vmm -- dereferencing null here would kill the shell task. */
+	page_check(!vmm_is_mapped(0) && vmm_get_phys(0) == 0);
+	printf("Page zero: is_mapped(0) = %i, get_phys(0) = %i (null trap)\n",
+	       vmm_is_mapped(0), (int)vmm_get_phys(0));
+
+	/* 6. Whatever the heap hands out has to lie in mapped memory --
+	      otherwise malloc() would be handing out page faults. */
+	page_check(block != 0 && vmm_is_mapped(heap_addr));
+	printf("Heap block ");
+	page_print_hex(heap_addr, 8);
+	printf(" lies in mapped memory\n");
+	free(block);
+
+	/* 7. Map a fresh frame at a virtual address that is provably free,
+	      write to it and read it back. This is the one check that exercises
+	      vmm_map() rather than just inspecting what vmm_init() built. */
+	frame = (uint32_t *)pmm_alloc_frame();
+	virt = page_find_free_virt();
+	mapped = 0;
+	ok = 0;
+
+	if(frame != 0 && virt != 0 &&
+	   vmm_map(virt, (uint32_t)frame, PAGE_PRESENT | PAGE_WRITE) == 0)
+	{
+		mapped = 1;
+		window = (volatile uint32_t *)virt;
+		window[0] = (uint32_t)PAGE_TEST_PATTERN;
+		window[1] = ~(uint32_t)PAGE_TEST_PATTERN;
+		window[PAGE_SIZE / 4 - 1] = (uint32_t)PAGE_TEST_PATTERN;
+
+		ok = (window[0] == (uint32_t)PAGE_TEST_PATTERN &&
+		      window[1] == ~(uint32_t)PAGE_TEST_PATTERN &&
+		      window[PAGE_SIZE / 4 - 1] == (uint32_t)PAGE_TEST_PATTERN &&
+		      vmm_get_phys(virt) == (uint32_t)frame &&
+		      vmm_is_mapped(virt));
+	}
+	page_check(ok);
+	printf("Mapped ");
+	page_print_hex(virt, 8);
+	printf(" -> ");
+	page_print_hex((uint32_t)frame, 8);
+	printf(", pattern read back\n");
+
+	/* 8. The new mapping must point at the very same physical page, so the
+	      frame's own identity address has to show the pattern too. */
+	ok = 0;
+	seen = 0;
+	if(mapped && vmm_is_mapped((uint32_t)frame))
+	{
+		seen = frame[0];
+		ok = (seen == (uint32_t)PAGE_TEST_PATTERN);
+	}
+	page_check(ok);
+	printf("Frame ");
+	page_print_hex((uint32_t)frame, 8);
+	printf(" via identity reads ");
+	page_print_hex(seen, 8);
+	printf("\n");
+
+	/* 9. After vmm_unmap() the address must be gone for good. */
+	if(mapped) vmm_unmap(virt);
+	page_check(mapped && !vmm_is_mapped(virt) && vmm_get_phys(virt) == 0);
+	printf("Unmapped ");
+	page_print_hex(virt, 8);
+	printf(": is_mapped = %i\n", vmm_is_mapped(virt));
+
+	pmm_free_frame(frame);
+
+	printf("  Result: %i of %i checks passed\n",
+	       page_tests_ok, page_tests_run);
+}
+
+/* Deliberate null pointer write, only reachable via "page -f". The pointer
+   itself is volatile so the compiler has to load it and cannot fold the
+   access into an undefined-behaviour trap of its own making. */
+static uint32_t * volatile page_fault_target = 0;
+
+static void page_fault_demo(void)
+{
+	printf("Writing to the null pointer on purpose.\n");
+	printf("The page fault handler takes over from here -- this task dies.\n");
+
+	*page_fault_target = (uint32_t)PAGE_TEST_PATTERN;
+
+	/* Not reached while page zero stays unmapped. */
+	printf("No fault happened -- page zero appears to be mapped!\n");
+}
+
+void paging(char *cmd)
+{
+	char opt[100];
+
+	if(prmc(cmd) == 0)
+	{
+		page_show_status();
+		return;
+	}
+
+	strcpy(opt, prmv(1, cmd));
+
+	if(strcmp(opt, "-t") == 0)
+	{
+		page_selftest();
+	}
+	else if(strcmp(opt, "-f") == 0)
+	{
+		page_fault_demo();
+	} else {
+		printf("Syntax: page [-t] [-f]\n");
+		printf("\t          Show the paging state\n");
+		printf("\t-t        Run the paging self-test\n");
+		printf("\t-f        Fault on the null pointer on purpose,\n");
+		printf("\t          which kills the current task\n");
+	}
+}
+
 void help(void)
 {
 	printf("TomatOS Help\n");
@@ -405,6 +738,7 @@ void help(void)
 	printf("\ttaskmgr   List and control tasks\n");
 	printf("\tstart     Start a test task\n");
 	printf("\tmem       Show memory usage, mem -t tests the heap\n");
+	printf("\tpage      Show paging state, page -t tests paging\n");
 	printf("\treboot    Restart the computer\n");
 	printf("\texit      Exit the shell\n");
 }

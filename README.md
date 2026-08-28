@@ -2,7 +2,7 @@
 
 A 32-bit x86 hobby kernel (Multiboot 1) — preemptive scheduler, VGA text
 console, PS/2 keyboard with German layout, PIT timer, CMOS clock, physical
-frame allocator, kernel heap and a small shell. Originally written between
+frame allocator, kernel heap, paging and a small shell. Originally written between
 2006 and 2011, ported to a current Linux toolchain in 2026.
 
 ## Requirements
@@ -36,9 +36,21 @@ QEMU loads the Multiboot ELF directly via `-kernel`, with no bootloader
 involved — the fastest way to try a change. Quit with `Ctrl-C` in the
 terminal.
 
-The shell offers `help`, `taskmgr`, `start`, `mem`, `reboot` and `exit`.
-`taskmgr` without an argument prints its own syntax, `mem` shows the memory
-state, and `mem -t` runs a heap self-test.
+The shell offers `help`, `taskmgr`, `start`, `mem`, `page`, `reboot` and
+`exit`. `taskmgr` without an argument prints its own syntax, `mem` and `page`
+show the memory and paging state, and `mem -t` / `page -t` run self-tests.
+
+### Memory layout
+
+The kernel is **identity mapped**: virtual address equals physical address.
+Paging is on, with two useful consequences. Page zero is deliberately left
+unmapped, so a null pointer dereference raises a page fault naming the
+offending address instead of quietly reading the real-mode interrupt vector
+table. And the kernel's own code is mapped read-only, enforced by `CR0.WP`
+— without that bit the CPU ignores read-only page table entries in ring 0.
+
+`page -f` triggers a null pointer write on purpose to demonstrate the fault
+handler; it kills the calling task, and the system carries on.
 
 ### Display
 
