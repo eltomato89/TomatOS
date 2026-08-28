@@ -93,6 +93,78 @@ QEMU_KEYMAP ?= de
 QEMUFLAGS := -m 32 -k $(QEMU_KEYMAP)
 
 # ---------------------------------------------------------------------------
+#  Anzeige ueber VNC
+#
+#  Dieses QEMU ist ohne grafische Display-Backends gebaut -- "-display help"
+#  meldet nur "none", denn qemu-ui-gtk und Verwandte sind bei Arch eigene
+#  Pakete. Der eingebaute VNC-Server (aus qemu-common) ist damit der Weg zum
+#  Bild. Die run-Targets starten ihn und haengen automatisch einen Client an.
+#
+#  Gebunden wird bewusst an 127.0.0.1: QEMU lauscht sonst auf allen
+#  Interfaces, und zwar ohne Passwort.
+#
+#  Abschalten (z.B. wenn qemu-ui-gtk installiert ist):  make run VNC=0
+#  Anderer Client:      make run VNC_CLIENT=gvncviewer
+#  Andere Anzeige-Nr.:  make run VNC_DISPLAY=3
+VNC         ?= 1
+VNC_DISPLAY ?= 1
+VNC_HOST    := 127.0.0.1
+VNC_PORT    := $(shell expr 5900 + $(VNC_DISPLAY))
+
+# Ersten verfuegbaren Client aus der Liste nehmen, sofern nicht vorgegeben.
+VNC_CLIENT ?= $(firstword $(foreach c,vncviewer gvncviewer vinagre xtightvncviewer krdc, \
+                  $(shell command -v $(c) 2>/dev/null)))
+
+# Aufrufform je Client: die meisten wollen "host:display", remmina eine URL.
+VNC_TARGET = $(if $(findstring remmina,$(VNC_CLIENT)), \
+                 vnc://$(VNC_HOST):$(VNC_PORT), \
+                 $(VNC_HOST):$(VNC_DISPLAY))
+
+ifeq ($(VNC),1)
+  QEMU_DISPLAY_FLAGS := -vnc $(VNC_HOST):$(VNC_DISPLAY)
+else
+  QEMU_DISPLAY_FLAGS :=
+endif
+
+# Startet QEMU und verbindet parallel den VNC-Client.
+#
+# QEMU laeuft im Vordergrund und behaelt damit stdio fuer die serielle
+# Ausgabe; Ctrl-C beendet wie gewohnt. Der Client wartet in einer Subshell,
+# bis der Port offen ist, und wird beim Beenden von QEMU mitgenommen.
+#   $(1) = QEMU-Argumente fuer das jeweilige Bootmedium
+define run_qemu
+	$(call need,$(QEMU),qemu-system-x86)
+	@if [ "$(VNC)" = "1" ] && [ -z "$(VNC_CLIENT)" ]; then \
+		printf '\nERROR: kein VNC-Client gefunden.\n'; \
+		printf '       Gesucht wurde nach: vncviewer gvncviewer vinagre xtightvncviewer krdc\n'; \
+		printf '       Installieren, z.B.:  sudo pacman -S tigervnc\n'; \
+		printf '       Oder eigenen Client angeben:  make $@ VNC_CLIENT=/pfad/zum/client\n'; \
+		printf '       Oder ohne VNC starten:        make $@ VNC=0\n\n'; \
+		exit 1; \
+	fi
+	@if [ "$(VNC)" = "1" ]; then \
+		echo "  VNC     $(VNC_HOST):$(VNC_DISPLAY) (Port $(VNC_PORT)) -> $(notdir $(VNC_CLIENT))"; \
+	fi
+	@set -e; \
+	 CLIENT_PID=""; \
+	 if [ "$(VNC)" = "1" ]; then \
+	   ( for i in $$(seq 1 100); do \
+	       if ss -ltn 2>/dev/null | grep -q '127\.0\.0\.1:$(VNC_PORT) '; then \
+	         exec $(VNC_CLIENT) $(VNC_TARGET); \
+	       fi; \
+	       sleep 0.1; \
+	     done; \
+	     echo "  VNC-Port $(VNC_PORT) kam nicht hoch - Client nicht gestartet." >&2 \
+	   ) >/dev/null 2>&1 & \
+	   CLIENT_PID=$$!; \
+	   trap 'kill $$CLIENT_PID 2>/dev/null; pkill -P $$CLIENT_PID 2>/dev/null; true' EXIT INT TERM; \
+	 fi; \
+	 $(QEMU) $(1) -serial stdio $(QEMU_DISPLAY_FLAGS) $(QEMUFLAGS) \
+	   || { rc=$$?; \
+	        [ $$rc -eq 130 ] || [ $$rc -eq 143 ] || exit $$rc; }
+endef
+
+# ---------------------------------------------------------------------------
 #  Sources / objects
 #
 #  Wildcard based -- no hand-maintained file list.
@@ -152,8 +224,7 @@ $(BUILD_DIR):
 # --- run directly (fastest test cycle) -------------------------------------
 # QEMU understands Multiboot ELF kernels, so no bootloader is involved.
 run: $(KERNEL)
-	$(call need,$(QEMU),qemu-system-x86)
-	$(QEMU) -kernel $(KERNEL) -serial stdio $(QEMUFLAGS)
+	$(call run_qemu,-kernel $(KERNEL))
 
 # --- bootable ISO ----------------------------------------------------------
 iso: $(ISO)
@@ -178,8 +249,7 @@ $(ISO): $(KERNEL)
 	@echo "  ISO ready: $@"
 
 run-iso: $(ISO)
-	$(call need,$(QEMU),qemu-system-x86)
-	$(QEMU) -cdrom $(ISO) -serial stdio $(QEMUFLAGS)
+	$(call run_qemu,-cdrom $(ISO))
 
 # --- GRUB Legacy floppy image ----------------------------------------------
 # The image in bin/ already contains stage1/stage2/menu.lst; menu.lst loads
@@ -195,12 +265,10 @@ $(FLOPPY): $(KERNEL) $(FLOPPY_TMPL) | $(BUILD_DIR)
 	@echo "  Floppy ready: $@"
 
 run-floppy: $(FLOPPY)
-	$(call need,$(QEMU),qemu-system-x86)
-	$(QEMU) -fda $(FLOPPY) -serial stdio $(QEMUFLAGS)
+	$(call run_qemu,-fda $(FLOPPY))
 
 # --- debugging -------------------------------------------------------------
 debug: $(KERNEL)
-	$(call need,$(QEMU),qemu-system-x86)
 	@echo ""
 	@echo "  QEMU is starting halted with a GDB stub on tcp:1234."
 	@echo "  In a second terminal:"
@@ -210,7 +278,7 @@ debug: $(KERNEL)
 	@echo "      (gdb) break kernel"
 	@echo "      (gdb) continue"
 	@echo ""
-	$(QEMU) -s -S -kernel $(KERNEL) -serial stdio $(QEMUFLAGS)
+	$(call run_qemu,-s -S -kernel $(KERNEL))
 
 # --- write the ISO to a USB stick ------------------------------------------
 # Usage: make usb DEV=/dev/sdX
@@ -257,6 +325,12 @@ help:
 	@echo "  usb         dd the ISO onto a USB stick: make usb DEV=/dev/sdX"
 	@echo "  clean       Remove $(BUILD_DIR)/"
 	@echo "  help        This text"
+	@echo ""
+	@echo "Optionen fuer die run-Targets:"
+	@echo "  VNC=0                 ohne VNC starten"
+	@echo "  VNC_CLIENT=<prog>     anderen VNC-Client verwenden"
+	@echo "  VNC_DISPLAY=<n>       andere Anzeige-Nummer (Port 5900+n)"
+	@echo "  QEMU_KEYMAP=<layout>  Tastaturlayout, Vorgabe: de"
 	@echo ""
 
 # Header dependencies generated by -MMD -MP (kept last on purpose).

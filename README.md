@@ -35,7 +35,28 @@ make run
 
 QEMU lädt den Multiboot-ELF direkt per `-kernel`, ganz ohne Bootloader —
 das ist der schnellste Weg zum Ausprobieren. Beenden mit `Ctrl-C` im
-Terminal oder `Strg-Alt-Q` im QEMU-Fenster.
+Terminal.
+
+### Anzeige
+
+Das QEMU-Paket unter Arch bringt keine grafischen Display-Backends mit
+(`-display help` meldet nur `none`; `qemu-ui-gtk` und Verwandte sind eigene
+Pakete). Die `run`-Targets nutzen deshalb QEMUs eingebauten VNC-Server und
+starten automatisch einen Client, sobald der Port offen ist. Der Server
+lauscht nur auf `127.0.0.1` — ohne diese Bindung wäre die VM ohne Passwort
+aus dem Netz erreichbar.
+
+Ein Client wird gebraucht, z.B. `sudo pacman -S tigervnc`. Gesucht wird
+nach `vncviewer`, `gvncviewer`, `vinagre`, `xtightvncviewer` und `krdc`.
+
+```sh
+make run VNC_CLIENT=gvncviewer   # anderer Client
+make run VNC_DISPLAY=3           # andere Anzeige-Nummer (Port 5903)
+make run VNC=0                   # ohne VNC
+```
+
+Alternativ lässt sich mit `sudo pacman -S qemu-ui-gtk` ein natives Fenster
+nachrüsten; dann genügt `make run VNC=0 QEMUFLAGS="-m 32 -k de -display gtk"`.
 
 An der Shell stehen `help`, `taskmgr`, `start`, `mem`, `reboot` und `exit` zur
 Verfügung. `taskmgr` ohne Argument zeigt seine eigene Syntax, `mem` den
