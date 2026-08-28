@@ -38,7 +38,8 @@ das ist der schnellste Weg zum Ausprobieren. Beenden mit `Ctrl-C` im
 Terminal oder `Strg-Alt-Q` im QEMU-Fenster.
 
 An der Shell stehen `help`, `taskmgr`, `start`, `mem`, `reboot` und `exit` zur
-Verfügung. `taskmgr` ohne Argument zeigt seine eigene Syntax.
+Verfügung. `taskmgr` ohne Argument zeigt seine eigene Syntax, `mem` den
+Speicherzustand und `mem -t` einen Selbsttest des Heaps.
 
 ### Tastaturlayout
 
