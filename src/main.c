@@ -27,14 +27,13 @@ void task() {
 }	
 
 void taskmanager(char *cmd);
-void help(char *cmd);
+void help(void);
 //void network_test(char *cmd);
 
 void main()
 {
 	char cmd[256];
-	
-	int i;
+
     printf("eltomato's TomatOS 0.31 [Version 0.31 Build 2011/27/09]\n");
     printf("(c) Copyright 2006-2011 Jens Köhler\n\n");
 	
@@ -46,19 +45,23 @@ void main()
 		
 		scan(cmd);
 		
-		if(strcmp(prmv(0, cmd), "taskmgr") == 1) taskmanager(cmd);
-		if(strcmp(prmv(0, cmd), "reboot") == 1) reboot();
-		if(strcmp(prmv(0, cmd), "help") == 1) help(cmd);
-		if(strcmp(prmv(0, cmd), "start") == 1) taskmgr_task_start(taskmgr_add_task( task, "Test Task", TASK_PRIORITY_LOW ));
-		
-		//if(strcmp(prmv(0, cmd), "test") == 1) network_test(cmd);
-		
-	} while(strcmp(cmd, "exit")!=1);
-	
+		/* strcmp() liefert jetzt 0 bei Gleichheit (uebliche C-Semantik). */
+		if(strcmp(prmv(0, cmd), "taskmgr") == 0) taskmanager(cmd);
+		if(strcmp(prmv(0, cmd), "reboot") == 0) reboot();
+		if(strcmp(prmv(0, cmd), "help") == 0) help();
+		if(strcmp(prmv(0, cmd), "start") == 0) taskmgr_task_start(taskmgr_add_task( task, "Test Task", TASK_PRIORITY_LOW ));
+
+		//if(strcmp(prmv(0, cmd), "test") == 0) network_test(cmd);
+
+	} while(strcmp(cmd, "exit") != 0);
+
 	//taskmgr_killall();
-	
+
 	cls();
 	printf("Sie können den Computer jetzt ausschalten!");
+
+	/* main() laeuft als Task und darf nicht zurueckkehren. */
+	for(;;);
 }
 /*
 void network_test(char *cmd)
@@ -67,7 +70,7 @@ void network_test(char *cmd)
 	char i;
 	for (i = 0; i < 6; i++)
 	{
-		mac_address[i] = inportb(ioaddr + i); /*ioaddr is the base address obtainable from the PCI device configuration space.* /
+		mac_address[i] = inportb(ioaddr + i); // ioaddr is the base address obtainable from the PCI device configuration space.
 	}
 	
 	printf("MAC ADDRESS: %s", mac_address);
@@ -84,12 +87,14 @@ void taskmanager(char *cmd)
 		printf("\t-r PID    Task fortführen\n");
 	}
 	
-	if(strcmp(prmv(1, cmd), "-l")) //List tasks
+	/* strcmp() liefert 0 bei Gleichheit -- der Rueckgabewert darf deshalb
+	   nicht mehr direkt als Wahrheitswert benutzt werden. */
+	if(strcmp(prmv(1, cmd), "-l") == 0) //List tasks
 	{
 		taskmgr_list_tasks();
 	}
 	
-	if(strcmp(prmv(1, cmd), "-k")) //Kill PID
+	if(strcmp(prmv(1, cmd), "-k") == 0) //Kill PID
 	{
 		if(prmc(cmd) < 2)
 		{
@@ -99,7 +104,7 @@ void taskmanager(char *cmd)
 		}
 	}
 	
-	if(strcmp(prmv(1, cmd), "-s")) //Suspend PID
+	if(strcmp(prmv(1, cmd), "-s") == 0) //Suspend PID
 	{
 		if(prmc(cmd) < 2)
 		{
@@ -108,7 +113,7 @@ void taskmanager(char *cmd)
 			taskmgr_task_suspend(atoi(prmv(2, cmd)));
 		}
 	}
-	if(strcmp(prmv(1, cmd), "-r")) //Resume PID
+	if(strcmp(prmv(1, cmd), "-r") == 0) //Resume PID
 	{
 		if(prmc(cmd) < 2)
 		{
@@ -120,7 +125,7 @@ void taskmanager(char *cmd)
 	
 }
 
-void help(char *cmd)
+void help(void)
 {
 	printf("TomatOS Help\n");
 	printf("Verfügbare Befehle: taskmgr");

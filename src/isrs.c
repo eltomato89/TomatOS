@@ -10,6 +10,17 @@
 #include <string.h>
 #include <stdio.h>
 
+/* settextcolor() lebt in scrn.c, hat aber (noch) keinen Prototyp in einem
+*  Header. Lokal deklarieren, damit -Wall hier nicht meckert. */
+extern void settextcolor(unsigned char forecolor, unsigned char backcolor);
+
+/* Wie oft schedule() hoechstens aufgerufen wird, um einen abgestuerzten Task
+*  zu verlassen. schedule() wechselt den Task erst, wenn dessen Zeitscheibe
+*  (cpu_time) aufgebraucht ist, und zieht pro Aufruf eine Scheibe ab. Die
+*  Obergrenze sorgt dafuer, dass wir im Interrupt-Kontext garantiert nicht
+*  endlos schleifen (groesste Prioritaet ist TASK_PRIORITY_REALTIME = 20). */
+#define FAULT_SCHEDULE_TRIES 64
+
 extern void isr0();
 extern void isr1();
 extern void isr2();
@@ -82,7 +93,10 @@ void isrs_install()
     idt_set_gate(31, (unsigned)isr31, 0x08, 0x8E);
 }
 
-unsigned char *exception_messages[] =
+/* char* statt unsigned char*: die Texte gehen an printf("%s") und an
+*  taskmgr_task_abort(const char*), unsigned char* erzeugte dort nur
+*  -Wpointer-sign-Warnungen. */
+char *exception_messages[] =
 {
     "Division By Zero",
     "Debug",
@@ -123,55 +137,96 @@ unsigned char *exception_messages[] =
 
 void fault_handler(struct regs *r)
 {
-	
-	
-	
-    int pid = taskmgr_get_currpid();
-	if(pid >= 0)
+	int pid;
+	int i;
+	struct regs *next;
+
+	pid = taskmgr_get_currpid();
+
+	/* Faellt ein laufender Task ueber eine Exception, wird er abgebrochen und
+	*  der Kontext auf den naechsten lauffaehigen Task umgebogen. Wuerden wir
+	*  hier einfach zurueckkehren, wuerde der iret am Ende von isr_common_stub
+	*  genau auf die fehlerhafte Instruktion springen und die Exception
+	*  endlos erneut ausloesen. */
+	if(pid >= 0 && r->int_no < 32)
 	{
 		taskmgr_task_abort(pid, r->err_code, exception_messages[r->int_no]);
-	}
-	else 
-	{
-	
-		if (r->int_no < 32)
+
+		/* Kurze, sichtbare Rueckmeldung - ein Absturz soll nicht
+		*  stillschweigend passieren. */
+		settextcolor(4,0);
+		printf("Task %i abgebrochen: %s (Errorcode %i, eip %i)\n",
+		       pid, exception_messages[r->int_no], r->err_code, r->eip);
+		settextcolor(15,0);
+
+		/* schedule() wechselt den Task erst, wenn dessen Zeitscheibe
+		*  aufgebraucht ist, und liefert bis dahin den uebergebenen Kontext
+		*  zurueck. Deshalb so lange aufrufen, bis ein anderer Kontext
+		*  herauskommt - aber nur begrenzt oft, damit hier im Interrupt
+		*  keine Endlosschleife entstehen kann. Der abgebrochene Task ist
+		*  nicht mehr RUNNING und wird von der Suche uebersprungen. */
+		next = r;
+		for(i=0; i < FAULT_SCHEDULE_TRIES; i++)
 		{
-		  
-		  //cls();
-		  settextcolor(4,0);
-		  printf("                                   ^~~~^\n");
-		  printf("                                  -     -\n");
-		  printf("                                ..       ..\n");
-		  printf("                               ~           ~\n");
-		  printf("                              .             .\n");
-		  printf("                             (;:   BOOM!   :;)\n");
-		  printf("----------                    (:           :)\n");
-		  printf("| PANIC! |                      ,         ,\n");
-		  printf("|_  _____|                       :._   _.:\n");
-		  printf("  |/                                | |\n");
-		  printf(" 0                                (=====)\n");
-		  printf("- -                                 | |\n");
-		  printf(" |                                  | |\n");
-		  printf("/ \\                              ((/   \\))\n");
-		  settextcolor(2,0);
-		  printf("----------------------------------------------------------\n");
-		  settextcolor(15,0);
-		  printf("The kernel made a boo-boo and couldn't fix it.\n");
-		  printf("Errorcode %i\nError: %s\n\n", r->err_code, exception_messages[r->int_no]);
-		  printf("PID: %i\n", taskmgr_get_currpid());
-		  printf("CPU HALT\n");
-		  
-		  
-		} else {
-		
-			printf("fault_handler() r=%i\n", r->int_no);
+			next = schedule(r);
+			if(next != r) break;
 		}
 
+		if(next != r)
+		{
+			/* Kontext in place ersetzen: isr_common_stub stellt saemtliche
+			*  Register aus genau diesem Speicherbereich wieder her und
+			*  springt per iret hinein. Das entspricht dem "mov esp, eax"
+			*  des IRQ-Pfades, nur ohne Aenderung am Assembler. */
+			*r = *next;
+			return;
+		}
+
+		/* schedule() gibt den unveraenderten Kontext zurueck, wenn kein Task
+		*  mehr lauffaehig ist. Dann gibt es nichts, wohin der iret springen
+		*  koennte, ohne die Exception erneut auszuloesen -> anhalten. */
+		settextcolor(4,0);
+		printf("Kein lauffaehiger Task mehr uebrig - CPU HALT\n");
+		settextcolor(15,0);
 		dump(r);
 		for(;;);
-	
 	}
-    
+
+	/* Kein Task aktiv: der Kernel selbst ist gestolpert -> Kernel-Panik. */
+	if (r->int_no < 32)
+	{
+
+	  //cls();
+	  settextcolor(4,0);
+	  printf("                                   ^~~~^\n");
+	  printf("                                  -     -\n");
+	  printf("                                ..       ..\n");
+	  printf("                               ~           ~\n");
+	  printf("                              .             .\n");
+	  printf("                             (;:   BOOM!   :;)\n");
+	  printf("----------                    (:           :)\n");
+	  printf("| PANIC! |                      ,         ,\n");
+	  printf("|_  _____|                       :._   _.:\n");
+	  printf("  |/                                | |\n");
+	  printf(" 0                                (=====)\n");
+	  printf("- -                                 | |\n");
+	  printf(" |                                  | |\n");
+	  printf("/ \\                              ((/   \\))\n");
+	  settextcolor(2,0);
+	  printf("----------------------------------------------------------\n");
+	  settextcolor(15,0);
+	  printf("The kernel made a boo-boo and couldn't fix it.\n");
+	  printf("Errorcode %i\nError: %s\n\n", r->err_code, exception_messages[r->int_no]);
+	  printf("PID: %i\n", pid);
+	  printf("CPU HALT\n");
+
+	} else {
+
+		printf("fault_handler() r=%i\n", r->int_no);
+	}
+
+	dump(r);
+	for(;;);
 }
 
 void dump(struct regs *r)
@@ -179,10 +234,10 @@ void dump(struct regs *r)
 
 	printf("TomatOS CPU Dump\n");
 	printf("gs: %i, fs: %i, es: %i, ds: %i\n", r->gs, r->fs, r->es, r->ds);
-	printf("edi: %i, esi: %i, esp: %i\n", r->edi, r->esi, r->ebp, r->esp);
+	printf("edi: %i, esi: %i, ebp: %i, esp: %i\n", r->edi, r->esi, r->ebp, r->esp);
 	printf("eax: %i, ebx: %i, ecx: %i, edx: %i\n", r->eax, r->ebx, r->ecx, r->edx);
 	printf("int_no: %i, err_code: %i\n", r->int_no, r->err_code);
 	printf("eip: %i, cs: %i, ss: %i\n", r->eip, r->cs, r->ss);
 	printf("eflags: %i, useresp: %i\n\n", r->eflags, r->useresp);
-	
+
 }

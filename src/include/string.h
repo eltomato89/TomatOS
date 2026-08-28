@@ -3,6 +3,7 @@
 extern char *itoa(int val);
 extern int atoi(char *val);
 extern size_t strlen(const char *str);
+extern int strcmp(const char *str1, const char *str2);
 extern char *	strcat(char *_s1, const char *_s2);
 extern char *hextoa(int val);
 //extern void strcpy(char *dest, char *source);

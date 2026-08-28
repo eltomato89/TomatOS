@@ -1,26 +1,27 @@
 #include <system.h>
 #include <stdio.h>
+#include <string.h>
 
 long register_read(char* reg)
 {
 	long r;
-	if(strcmp(reg, "eax"))
+	if(strcmp(reg, "eax") == 0)
 	{
 		asm ( "mov %%eax, %0;" : "=r"(r)); // eax into r
 
-	} else if(strcmp(reg, "ebx"))
+	} else if(strcmp(reg, "ebx") == 0)
 	{
 		asm ( "mov %%ebx, %0;" : "=r"(r));
-	} else if(strcmp(reg, "ecx"))
+	} else if(strcmp(reg, "ecx") == 0)
 	{
 		asm ( "mov %%ecx, %0;" : "=r"(r));
-	} else if(strcmp(reg, "edx"))
+	} else if(strcmp(reg, "edx") == 0)
 	{
 		asm ( "mov %%edx, %0;" : "=r"(r));
-	} else if(strcmp(reg, "esi"))
+	} else if(strcmp(reg, "esi") == 0)
 	{
 		asm ( "mov %%esi, %0;" : "=r"(r));
-	} else if(strcmp(reg, "edi"))
+	} else if(strcmp(reg, "edi") == 0)
 	{
 		asm ( "mov %%edi, %0;" : "=r"(r));
 	} else {
@@ -33,23 +34,23 @@ long register_read(char* reg)
 
 void register_write(char* reg, long value)
 {
-	if(strcmp(reg, "eax"))
+	if(strcmp(reg, "eax") == 0)
 	{
 		asm ( "mov %0, %%eax; " : : "r"(value)); // a into eax
 
-	} else if(strcmp(reg, "ebx"))
+	} else if(strcmp(reg, "ebx") == 0)
 	{
 		asm ( "mov %0, %%ebx; " : : "r"(value));
-	} else if(strcmp(reg, "ecx"))
+	} else if(strcmp(reg, "ecx") == 0)
 	{
 		asm ( "mov %0, %%ecx; " : : "r"(value));
-	} else if(strcmp(reg, "edx"))
+	} else if(strcmp(reg, "edx") == 0)
 	{
 		asm ( "mov %0, %%edx; " : : "r"(value));
-	} else if(strcmp(reg, "esi"))
+	} else if(strcmp(reg, "esi") == 0)
 	{
 		asm ( "mov %0, %%esi; " : : "r"(value));
-	} else if(strcmp(reg, "edi"))
+	} else if(strcmp(reg, "edi") == 0)
 	{
 		asm ( "mov %0, %%edi; " : : "r"(value));
 	} else {

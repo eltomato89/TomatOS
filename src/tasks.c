@@ -4,24 +4,42 @@
 
 #define MAX_TASKS 64
 #define NUM_OF_PRIORITIES 4
-void prio_queue_dump();
-void queue_push(int pid);
 
 static int current_task = -1;
-
-static int q = 2;
 
 task_settings tasks[MAX_TASKS];
 static uint8_t task_stacks[MAX_TASKS][4096];
 static struct regs* task_states[MAX_TASKS];
 
-unsigned char *readable_task_state[] =
+char *readable_task_state[] =
 {
     "Running",
     "Suspended",
 	"Aborted",
 	"Unused"
 };
+
+//Sichere Kopie in einen Puffer fester Groesse: kopiert hoechstens size-1 Zeichen
+//und terminiert immer mit '\0'. Ersetzt strcpy() an den Stellen, an denen die
+//Quelle aus einem Aufruferpuffer beliebiger Laenge stammt.
+static void copy_bounded(char *dest, const char *src, int size)
+{
+	int i;
+
+	if(dest == 0 || size <= 0) return;
+
+	if(src == 0)
+	{
+		dest[0] = '\0';
+		return;
+	}
+
+	for(i=0; i < size-1 && src[i] != '\0'; i++)
+	{
+		dest[i] = src[i];
+	}
+	dest[i] = '\0';
+}
 
 
 struct regs* init_task(uint8_t* stack, void* entry)
@@ -51,12 +69,6 @@ struct regs* init_task(uint8_t* stack, void* entry)
 }
 
 
- 
-void init_multitasking(void)
-{
-		
-}
- 
 struct regs* schedule(struct regs* cpu)
 {
 	int i;
@@ -105,14 +117,14 @@ struct regs* schedule(struct regs* cpu)
     return cpu;
 }
 
-int mt_install()
+//Kein Aufrufer wertet ein Ergebnis aus, daher void statt int.
+void mt_install()
 {
 	int i;
 	for(i=0; i <= MAX_TASKS-1; i++) //Alle Task-Slots als unbenutzt definieren
 	{
 		tasks[i].state = TASK_STATE_NULL;
 	}
-	
 }
 
 int taskmgr_add_task( void* tfunct, const char *bezeichnung, int prio)
@@ -123,7 +135,7 @@ int taskmgr_add_task( void* tfunct, const char *bezeichnung, int prio)
 		if(tasks[i].state == TASK_STATE_NULL)
 		{
 			tasks[i].pid = i;
-			strcpy(tasks[i].name, bezeichnung);
+			copy_bounded(tasks[i].name, bezeichnung, sizeof(tasks[i].name));
 			tasks[i].priority = prio;
 			tasks[i].state = TASK_STATE_SUSPENDED;
 			
@@ -140,7 +152,7 @@ int taskmgr_add_task( void* tfunct, const char *bezeichnung, int prio)
 		if(tasks[i].state == TASK_STATE_ABORTED)
 		{
 			tasks[i].pid = i;
-			strcpy(tasks[i].name, bezeichnung);
+			copy_bounded(tasks[i].name, bezeichnung, sizeof(tasks[i].name));
 			tasks[i].priority = prio;
 			tasks[i].state = TASK_STATE_SUSPENDED;
 			
@@ -156,10 +168,11 @@ int taskmgr_add_task( void* tfunct, const char *bezeichnung, int prio)
 	return -1;
 }
 
-int taskmgr_list_tasks()
+//Reine Ausgabefunktion, kein Aufrufer wertet ein Ergebnis aus, daher void statt int.
+void taskmgr_list_tasks()
 {
 	int i;
-	
+
 	printf("Running Tasks:\n");
 	
 	for(i=0; i <= MAX_TASKS-1; i++)
@@ -202,11 +215,20 @@ void taskmgr_task_abort(int pid, int error_number, const char *error_descr)
 {
 	if(pid < 0 || pid > MAX_TASKS-1)
 	{
-		printf("ERR: Task %i could not be found!\n");
+		printf("ERR: Task %i could not be found!\n", pid);
 	} else {
 		tasks[pid].state = TASK_STATE_ABORTED;
 		tasks[pid].error_no = error_number;
-		strcpy(tasks[pid].error, error_descr);
+		copy_bounded(tasks[pid].error, error_descr, sizeof(tasks[pid].error));
+
+		//Der Stack-Slot bleibt bewusst belegt, taskmgr_add_task() recycelt ihn spaeter.
+		//Wird aber der gerade laufende Task abgebrochen, muss seine restliche Rechenzeit
+		//verfallen: sonst laeuft er in schedule() im else-Zweig noch bis zum Ablauf von
+		//cpu_time weiter, obwohl er nicht mehr TASK_STATE_RUNNING ist.
+		if(pid == current_task)
+		{
+			tasks[pid].cpu_time = 0;
+		}
 	}
 }
 
@@ -214,7 +236,7 @@ void taskmgr_task_start(int pid)
 {
 	if(pid < 0 || pid > MAX_TASKS-1)
 	{
-		printf("ERR: Task %i could not be found!\n");
+		printf("ERR: Task %i could not be found!\n", pid);
 	} else {
 		tasks[pid].state = TASK_STATE_RUNNING;
 	}
@@ -228,13 +250,24 @@ void taskmgr_task_suspend(int pid)
 	} else
 	if(pid < 0 || pid > MAX_TASKS-1)
 	{
-		printf("ERR: Task %i could not be found!\n");
+		printf("ERR: Task %i could not be found!\n", pid);
 	} else {
 		tasks[pid].state = TASK_STATE_SUSPENDED;
+
+		//Gleiches Problem wie beim Abbruch: der aktuell laufende Task darf seine
+		//Restrechenzeit nach dem Suspendieren nicht weiter aufbrauchen.
+		if(pid == current_task)
+		{
+			tasks[pid].cpu_time = 0;
+		}
 	}
 }
 
-int taskmgr_killall()
+//Beendet alle Tasks ab Index 1. Slot 0 wird bewusst verschont: dort laeuft die
+//Konsole (der System-Task), ueber die killall ueberhaupt erst aufgerufen wird —
+//wuerde sie mit abgebrochen, bliebe kein lauffaehiger Task mehr uebrig.
+//Kein Aufrufer wertet ein Ergebnis aus, daher void statt int.
+void taskmgr_killall()
 {
 	int i;
 	for(i=1; i <= MAX_TASKS-1; i++)

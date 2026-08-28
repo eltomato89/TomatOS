@@ -74,9 +74,12 @@ extern int taskmgr_get_taskcount();
 
 
 /* CONSOLE.C */
-extern void puts(unsigned char *text);
-//extern void putch(unsigned char c);
+extern void puts(char *text);
+extern void putch(unsigned char c);
 extern void cls(void);
+extern void init_video(void);
+extern void settextcolor(unsigned char forecolor, unsigned char backcolor);
+extern void panic(char *desc);
 extern void display_update_statusbar();
 
 /* GDT.C */
@@ -99,8 +102,10 @@ extern void irq_install();
 /* TIMER.C */
 extern void timer_wait(int ticks);
 extern void timer_install();
+extern void pic_install();
 extern void sleep(int ticks);
 extern void timer_setInterval(int hz);
+extern int timer_get_ticks();
 extern datetime cmos_readtime();
 
 extern int timer_install_handler(void (*handler)(struct regs *r));
@@ -112,19 +117,14 @@ extern unsigned char getch();
 extern void kb_flush();
 
 /* MULTITASKING.C */
-extern int mt_install();
-extern int taskmgr_list_tasks();
+extern void mt_install();
+extern void taskmgr_list_tasks();
 extern int taskmgr_add_task( void* tfunct, const char *bezeichnung, int cpu_time);
 extern int taskmgr_get_currpid();
 extern void taskmgr_task_abort(int pid, int error_number, const char *error_descr);
 extern void taskmgr_task_start(int pid);
 extern void taskmgr_task_suspend(int pid);
-extern int taskmgr_killall();
-
-extern int prio_queue_pop();
-extern void prio_queue_push(int pid);
-extern int prio_queue_size();
-extern void prio_queue_rebuild();
+extern void taskmgr_killall();
 
 extern void reboot();
 

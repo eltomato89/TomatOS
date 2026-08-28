@@ -144,7 +144,7 @@ void putch(unsigned char c)
 }
 
 /* Uses the above routine to output a string... */
-void puts(unsigned char *text)
+void puts(char *text)
 {
     int i;
 

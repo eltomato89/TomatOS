@@ -10,16 +10,18 @@
 #include <string.h>
 #include <stdio.h>
 
+/* Die Zeichenwerte sind CP437-Codepunkte, denn der VGA-Textmodus stellt
+*  CP437 dar und nicht Latin-1. */
 unsigned char kbdde_s[128] =
 {
     0,  27, '1', '2', '3', '4', '5', '6', '7', '8',	/* 9 */
-  '9', '0', 223 /* ß */, 0xB4 /* ´ */, '\b',	/* Backspace */
+  '9', '0', 0xE1 /* ß */, 0x27 /* ´ (CP437 kennt kein Akut) */, '\b',	/* Backspace */
   '\t',			/* Tab */
   'q', 'w', 'e', 'r',	/* 19 */
-  't', 'z', 'u', 'i', 'o', 'p', 252 /* ü */, '+', '\n',		/* Enter key */
+  't', 'z', 'u', 'i', 'o', 'p', 0x81 /* ü */, '+', '\n',		/* Enter key */
     0,			/* 29   - Control */
-  'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', 246 /* ö */,	/* 39 */
- 228/* ä */, '^',   0,		/* Left shift */
+  'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', 0x94 /* ö */,	/* 39 */
+ 0x84/* ä */, '^',   0,		/* Left shift */
  '#', 'y', 'x', 'c', 'v', 'b', 'n',			/* 49 */
   'm', ',', '.', '-',   0,					/* Right shift */
   '*',
@@ -51,14 +53,14 @@ unsigned char kbdde_s[128] =
 };
 unsigned char kbdde_b[128] =
 {
-    0,  27, '!', '\"', 0xA7 /* § */, '$', '%', '&', '/', '(',	/* 9 */
-  ')', '=', 223 /* ß */, '`', '\b',	/* Backspace */
+    0,  27, '!', '\"', 0x15 /* § */, '$', '%', '&', '/', '(',	/* 9 */
+  ')', '=', 0xE1 /* ß */, '`', '\b',	/* Backspace */
   '\t',			/* Tab */
   'Q', 'W', 'E', 'R',	/* 19 */
-  'T', 'Z', 'U', 'I', 'O', 'P', 252 /* ü */, '*', '\n',		/* Enter key */
+  'T', 'Z', 'U', 'I', 'O', 'P', 0x9A /* Ü */, '*', '\n',		/* Enter key */
     0,			/* 29   - Control */
-  'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', 246 /* ö */,	/* 39 */
- 228/* ä */, 0xB0 /* ° */,   0,		/* Left shift */
+  'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', 0x99 /* Ö */,	/* 39 */
+ 0x8E/* Ä */, 0xF8 /* ° */,   0,		/* Left shift */
  0x27, 'Y', 'X', 'C', 'V', 'B', 'N',			/* 49 */
   'M', ';', ':', '_',   0,					/* Right shift */
   '*',
@@ -134,18 +136,16 @@ void keyboard_install()
 unsigned char getch()
 {   
     char ky;
-    
-    /*
-    do{
-      putch(EOS);
-    } while(last_key == EOS);
-    */
-  
+
+    /* last_key ist volatile, die Schleife darf also nicht wegoptimiert
+    *  werden. Statt busy zu pollen warten wir stromsparend mit 'hlt' auf
+    *  den naechsten Interrupt - der Tastatur-IRQ (und notfalls der Timer)
+    *  weckt uns wieder auf. */
     while(last_key == EOS)
     {
-      putch(EOS);
+      __asm__ __volatile__("hlt");
     }
-    
+
     ky = last_key;
     last_key = EOS;
     
@@ -167,42 +167,38 @@ unsigned char getchn()
 	return x;
 }
 
-char * gets()
-{
-  char ky;
-  char ret[80];
-  int i=0;
-  do
-  {
-    ky = getch();
-    if(ky != 10) ret[i] = ky;
-    putch(ky);
-    i++;
-  } while(ky != 10);
-  
-  ret[i-1] = '\0';
-  return ret;
-}
+/* gets() wurde entfernt: die Funktion gab einen Zeiger auf ein lokales
+*  Array zurueck (Undefined Behaviour), hatte keinen einzigen Aufrufer und
+*  scan() leistet dasselbe ueber einen Ausgabeparameter. */
+
+/* Achtung: scan() kopiert das Ergebnis mit strcpy() nach 'var', ohne dessen
+*  Groesse zu kennen. Der Zielpuffer muss darum mindestens SCAN_BUFSZ Bytes
+*  fassen. Ohne Signaturaenderung (die Deklaration steht in stdio.h) laesst
+*  sich das nicht sauberer loesen; wenigstens ist der interne Puffer jetzt
+*  begrenzt und die maximale Kopierlaenge damit bekannt. */
+#define SCAN_BUFSZ 80
 
 void scan(char* var)
   {
-    char ky;
-    static char ret[80];
-    int i=0;	
-       
+    unsigned char ky;
+    static char ret[SCAN_BUFSZ];
+    int i=0;
+
     do
     {
       ky = getch();
-          
-      if(ky >= 32 && ky <= 126)
+
+      if(ky >= 32 && ky != 127)
       {
-        
-        ret[i] = ky;
-        putch(ky);
-        i++;
-        
+        /* Ist der Puffer voll, werden weitere Zeichen ignoriert. */
+        if(i < SCAN_BUFSZ - 1)
+        {
+          ret[i] = ky;
+          putch(ky);
+          i++;
+        }
       }
-      
+
       if(ky == 8 && i > 0)
       {
         
@@ -221,25 +217,29 @@ void scan(char* var)
 	strcpy(var, ret);
   }
   
+  /* Gleiche Einschraenkung wie bei scan(): 'var' muss mindestens
+  *  SCAN_BUFSZ Bytes fassen. */
   void scan_h(char* var, int out)
   {
-    char ky;
-    static char ret[80];
-    int i=0;	
-       
+    unsigned char ky;
+    static char ret[SCAN_BUFSZ];
+    int i=0;
+
     do
     {
       ky = getch();
-          
-      if(ky >= 32 && ky <= 126)
+
+      if(ky >= 32 && ky != 127)
       {
-        
-        ret[i] = ky;
-        printf("%c", out);
-        i++;
-        
+        /* Ist der Puffer voll, werden weitere Zeichen ignoriert. */
+        if(i < SCAN_BUFSZ - 1)
+        {
+          ret[i] = ky;
+          printf("%c", out);
+          i++;
+        }
       }
-      
+
       if(ky == 8 && i > 0)
       {
         

@@ -7,7 +7,9 @@
 */
 
 
-#include <stdio.h> 
+#include <system.h>
+#include <string.h>
+#include <stdio.h>
 /* Required Declarations */
 int do_intel(void);
 int do_amd(void);
@@ -490,10 +492,13 @@ int floppy_detect(char drive)
 
 char *floppy_getDriveType(int num)
 {
-	char *drive_type[5] = { "no floppy drive",
+	/* Sechs Eintraege - das Array war frueher als [5] deklariert, wodurch der
+	 * letzte Typ verlorenging. Der Bereichscheck faengt unbekannte Nibbles ab. */
+	static char *drive_type[6] = { "no floppy drive",
 							"360kb 5.25in floppy drive",
 							"1.2mb 5.25in floppy drive",
 							"720kb 3.5in", "1.44mb 3.5in",
 							"2.88mb 3.5in"};
+	if(num < 0 || num > 5) return "unknown floppy drive";
 	return drive_type[num];
 }

@@ -84,8 +84,9 @@ int checkCPUID(void)
 
 int kernel()
 {
-    void err_handler(int);
-	unsigned long ebx, unused;
+	extern void main();
+	int task_console;
+
     init_video();
     printf("\n\nTomatOS/x86 boot v0.2\n");
 	
@@ -116,8 +117,12 @@ int kernel()
 
 	getchn(); // flush last keyboard character set by EnableA20Gate();
 	__asm__ __volatile__ ("sti");
-    
-	extern void main();
-	int task_console = taskmgr_add_task( main, "KONSOLE", TASK_PRIORITY_REALTIME );
+
+	task_console = taskmgr_add_task( main, "KONSOLE", TASK_PRIORITY_REALTIME );
 	taskmgr_task_start(task_console);
+
+	/* Ab hier uebernimmt der Timer-IRQ: der Scheduler springt in den
+	 * Konsolen-Task. Wir kehren nach start.asm zurueck, das dort in einer
+	 * Endlosschleife auf den ersten Taskwechsel wartet. */
+	return 0;
 }
