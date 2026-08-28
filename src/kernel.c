@@ -14,6 +14,8 @@
 #include <syscall.h>
 #include <vmm.h>
 #include <exec.h>
+#include <ata.h>
+#include <fat.h>
 #define cpuid(in, a, b, c, d) __asm__("cpuid": "=a" (a), "=b" (b), "=c" (c), "=d" (d) : "a" (in));
 
 void *memcpy(void *dest, const void *src, size_t count)
@@ -205,6 +207,100 @@ static void print_modules(void)
 	printf(")\n");
 }
 
+/* At most max characters of s. printf() knows no precision, and both strings
+*  that end up on the disk lines below come from somewhere else - a model
+*  string out of the drive's IDENTIFY data, an error text out of the
+*  filesystem. A line that runs past 80 columns wraps and costs a second row,
+*  which is exactly what the whole boot output is trying not to do. */
+static void print_capped(const char *s, int max)
+{
+	int i;
+
+	if(s == 0) return;
+
+	for(i = 0; i < max && s[i] != '\0'; i++) putch((unsigned char)s[i]);
+}
+
+/* Brings the disk up and mounts what is on it, in at most two lines: one for
+*  the drive, one for the filesystem.
+*
+*  Which drive: the first one that carries something mountable, tried from 0
+*  upwards. Drive 0 is where an image handed to qemu as -hda ends up, so it is
+*  the answer in practically every case here - but insisting on it would be
+*  wrong on real hardware, where drive 0 can just as well be an empty slot or
+*  the CD-ROM the machine booted from while the data sits on the slave. Trying
+*  the others costs one IDENTIFY per drive, all of them already done by
+*  ata_init(), and a boot sector read for each drive that is actually there.
+*  The first mount that succeeds ends the search, so a machine with two
+*  filesystems gets the lower drive - deterministic, and changeable from the
+*  shell later.
+*
+*  No disk at all is a normal case, not a failure: "make run" without an image
+*  boots exactly like this, and so does hardware with nothing attached. It
+*  prints nothing at all then, for the same reason print_modules() says
+*  nothing about an empty module list - a row spent on "no disk" is a row
+*  taken away from something that has news. Whatever the outcome, this returns
+*  and the shell comes up: ata_init() is documented as safe with no controller
+*  present, and a drive that answers nothing simply is not present(). */
+static void disk_init(void)
+{
+	uint32_t sectors;
+	int drive;
+	int first;		/* first drive that exists at all        */
+	int mounted;		/* first one that holds a filesystem     */
+
+	ata_init();
+
+	first   = -1;
+	mounted = -1;
+
+	for(drive = 0; drive < ATA_MAX_DRIVES; drive++)
+	{
+		if(!ata_present(drive)) continue;
+
+		if(first < 0) first = drive;
+
+		if(fat_mount(drive) == 0)
+		{
+			mounted = drive;
+			break;
+		}
+	}
+
+	if(first < 0) return;
+
+	drive   = (mounted >= 0) ? mounted : first;
+	sectors = ata_sectors(drive);
+
+	/* 512 byte sectors, so 2048 of them make a MiB. The size is printed
+	*  rather than the sector count, which says nothing at a glance - and in
+	*  KiB below a megabyte, because a 1.44 MiB floppy image is a perfectly
+	*  normal FAT12 medium here and "0 MiB" would be a useless line. */
+	printf("Disk: hd%i, ", drive);
+	if(sectors >= 2048u)
+		printf("%i MiB, ", (int)(sectors / 2048u));
+	else
+		printf("%i KiB, ", (int)(sectors / 2u));
+	print_capped(ata_model(drive), 40);
+	printf("\n");
+
+	if(mounted < 0)
+	{
+		/* One line, and it names the reason: a disk that is there but
+		*  holds nothing this kernel understands is the case one wants
+		*  explained, unlike no disk at all. */
+		printf("Filesystem: none (");
+		print_capped(fat_last_error(), 46);
+		printf(")\n");
+		return;
+	}
+
+	printf("Filesystem: %s on hd%i, %i KiB of %i KiB free\n",
+		fat_type(), drive,
+		(int)(fat_free_bytes() / 1024u),
+		(int)(fat_total_bytes() / 1024u));
+}
+
 /* Entry point from start.asm. mbi_phys is the pointer the bootloader left in
 *  ebx: a PHYSICAL address. The kernel runs in the higher half, so that value
 *  is not a usable pointer - it is converted once, right here, and everything
@@ -312,6 +408,32 @@ int kernel(uint32_t magic, multiboot_info *mbi_phys)
 	*  module plus the list itself; recording addresses here does not make
 	*  the memory behind them any safer.
 	*
+	*  The disk hangs off the very end of the boot, behind the "sti", and it
+	*  is the one step that is not placed by what it needs from memory
+	*  management. Its lower bound is the same as everywhere here: ata_init()
+	*  and fat_mount() may allocate - the filesystem takes a buffer for the
+	*  FAT out of the heap - so heap_init() has to be done, and it is, long
+	*  before. The upper bound is the one that decides it. The driver polls,
+	*  so it needs no interrupt of its own and none of the IRQ machinery is a
+	*  precondition. But a PIO driver that waits for a drive to become ready
+	*  may well wait with sleep(), and sleep() is timer_wait(), which spins on
+	*  timer_ticks until the timer IRQ moves it on. Before pic_install() the
+	*  PIT is not programmed and no handler is installed; before the "sti" the
+	*  interrupt cannot arrive at all, and timer_wait() then notices that
+	*  interrupts are off and drops its hlt - but the loop itself has no way
+	*  out. One sleep() in a driver placed further up would therefore not be
+	*  slow, it would be the end of the boot, on precisely the machines whose
+	*  drives are slow to answer. Behind the "sti" every mechanism a polling
+	*  driver might reach for actually works, and the price is only that the
+	*  two disk lines appear below "Protected Mode Kernel Running" instead of
+	*  in the middle of the driver block.
+	*
+	*  Still in front of the console task, though, and that part is not
+	*  cosmetic: the shell may ask fat_readdir() something with its first
+	*  command, and by the time it can be typed the mount is either done or
+	*  known to have failed. Nothing here needs a task or a scheduler - it
+	*  runs on the boot stack like everything else in this function.
+	*
 	*  The kernel is linked for 0xC0100000 but loaded at 0x00100000, and by
 	*  the time this function runs it already executes from the higher half:
 	*  start.asm puts up a provisional mapping and jumps up there before
@@ -380,6 +502,11 @@ int kernel(uint32_t magic, multiboot_info *mbi_phys)
 
 	getchn(); // flush last keyboard character set by EnableA20Gate();
 	__asm__ __volatile__ ("sti");
+
+	/* Disk and filesystem: last, because this is the first point at which a
+	*  driver may wait for hardware with sleep(). See the ordering comment
+	*  above. Says nothing when there is no drive. */
+	disk_init();
 
 	task_console = taskmgr_add_task( main, "CONSOLE", TASK_PRIORITY_REALTIME );
 	taskmgr_task_start(task_console);

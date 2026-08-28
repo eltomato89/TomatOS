@@ -3,7 +3,8 @@
 A 32-bit x86 hobby kernel (Multiboot 1) — preemptive scheduler, VGA text
 console, PS/2 keyboard with German layout, PIT timer, CMOS clock, physical
 frame allocator, kernel heap, paging, ring 3 with system calls, per-task
-address spaces, loadable programs and a small shell. Originally written between
+address spaces, loadable programs, an ATA driver with a FAT12/16 filesystem,
+and a small shell. Originally written between
 2006 and 2011, ported to a current Linux toolchain in 2026.
 
 ## Requirements
@@ -38,7 +39,7 @@ involved — the fastest way to try a change. Quit with `Ctrl-C` in the
 terminal.
 
 The shell offers `help`, `taskmgr`, `start`, `mem`, `page`, `user`, `ps`,
-`exec`, `reboot` and `exit`. `taskmgr` without an argument prints its own syntax, `mem` and `page`
+`exec`, `ls`, `cat`, `df`, `reboot` and `exit`. `taskmgr` without an argument prints its own syntax, `mem` and `page`
 show the memory and paging state, and `mem -t` / `page -t` run self-tests.
 
 ### Memory layout
@@ -187,6 +188,27 @@ segment by segment, because segments are not page aligned: the tail of one
 and the head of the next can share a page. It maps a segment read-only
 unless `PF_W` is set, zeroes the `.bss` part beyond `p_filesz`, and refuses
 anything that would land at or above `KERNEL_VIRTUAL_BASE`.
+
+### Disk and filesystem
+
+`src/ata.c` talks to ATA/IDE drives with programmed I/O and LBA28 — no DMA,
+no PCI enumeration, no interrupt handler; the driver polls and masks the
+drive's interrupt. On top of it `src/fat.c` reads FAT12 and FAT16 volumes.
+
+`make disk` builds a 32 MB FAT16 image with mtools and puts the user
+programs plus a few text files on it; the run targets attach it as a hard
+disk. `df` shows what was found, `ls` and `cat` read it, and `exec` can load
+a program **from the filesystem** rather than from a boot module:
+
+```
+@TomatOS> exec /bin/hello.elf
+```
+
+Two details worth knowing about FAT. The type follows from the **data
+cluster count** (below 4085 is FAT12, below 65525 FAT16), never from the
+type string in the boot sector — that field is advisory and often wrong. And
+the root directory of FAT12/16 is a fixed area behind the FATs, not part of
+the cluster chain, unlike every subdirectory.
 
 ## On real hardware
 

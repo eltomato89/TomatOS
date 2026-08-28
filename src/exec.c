@@ -1,6 +1,6 @@
 /* TomatOS - v0.1 pre Alpha
 *  By:   Jens Köhler (eltomato@googlemail.com)
-*  Desc: Turns a bootloader module into a running ring 3 task.
+*  Desc: Turns a bootloader module or a file on disk into a running ring 3 task.
 *
 *  Two halves, and they meet only through the module table in the middle:
 *
@@ -37,6 +37,36 @@
 *  rejected with a readable reason instead of being loaded into a program
 *  counter that faults at the first PLT entry.
 *
+*  Since there is a filesystem, a program no longer has to be baked into the
+*  boot media: exec_spawn_file() loads one from a file on the mounted volume.
+*  The loader itself is not doubled for that. Everything above - the header
+*  checks, the per page frame allocation, the .bss gap, PAGE_USER and the
+*  PF_W dependent PAGE_WRITE - is one code path that asks an "image" for
+*  bytes instead of dereferencing a pointer. The two sources answer the same
+*  two questions and differ in nothing else:
+*
+*    - a module is already in RAM, inside the direct mapping, so a read is a
+*      memcpy() from base + offset and costs nothing extra;
+*    - a file is read with fat_read() at that same offset, one page at a
+*      time, straight into the frame that page will be mapped from.
+*
+*  The alternative - read the whole file into a heap buffer and run the
+*  existing module loader over it - would have been shorter still, but it
+*  doubles the memory a program needs at the worst possible moment (the heap
+*  copy is alive while the frames for the image are being allocated) and it
+*  puts a hard ceiling on the program size that has nothing to do with how
+*  much memory the program actually needs. A 300 KiB binary would then fail
+*  on a heap that has 256 KiB left, although its segments would fit in RAM
+*  perfectly well. Reading page by page has no such ceiling: only the ELF
+*  header plus the program header table are held in the heap, a few hundred
+*  bytes, and a file too large for the machine fails exactly where a module
+*  of the same size would - in pmm_alloc_frame(), with "out of physical
+*  memory while loading a segment".
+*
+*  The price is one fat_read() per page instead of one memcpy() per segment.
+*  For a loader that runs once per program start this is the cheaper of the
+*  two prices.
+*
 *  Notes: No warranty expressed or implied. Use at own risk.
 */
 
@@ -49,6 +79,7 @@
 #include <multiboot.h>
 #include <elf.h>
 #include <exec.h>
+#include <fat.h>
 
 /* Indices into e_ident that the loader checks. The remaining bytes (version,
 *  OS ABI, padding) say nothing a static i386 executable would depend on. */
@@ -74,6 +105,24 @@
 /* error_no a task aborted by the loader carries. The text says the rest. */
 #define EXEC_ABORT_ERRNO 1
 
+/* Longest path to a program file that can be remembered in the table below,
+*  including the terminator. exec_spawn_file() itself has no such limit - it
+*  reads through the caller's string. */
+#define EXEC_PATH_MAX   64
+
+/* How many files exec_module_find() keeps resolved at a time, and where
+*  their indices start. The gap to EXEC_MAX_MODULES is deliberate: an index
+*  is either a module or a file, never both, and a stale one is rejected
+*  rather than silently landing on the wrong program. */
+#define EXEC_MAX_FILES  4
+#define EXEC_FILE_INDEX_BASE 1000
+
+/* Everything in front of the last program header, i.e. e_phoff plus the
+*  table, is what a file image keeps in the heap. Real linkers put the table
+*  right behind the file header, so this bound is never anywhere near - it
+*  only stops a corrupt e_phoff from asking for a megabyte of heap. */
+#define EXEC_HEADER_MAX 16384
+
 /* A module as the kernel keeps it: the bootloader's physical range, boiled
 *  down to start and size, plus the name taken from its command line. */
 typedef struct
@@ -83,8 +132,40 @@ typedef struct
 	char     name[EXEC_NAME_MAX];
 } exec_module;
 
+/* A file the name resolution below has found on the mounted volume. Only the
+*  path is authoritative; size and name are what the shell prints. */
+typedef struct
+{
+	char     path[EXEC_PATH_MAX];
+	char     name[EXEC_NAME_MAX];
+	uint32_t size;
+	int      used;
+} exec_file;
+
+/* Where the bytes of a program image come from. The loader below never
+*  touches a module or a file directly, it asks this:
+*
+*    base  is byte 0 of the image as a virtual address - the module itself
+*          for a module, the heap copy of the ELF and program headers for a
+*          file. Only the first "hdr" bytes of the image may be reached
+*          through it, which for a module happens to be all of them.
+*    path  is the file the rest is read from, or 0 when base covers
+*          everything.
+*    noun  is what an error message calls the thing, "module" or "file". */
+typedef struct
+{
+	uint32_t    size;		/* total size of the image in bytes  */
+	uint32_t    base;		/* virtual address of image byte 0   */
+	uint32_t    hdr;		/* bytes base really covers          */
+	const char *path;		/* file path, 0 for a module         */
+	const char *noun;
+} exec_image;
+
 static exec_module modules[EXEC_MAX_MODULES];
 static int         module_count = 0;
+
+static exec_file   files[EXEC_MAX_FILES];
+static int         file_next = 0;
 
 static char last_error[EXEC_ERROR_MAX] = "";
 
@@ -107,6 +188,44 @@ static void copy_bounded(char *dest, const char *src, int max)
 static void exec_set_error(const char *msg)
 {
 	copy_bounded(last_error, msg, EXEC_ERROR_MAX);
+}
+
+/* Two part message. Exists for the handful of errors that have to name the
+*  source - "module is too small ...", "... outside the file" - so that one
+*  loader can produce both wordings without a printf() into a buffer. */
+static void exec_set_error_2(const char *first, const char *second)
+{
+	int n;
+	int i;
+
+	copy_bounded(last_error, first, EXEC_ERROR_MAX);
+
+	n = (int)strlen(last_error);
+	for (i = 0; n + i < EXEC_ERROR_MAX - 1 && second[i] != '\0'; i++)
+		last_error[n + i] = second[i];
+
+	last_error[n + i] = '\0';
+}
+
+/* Last component of a path, which is what a task started from a file is
+*  called. A path that ends in a separator has no name of its own and keeps
+*  the whole string - better a strange task name than an empty one. */
+static void name_from_path(const char *path, char *dest, int max)
+{
+	int last;
+	int i;
+
+	last = -1;
+
+	for (i = 0; path[i] != '\0'; i++)
+	{
+		if (path[i] == '/' || path[i] == '\\') last = i;
+	}
+
+	if (last < 0 || path[last + 1] == '\0')
+		copy_bounded(dest, path, max);
+	else
+		copy_bounded(dest, path + last + 1, max);
 }
 
 /* Non-zero if [phys, phys + len) lies inside the window P2V() describes.
@@ -228,6 +347,89 @@ void exec_init(multiboot_info *mbi)
 	}
 }
 
+/* --- Files on the mounted volume ------------------------------------------ */
+
+/* The module list is what the bootloader handed over and never changes. A
+*  file is not part of it - it is looked up on demand and remembered just
+*  long enough for the caller to spawn it, in a table of its own with indices
+*  of its own. That is what lets exec_spawn() take a file without a second
+*  interface: an index either names a module or it names one of these. */
+
+/* The file behind an index, or 0 if the index does not name a live one. */
+static exec_file *file_at(int index)
+{
+	int i;
+
+	if (index < EXEC_FILE_INDEX_BASE) return 0;
+
+	i = index - EXEC_FILE_INDEX_BASE;
+	if (i >= EXEC_MAX_FILES) return 0;
+	if (!files[i].used) return 0;
+
+	return &files[i];
+}
+
+/* Puts a path into the table and returns its index, or -1 if the path is too
+*  long to be kept whole. Truncating one would be worse than refusing it: the
+*  shortened path could well name a different file that exists.
+*
+*  A path already in the table keeps its slot, so asking for the same program
+*  twice does not use two of them. Otherwise the oldest entry is overwritten;
+*  an index the caller kept from four lookups ago then names a different
+*  program, which is why nothing but the shell's "resolve, then immediately
+*  spawn" is promised here. */
+static int file_register(const char *path, uint32_t size)
+{
+	int i;
+
+	if (path == 0 || path[0] == '\0') return -1;
+	if ((int)strlen(path) >= EXEC_PATH_MAX) return -1;
+
+	for (i = 0; i < EXEC_MAX_FILES; i++)
+	{
+		if (files[i].used && strcmp(files[i].path, path) == 0)
+		{
+			files[i].size = size;
+			return EXEC_FILE_INDEX_BASE + i;
+		}
+	}
+
+	i = file_next;
+	file_next = (file_next + 1) % EXEC_MAX_FILES;
+
+	copy_bounded(files[i].path, path, EXEC_PATH_MAX);
+	name_from_path(path, files[i].name, EXEC_NAME_MAX);
+	files[i].size = size;
+	files[i].used = 1;
+
+	return EXEC_FILE_INDEX_BASE + i;
+}
+
+/* Looks a name up on the mounted volume, first as given and then below the
+*  root, so that both "hello.elf" and "/bin/hello.elf" work. Returns the
+*  index of the registered file, or -1. */
+static int file_lookup(const char *name)
+{
+	char     path[EXEC_PATH_MAX];
+	uint32_t size;
+
+	if (!fat_mounted()) return -1;
+	if (name[0] == '\0') return -1;
+
+	if (fat_size(name, &size) == 0) return file_register(name, size);
+
+	if (name[0] == '/' || (int)strlen(name) + 1 >= EXEC_PATH_MAX) return -1;
+
+	path[0] = '/';
+	copy_bounded(path + 1, name, EXEC_PATH_MAX - 1);
+
+	if (fat_size(path, &size) == 0) return file_register(path, size);
+
+	return -1;
+}
+
+/* --- Looking programs up -------------------------------------------------- */
+
 int exec_module_count(void)
 {
 	return module_count;
@@ -235,16 +437,34 @@ int exec_module_count(void)
 
 const char *exec_module_name(int index)
 {
+	exec_file *f;
+
+	f = file_at(index);
+	if (f != 0) return f->name;
+
 	if (index < 0 || index >= module_count) return "?";
 	return modules[index].name;
 }
 
 uint32_t exec_module_size(int index)
 {
+	exec_file *f;
+
+	f = file_at(index);
+	if (f != 0) return f->size;
+
 	if (index < 0 || index >= module_count) return 0;
 	return modules[index].size;
 }
 
+/* A module of that name, or - since there is a filesystem - a file of that
+*  name on the mounted volume. Modules win, because they are the ones a
+*  "module" line in grub.cfg deliberately put there.
+*
+*  Resolving a file here rather than in a second lookup function is what
+*  keeps the caller free of the distinction: whatever comes back is an index
+*  exec_spawn() accepts, and exec_module_name() and exec_module_size()
+*  describe it either way. */
 int exec_module_find(const char *name)
 {
 	int i;
@@ -256,7 +476,7 @@ int exec_module_find(const char *name)
 		if (strcmp(modules[i].name, name) == 0) return i;
 	}
 
-	return -1;
+	return file_lookup(name);
 }
 
 const char *exec_last_error(void)
@@ -264,31 +484,67 @@ const char *exec_last_error(void)
 	return last_error;
 }
 
+/* --- The image, the one thing both sources have to answer ----------------- */
+
+/* len bytes at offset off of the image, into dest. Returns 0 on success.
+*
+*  The range is checked against the size of the image first, for both kinds
+*  alike: a module read past its end would walk into the next one, and a file
+*  read past its end would come back short and leave dest half filled with
+*  whatever was in the frame. */
+static int image_read(const exec_image *img, uint32_t off, uint32_t len,
+                      void *dest)
+{
+	int got;
+
+	if (len == 0) return 0;
+	if (off > img->size || len > img->size - off) return -1;
+
+	if (img->path == 0)
+	{
+		memcpy(dest, (const char *)(img->base + off), (size_t)len);
+		return 0;
+	}
+
+	got = fat_read(img->path, off, len, dest);
+	if (got < 0 || (uint32_t)got != len) return -1;
+
+	return 0;
+}
+
 /* --- ELF32 loading -------------------------------------------------------- */
 
 /* Program header number i. The caller has already established that the whole
-*  table lies inside the module. */
-static elf32_phdr *phdr_at(uint32_t image, elf32_ehdr *eh, int i)
+*  table lies inside the image - and, for a file, that the heap copy reaches
+*  that far. */
+static elf32_phdr *phdr_at(const exec_image *img, elf32_ehdr *eh, int i)
 {
-	return (elf32_phdr *)(image + eh->e_phoff +
+	return (elf32_phdr *)(img->base + eh->e_phoff +
 	                      (uint32_t)i * (uint32_t)eh->e_phentsize);
 }
 
 /* Everything about the file header that has to hold before any field of it is
-*  believed. Returns 0 when the module is a static 32-bit i386 executable
-*  whose program header table lies completely inside the module. */
-static int check_header(uint32_t image, uint32_t size)
+*  believed. Returns 0 when the image is a static 32-bit i386 executable
+*  whose program header table lies completely inside it.
+*
+*  Reads nothing but the ELF header itself, which is why a file can be run
+*  through this the moment its first 52 bytes are in the heap - long before
+*  it is known how far the program header table reaches. */
+static int check_header(const exec_image *img)
 {
 	elf32_ehdr *eh;
+	uint32_t    size;
 	uint32_t    table;
+
+	size = img->size;
 
 	if (size < (uint32_t)sizeof(elf32_ehdr))
 	{
-		exec_set_error("module is too small to hold an ELF header");
+		exec_set_error_2(img->noun, " is too small to hold an ELF header");
 		return -1;
 	}
 
-	eh = (elf32_ehdr *)image;
+	eh = (elf32_ehdr *)img->base;
 
 	if (eh->e_ident[0] != ELFMAG0 || eh->e_ident[1] != ELFMAG1 ||
 	    eh->e_ident[2] != ELFMAG2 || eh->e_ident[3] != ELFMAG3)
@@ -340,7 +596,8 @@ static int check_header(uint32_t image, uint32_t size)
 	table = (uint32_t)eh->e_phnum * (uint32_t)eh->e_phentsize;
 	if (eh->e_phoff >= size || table > size - eh->e_phoff)
 	{
-		exec_set_error("program header table lies outside the module");
+		exec_set_error_2("program header table lies outside the ",
+		                 img->noun);
 		return -1;
 	}
 
@@ -355,8 +612,8 @@ static int check_header(uint32_t image, uint32_t size)
 *  filled in, whereas a page that is mapped although no earlier segment claims
 *  it belongs to something else in this address space - the task's user stack,
 *  for instance - and the program does not get to overwrite it. */
-static int page_of_earlier_segment(uint32_t image, elf32_ehdr *eh, int upto,
-                                   uint32_t page)
+static int page_of_earlier_segment(const exec_image *img, elf32_ehdr *eh,
+                                   int upto, uint32_t page)
 {
 	elf32_phdr *ph;
 	uint32_t    first;
@@ -365,7 +622,7 @@ static int page_of_earlier_segment(uint32_t image, elf32_ehdr *eh, int upto,
 
 	for (i = 0; i < upto; i++)
 	{
-		ph = phdr_at(image, eh, i);
+		ph = phdr_at(img, eh, i);
 
 		if (ph->p_type != PT_LOAD || ph->p_memsz == 0) continue;
 
@@ -382,7 +639,7 @@ static int page_of_earlier_segment(uint32_t image, elf32_ehdr *eh, int upto,
 
 /* Loads one PT_LOAD segment into the given address space, one page at a time.
 *  Returns 0 on success, -1 with last_error set otherwise. */
-static int load_segment(addrspace_t space, uint32_t image, uint32_t size,
+static int load_segment(addrspace_t space, const exec_image *img,
                         elf32_ehdr *eh, int index)
 {
 	elf32_phdr *ph;
@@ -395,7 +652,7 @@ static int load_segment(addrspace_t space, uint32_t image, uint32_t size,
 	uint32_t    to;		/* one past the last such byte             */
 	void       *frame;
 
-	ph = phdr_at(image, eh, index);
+	ph = phdr_at(img, eh, index);
 
 	if (ph->p_memsz == 0) return 0;		/* nothing to place */
 
@@ -405,10 +662,10 @@ static int load_segment(addrspace_t space, uint32_t image, uint32_t size,
 		return -1;
 	}
 
-	/* What the segment reads out of the module has to be inside it. */
-	if (ph->p_offset > size || ph->p_filesz > size - ph->p_offset)
+	/* What the segment reads out of the image has to be inside it. */
+	if (ph->p_offset > img->size || ph->p_filesz > img->size - ph->p_offset)
 	{
-		exec_set_error("segment contents lie outside the module");
+		exec_set_error_2("segment contents lie outside the ", img->noun);
 		return -1;
 	}
 
@@ -482,7 +739,7 @@ static int load_segment(addrspace_t space, uint32_t image, uint32_t size,
 		{
 			phys &= PAGE_ADDR_MASK;
 
-			if (!page_of_earlier_segment(image, eh, index, page))
+			if (!page_of_earlier_segment(img, eh, index, page))
 			{
 				exec_set_error("segment overlaps something already mapped");
 				return -1;
@@ -513,12 +770,21 @@ static int load_segment(addrspace_t space, uint32_t image, uint32_t size,
 		to = page + PAGE_SIZE;
 		if (to > file_end) to = file_end;
 
+		/* The one place the two sources part company, and it is a
+		*  single call: a module is copied out of the direct mapping,
+		*  a file is read from the volume - in both cases straight
+		*  into the frame that is about to carry this page. */
 		if (to > from)
 		{
-			memcpy((char *)P2V(phys) + (from - page),
-			       (const char *)(image + ph->p_offset +
-			                      (from - ph->p_vaddr)),
-			       (size_t)(to - from));
+			if (image_read(img,
+			               ph->p_offset + (from - ph->p_vaddr),
+			               to - from,
+			               (char *)P2V(phys) + (from - page)) != 0)
+			{
+				exec_set_error_2("could not read the segment out of the ",
+				                 img->noun);
+				return -1;
+			}
 		}
 
 		if (page == last) break;
@@ -528,9 +794,9 @@ static int load_segment(addrspace_t space, uint32_t image, uint32_t size,
 	return 0;
 }
 
-/* Parses the module and places every PT_LOAD segment into the space. On
+/* Parses the image and places every PT_LOAD segment into the space. On
 *  success *entry_out holds the address the task is to start at. */
-static int load_image(addrspace_t space, uint32_t image, uint32_t size,
+static int load_image(addrspace_t space, const exec_image *img,
                       uint32_t *entry_out)
 {
 	elf32_ehdr *eh;
@@ -540,9 +806,9 @@ static int load_image(addrspace_t space, uint32_t image, uint32_t size,
 	int         found;
 	int         i;
 
-	if (check_header(image, size) != 0) return -1;
+	if (check_header(img) != 0) return -1;
 
-	eh = (elf32_ehdr *)image;
+	eh = (elf32_ehdr *)img->base;
 
 	/* A dynamic executable is rejected before a single page is mapped.
 	*  There is no dynamic linker to hand the program to, and loading it
@@ -550,7 +816,7 @@ static int load_image(addrspace_t space, uint32_t image, uint32_t size,
 	*  relocation, where nothing points back to this cause. */
 	for (i = 0; i < (int)eh->e_phnum; i++)
 	{
-		ph = phdr_at(image, eh, i);
+		ph = phdr_at(img, eh, i);
 
 		if (ph->p_type == PT_INTERP)
 		{
@@ -563,18 +829,18 @@ static int load_image(addrspace_t space, uint32_t image, uint32_t size,
 
 	for (i = 0; i < (int)eh->e_phnum; i++)
 	{
-		ph = phdr_at(image, eh, i);
+		ph = phdr_at(img, eh, i);
 
 		if (ph->p_type != PT_LOAD || ph->p_memsz == 0) continue;
 
-		if (load_segment(space, image, size, eh, i) != 0) return -1;
+		if (load_segment(space, img, eh, i) != 0) return -1;
 
 		loaded++;
 	}
 
 	if (loaded == 0)
 	{
-		exec_set_error("no loadable segment in the module");
+		exec_set_error_2("no loadable segment in the ", img->noun);
 		return -1;
 	}
 
@@ -587,7 +853,7 @@ static int load_image(addrspace_t space, uint32_t image, uint32_t size,
 
 	for (i = 0; i < (int)eh->e_phnum && found == 0; i++)
 	{
-		ph = phdr_at(image, eh, i);
+		ph = phdr_at(img, eh, i);
 
 		if (ph->p_type != PT_LOAD || ph->p_memsz == 0) continue;
 
@@ -605,32 +871,146 @@ static int load_image(addrspace_t space, uint32_t image, uint32_t size,
 	return 0;
 }
 
-/* --- Spawning ------------------------------------------------------------- */
+/* --- Opening a file as an image ------------------------------------------- */
 
-int exec_spawn(int index, int prio)
+/* Prepares img so that the loader can work on the file at path: the size
+*  comes from the directory entry, and the ELF header together with the
+*  program header table is copied into the heap, because those are the only
+*  bytes the loader dereferences instead of reading.
+*
+*  Two steps rather than one, and the header check sits between them: how far
+*  the table reaches is stated by the very header whose plausibility has not
+*  been established yet, so nothing is allocated on the strength of e_phoff
+*  before check_header() has passed over it.
+*
+*  On success the caller owns img->base and releases it with image_close();
+*  on failure nothing is left allocated and last_error says why. */
+static int image_open_file(exec_image *img, const char *path)
 {
-	addrspace_t space;
-	uint32_t    image;
-	uint32_t    entry;
-	int         pid;
+	elf32_ehdr *eh;
+	uint32_t    hdr;
+	char       *buf;
 
-	exec_set_error("");
+	img->size = 0;
+	img->base = 0;
+	img->hdr  = 0;
+	img->path = path;
+	img->noun = "file";
 
-	if (index < 0 || index >= module_count)
+	if (!fat_mounted())
 	{
-		exec_set_error("no module with that index");
+		exec_set_error("no filesystem mounted");
 		return -1;
 	}
 
-	/* exec_init() has already established that the whole module lies inside
-	*  the direct mapping, so this pointer is good for size bytes. */
-	image = (uint32_t)P2V(modules[index].start);
+	if (fat_size(path, &img->size) != 0)
+	{
+		exec_set_error_2("no such file: ", fat_last_error());
+		return -1;
+	}
+
+	buf = (char *)malloc(sizeof(elf32_ehdr));
+	if (buf == 0)
+	{
+		exec_set_error("no heap memory for the ELF header");
+		return -1;
+	}
+
+	img->base = (uint32_t)buf;
+	img->hdr  = (uint32_t)sizeof(elf32_ehdr);
+
+	/* A file shorter than a header would make this read fail with a
+	*  message about the disk, which is not what is wrong with it. */
+	if (img->size < (uint32_t)sizeof(elf32_ehdr))
+	{
+		free(buf);
+		img->base = 0;
+		exec_set_error("file is too small to hold an ELF header");
+		return -1;
+	}
+
+	if (image_read(img, 0, (uint32_t)sizeof(elf32_ehdr), buf) != 0)
+	{
+		free(buf);
+		img->base = 0;
+		exec_set_error_2("could not read the ELF header: ",
+		                 fat_last_error());
+		return -1;
+	}
+
+	if (check_header(img) != 0)
+	{
+		free(buf);
+		img->base = 0;
+		return -1;
+	}
+
+	eh = (elf32_ehdr *)img->base;
+
+	/* check_header() has established that this lies inside the file, so
+	*  the sum cannot wrap and the only question left is the heap. */
+	hdr = eh->e_phoff + (uint32_t)eh->e_phnum * (uint32_t)eh->e_phentsize;
+
+	if (hdr > EXEC_HEADER_MAX)
+	{
+		free(buf);
+		img->base = 0;
+		exec_set_error("program header table lies too far into the file");
+		return -1;
+	}
+
+	if (hdr > img->hdr)
+	{
+		free(buf);
+		img->base = 0;
+
+		buf = (char *)malloc(hdr);
+		if (buf == 0)
+		{
+			exec_set_error("no heap memory for the program headers");
+			return -1;
+		}
+
+		img->base = (uint32_t)buf;
+		img->hdr  = hdr;
+
+		if (image_read(img, 0, hdr, buf) != 0)
+		{
+			free(buf);
+			img->base = 0;
+			exec_set_error_2("could not read the program headers: ",
+			                 fat_last_error());
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+static void image_close(exec_image *img)
+{
+	if (img->path != 0 && img->base != 0) free((void *)img->base);
+
+	img->base = 0;
+	img->hdr  = 0;
+}
+
+/* --- Spawning ------------------------------------------------------------- */
+
+/* Everything both sources share once the image is ready: a suspended task
+*  with an address space of its own, the segments in it, the entry point set.
+*  Returns the pid, or -1 with last_error set. */
+static int spawn_image(const exec_image *img, const char *name, int prio)
+{
+	addrspace_t space;
+	uint32_t    entry;
+	int         pid;
 
 	/* The task comes first and comes suspended: it owns the address space
 	*  the segments are mapped into, and it must not be scheduled while its
 	*  image is still half in place. The entry point is still unknown here,
 	*  which is exactly why it is passed as 0 and set further down. */
-	pid = taskmgr_add_user_task(0, modules[index].name, prio);
+	pid = taskmgr_add_user_task(0, name, prio);
 	if (pid < 0)
 	{
 		exec_set_error("no free task slot or no memory for the address space");
@@ -652,7 +1032,7 @@ int exec_spawn(int index, int prio)
 	*  mapped belong to its address space and go back to the pmm with it -
 	*  there is deliberately no second list of them here that could free
 	*  them a second time. */
-	if (load_image(space, image, modules[index].size, &entry) != 0)
+	if (load_image(space, img, &entry) != 0)
 	{
 		taskmgr_task_abort(pid, EXEC_ABORT_ERRNO, last_error);
 		return -1;
@@ -671,4 +1051,79 @@ int exec_spawn(int index, int prio)
 	/* Suspended on purpose. The caller starts it with taskmgr_task_start()
 	*  once it is done looking at it. */
 	return pid;
+}
+
+/* Loads the ELF file at path as a new ring 3 task and returns its pid, or a
+*  negative value with exec_last_error() set. Like exec_spawn(), the task
+*  comes back suspended.
+*
+*  Not declared in exec.h - that header is not ours to change here - so a
+*  caller outside this file repeats the prototype:
+*
+*      extern int exec_spawn_file(const char *path, int prio);
+*
+*  The shell does not have to: exec_module_find() already resolves a name to
+*  a file when no module carries it, and exec_spawn() takes the index that
+*  comes back. This entry point is for a caller that has a path rather than
+*  a name and wants no lookup in between. */
+int exec_spawn_file(const char *path, int prio)
+{
+	exec_image img;
+	char       name[EXEC_NAME_MAX];
+	int        pid;
+
+	exec_set_error("");
+
+	if (path == 0 || path[0] == '\0')
+	{
+		exec_set_error("no file name given");
+		return -1;
+	}
+
+	if (image_open_file(&img, path) != 0) return -1;
+
+	name_from_path(path, name, EXEC_NAME_MAX);
+
+	pid = spawn_image(&img, name, prio);
+
+	/* The header copy has done its job either way: the segments are in the
+	*  task's frames, and nothing below this line reads from the file again.
+	*  Released before the pid is returned, so that a caller which starts
+	*  the task immediately does not run it against a heap this loader is
+	*  still holding on to. */
+	image_close(&img);
+
+	return pid;
+}
+
+int exec_spawn(int index, int prio)
+{
+	exec_image  img;
+	exec_file  *f;
+
+	exec_set_error("");
+
+	/* An index from exec_module_find() may name a file just as well as a
+	*  module. It is handed on rather than duplicated here - the loader is
+	*  the same one, only the source of the bytes differs. */
+	f = file_at(index);
+	if (f != 0) return exec_spawn_file(f->path, prio);
+
+	if (index < 0 || index >= module_count)
+	{
+		exec_set_error("no module with that index");
+		return -1;
+	}
+
+	/* exec_init() has already established that the whole module lies inside
+	*  the direct mapping, so this pointer is good for size bytes - which is
+	*  why a module needs no heap copy of its headers and no read function:
+	*  base covers the whole image. */
+	img.size = modules[index].size;
+	img.base = (uint32_t)P2V(modules[index].start);
+	img.hdr  = modules[index].size;
+	img.path = 0;
+	img.noun = "module";
+
+	return spawn_image(&img, modules[index].name, prio);
 }

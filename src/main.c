@@ -10,6 +10,8 @@
 #include <vmm.h>
 #include <syscall.h>
 #include <exec.h>
+#include <ata.h>
+#include <fat.h>
 //#include <wmessages.h>
 
 #define NULL 0
@@ -216,6 +218,38 @@ extern char usertext_end[];
 *  when the table is full rather than the table growing without end. */
 #define PS_INSTANCES     8
 
+/* --- filesystem --------------------------------------------------------- */
+
+/* Column widths of the "ls" table, padded by hand like every other table in
+*  this file. The name field is FAT_NAME_MAX wide plus one space, so a full
+*  8.3 name never touches the size column. */
+#define LS_NAME_WIDTH    14
+#define LS_SIZE_WIDTH    10
+
+/* Upper bound on the directory walk. fat_readdir() says when it is done, so
+*  this is not how the loop normally ends -- it is the guard that keeps a
+*  damaged or looping directory from hanging the shell forever. */
+#define LS_MAX_ENTRIES   4096
+
+/* Width of the model column in "df". IDENTIFY hands out 40 characters, plus
+*  one space to the next column. */
+#define DF_MODEL_WIDTH   41
+
+/* How much of a file "cat" holds at a time. A file can be far larger than
+*  any buffer worth putting on a task stack, and fat_read() is offset based
+*  precisely so it can be streamed -- so the file is walked one chunk at a
+*  time and nothing is allocated for it at all. One sector is the natural
+*  unit: it is what the layer underneath moves anyway. */
+#define CAT_CHUNK        ATA_SECTOR_SIZE
+
+/* Bytes "cat" lets through untouched. Everything outside this range is
+*  replaced, see fs_cat(). */
+#define CAT_FIRST_PRINT  0x20
+#define CAT_LAST_PRINT   0x7E
+
+/* What a byte that cannot be printed is shown as. */
+#define CAT_REPLACEMENT  '.'
+
 void update_infobar() {
 	while(1)
 	{
@@ -237,6 +271,9 @@ void paging(char *cmd);
 void usermode(char *cmd);
 void processes(char *cmd);
 void execute(char *cmd);
+void listdir(char *cmd);
+void printfile(char *cmd);
+void diskfree(char *cmd);
 void help(void);
 //void network_test(char *cmd);
 
@@ -263,6 +300,13 @@ static void ps_print_left(const char *text, int width);
 static void ps_modules(void);
 static void ps_instances(void);
 static void exec_remember(int pid, addrspace_t space, const char *name);
+
+static void fs_print_right_text(const char *text, int width);
+static int  fs_drives_found(void);
+static int  fs_require_mount(const char *what);
+static void fs_list(const char *path);
+static void fs_cat(const char *path);
+static void fs_df(void);
 
 /* Self-test counters, maintained by mem_check(). */
 static int mem_tests_run = 0;
@@ -304,6 +348,9 @@ void main()
 		else if(strcmp(word, "user") == 0) usermode(cmd);
 		else if(strcmp(word, "ps") == 0) processes(cmd);
 		else if(strcmp(word, "exec") == 0) execute(cmd);
+		else if(strcmp(word, "ls") == 0) listdir(cmd);
+		else if(strcmp(word, "cat") == 0) printfile(cmd);
+		else if(strcmp(word, "df") == 0) diskfree(cmd);
 		else if(strcmp(word, "reboot") == 0) reboot();
 		else if(strcmp(word, "help") == 0) help();
 		else if(strcmp(word, "start") == 0) taskmgr_task_start(taskmgr_add_task( task, "Test Task", TASK_PRIORITY_LOW ));
@@ -2213,10 +2260,13 @@ void execute(char *cmd)
 	   copied out before anything else calls prmv() again. */
 	strcpy(name, prmv(1, cmd));
 
-	if(exec_module_count() == 0)
+	/* Programs can come from two places now: a bootloader module, or a file
+	   on the mounted filesystem. exec_module_find() looks in both, so this
+	   only gives up when neither source exists at all. */
+	if(exec_module_count() == 0 && !fat_mounted())
 	{
-		printf("exec: the bootloader passed no modules -- there is nothing\n");
-		printf("      to run. \"ps\" says the same.\n");
+		printf("exec: no modules were passed and no filesystem is mounted --\n");
+		printf("      there is nothing to run. \"ps\" and \"df\" say the same.\n");
 		return;
 	}
 
@@ -2266,6 +2316,446 @@ void execute(char *cmd)
 	printf("  Started. \"ps\" shows it for as long as it runs.\n");
 }
 
+/* --- ls, cat and df ------------------------------------------------------ */
+
+/* Prints text right-aligned in a field of the given width -- the counterpart
+*  to ps_print_left(), and the same idea as mem_print_right() for numbers.
+*  It exists because the size column is not always a number: a directory has
+*  no size of its own, and the header carries a word, and both have to line up
+*  over the digits below them. Text longer than the field is cut short rather
+*  than pushing the row out of line. */
+static void fs_print_right_text(const char *text, int width)
+{
+	int len;
+	int i;
+
+	len = (int)strlen(text);
+	if(len > width) len = width;
+
+	for(i = len; i < width; i++)
+	{
+		putch(' ');
+	}
+
+	for(i = 0; i < len; i++)
+	{
+		putch((unsigned char)text[i]);
+	}
+}
+
+/* How many drives the ATA driver identified. Asked in two places: to explain
+*  an unmounted filesystem, and to print the drive table in "df". */
+static int fs_drives_found(void)
+{
+	int drive;
+	int found;
+
+	found = 0;
+	for(drive = 0; drive < ATA_MAX_DRIVES; drive++)
+	{
+		if(ata_present(drive)) found++;
+	}
+
+	return found;
+}
+
+/* Guard in front of every command that needs a filesystem, and the one place
+*  that says why there is none.
+*
+*  Booting without a disk is a normal state here, not a failure -- "make run"
+*  does exactly that -- so the answer has to distinguish the two cases that
+*  lead to it. No drive at all is a different situation from a drive that
+*  holds nothing this kernel recognises, and only the second one has an error
+*  message worth printing. Returns 1 when the command may go ahead. */
+static int fs_require_mount(const char *what)
+{
+	const char *why;
+	int drives;
+
+	if(fat_mounted()) return 1;
+
+	drives = fs_drives_found();
+
+	printf("%s: no filesystem is mounted.\n", what);
+
+	if(drives == 0)
+	{
+		printf("      The ATA driver found no drive at all, so there is nothing\n");
+		printf("      to mount. Booting without a disk is a normal case here.\n");
+	} else {
+		why = fat_last_error();
+		printf("      %i drive(s) were found, but none of them carries a FAT12\n",
+		       drives);
+		printf("      or FAT16 filesystem this kernel can read.\n");
+		if(why[0] != EOS) printf("      Last error: %s\n", why);
+	}
+
+	printf("      \"df\" shows what the drivers did find.\n");
+	return 0;
+}
+
+/* "ls [path]": one row per directory entry, and a summary underneath.
+*
+*  fat_readdir() is index based rather than handing out a cursor, so the walk
+*  is a plain count upwards until it reports there are no more entries. That
+*  makes the loop trivial and stateless -- nothing has to be closed, and a
+*  half finished listing leaves nothing behind. The cost is that the driver
+*  re-walks the directory for every index, which for a shell listing a handful
+*  of entries is not worth a line of code to avoid. */
+static void fs_list(const char *path)
+{
+	fat_dirent ent;
+	uint32_t bytes;
+	int entries;
+	int files;
+	int dirs;
+	int index;
+	int rc;
+
+	printf("Directory of %s\n", path);
+
+	printf("  ");
+	ps_print_left("Name", LS_NAME_WIDTH);
+	fs_print_right_text("Size", LS_SIZE_WIDTH);
+	printf("  Type\n");
+
+	bytes = 0;
+	entries = 0;
+	files = 0;
+	dirs = 0;
+	rc = 0;
+
+	for(index = 0; index < LS_MAX_ENTRIES; index++)
+	{
+		rc = fat_readdir(path, index, &ent);
+
+		/* 1 means the directory is exhausted, which is the normal way out;
+		   anything negative is a real failure and is reported below. */
+		if(rc != 0) break;
+
+		printf("  ");
+		ps_print_left(ent.name, LS_NAME_WIDTH);
+
+		if(ent.is_dir)
+		{
+			/* A directory carries no size of its own in FAT, so the column
+			   shows a dash instead of a zero that would mean "empty". */
+			fs_print_right_text("-", LS_SIZE_WIDTH);
+			printf("  dir\n");
+			dirs++;
+		} else {
+			mem_print_right(ent.size, LS_SIZE_WIDTH);
+			printf("  file\n");
+			bytes += ent.size;
+			files++;
+		}
+
+		entries++;
+	}
+
+	if(rc < 0)
+	{
+		printf("  Reading the directory failed at entry %i: %s\n",
+		       index, fat_last_error());
+		return;
+	}
+
+	if(index == LS_MAX_ENTRIES)
+	{
+		printf("  ... stopped after %i entries.\n", LS_MAX_ENTRIES);
+	}
+
+	if(entries == 0)
+	{
+		printf("  (empty)\n");
+	}
+
+	printf("  %i entries (%i files, %i directories), ", entries, files, dirs);
+	printf("%u bytes\n", (int)bytes);
+}
+
+/* The buffer "cat" streams a file through. At file scope on purpose: the
+*  shell runs as a task with a stack of its own, and half a kilobyte of it is
+*  better spent on the call chain than on a copy of somebody's file. Only the
+*  shell task ever reaches this. */
+static char cat_buf[CAT_CHUNK];
+
+/* "cat <path>": the contents of a file, printed as text.
+*
+*  The file is never held in memory as a whole. fat_size() says how long it
+*  is, fat_read() takes an offset, and the loop below moves CAT_CHUNK bytes at
+*  a time -- so a megabyte file costs the same half kilobyte of memory as an
+*  empty one.
+*
+*  What the bytes are allowed to do to the screen is the other half of the
+*  job. putch() acts on the control characters it is given: 0x08 walks the
+*  cursor backwards, 0x09 jumps it to the next tab stop, 0x0D throws it back
+*  to the left margin. A binary file is full of such bytes, and printed
+*  verbatim it would overwrite whatever was on screen and leave the cursor
+*  somewhere arbitrary. So exactly three kinds of byte get through:
+*
+*    - printable ASCII, 0x20 to 0x7E, which is the range every VGA font agrees
+*      on and the only range where a byte means the same thing everywhere;
+*    - '\n', because line breaks are what makes a text file readable;
+*    - '\t', whose effect on the cursor is forwards and bounded.
+*
+*  '\r' is dropped rather than replaced: DOS text files end every line with
+*  CR LF, and turning the CR into a visible character would put a mark at the
+*  end of every single line of an ordinary file. The LF that follows does the
+*  work. Everything else -- other control codes, and everything from 0x7F up,
+*  where the meaning depends on a code page -- becomes CAT_REPLACEMENT, so a
+*  binary file shows its shape and its length without touching the cursor.
+*  The count of what was replaced is printed at the end, which is what tells
+*  a file that was not text from one that was. */
+static void fs_cat(const char *path)
+{
+	uint32_t size;
+	uint32_t offset;
+	uint32_t want;
+	uint32_t hidden;
+	unsigned char c;
+	int at_margin;
+	int got;
+	int i;
+
+	if(fat_size(path, &size) != 0)
+	{
+		printf("cat: %s: %s\n", path, fat_last_error());
+		return;
+	}
+
+	if(size == 0)
+	{
+		printf("cat: %s is empty (0 bytes).\n", path);
+		return;
+	}
+
+	offset = 0;
+	hidden = 0;
+
+	/* Whether the cursor sits at the start of a line, so the trailer below
+	   can begin on one of its own without inserting a blank line after a
+	   file that already ended with a newline. */
+	at_margin = 1;
+
+	while(offset < size)
+	{
+		want = size - offset;
+		if(want > (uint32_t)CAT_CHUNK) want = (uint32_t)CAT_CHUNK;
+
+		got = fat_read(path, offset, want, cat_buf);
+
+		if(got < 0)
+		{
+			if(!at_margin) printf("\n");
+			printf("cat: reading %s failed at offset %u: %s\n",
+			       path, (int)offset, fat_last_error());
+			return;
+		}
+
+		/* A short result means end of file -- the size in the directory
+		   entry and what the cluster chain actually holds need not agree on
+		   a damaged disk, and the chain is the one that decides. */
+		if(got == 0) break;
+		if((uint32_t)got > want) got = (int)want;
+
+		for(i = 0; i < got; i++)
+		{
+			c = (unsigned char)cat_buf[i];
+
+			if(c == '\n')
+			{
+				putch(c);
+				at_margin = 1;
+			}
+			else if(c == '\t')
+			{
+				putch(c);
+				at_margin = 0;
+			}
+			else if(c == '\r')
+			{
+				/* CR LF line ends: swallowed, the LF does the work. */
+				hidden++;
+			}
+			else if(c >= CAT_FIRST_PRINT && c <= CAT_LAST_PRINT)
+			{
+				putch(c);
+				at_margin = 0;
+			} else {
+				putch((unsigned char)CAT_REPLACEMENT);
+				at_margin = 0;
+				hidden++;
+			}
+		}
+
+		offset += (uint32_t)got;
+	}
+
+	if(!at_margin) printf("\n");
+
+	printf("[%s: %u of %u bytes shown", path, (int)offset, (int)size);
+
+	if(hidden != 0)
+	{
+		printf(", %u not printable", (int)hidden);
+	}
+
+	printf("]\n");
+}
+
+/* "df": the state of the mount and of the drives underneath it.
+*
+*  This is the command one runs when something does not work, so it prints
+*  both halves even when the upper one is missing: a filesystem that is not
+*  mounted still leaves the question of whether a disk was found at all, and
+*  that answer lives in the ATA driver. */
+static void fs_df(void)
+{
+	const char *label;
+	uint32_t total;
+	uint32_t avail;
+	uint32_t sectors;
+	int drives;
+	int drive;
+
+	printf("Filesystem:\n");
+
+	if(!fat_mounted())
+	{
+		printf("  Nothing is mounted -- no path can be read.\n");
+	} else {
+		total = fat_total_bytes();
+		avail = fat_free_bytes();
+		label = fat_label();
+
+		printf("  Type:          %s\n", fat_type());
+		printf("  Label:         %s\n", label[0] == EOS ? "(none)" : label);
+
+		printf("  Total:   ");
+		mem_print_right(total, 12);
+		printf(" bytes (");
+		mem_print_right(total / 1024, 8);
+		printf(" KiB)\n");
+
+		printf("  Used:    ");
+		mem_print_right(total - avail, 12);
+		printf(" bytes (");
+		mem_print_right((total - avail) / 1024, 8);
+		printf(" KiB)\n");
+
+		printf("  Free:    ");
+		mem_print_right(avail, 12);
+		printf(" bytes (");
+		mem_print_right(avail / 1024, 8);
+		printf(" KiB)\n");
+
+		printf("  Cluster size:  %u bytes\n", (int)fat_cluster_bytes());
+	}
+
+	printf("\n");
+	printf("Drives the ATA driver found:\n");
+
+	drives = fs_drives_found();
+
+	if(drives == 0)
+	{
+		printf("  None. Either no controller answered or nothing is attached\n");
+		printf("  to it -- booting without a disk is a normal case here.\n");
+
+		/* The driver's own account of the last failure, if it had one. A
+		   probe that simply found nothing leaves this empty. */
+		if(ata_last_error()[0] != EOS)
+		{
+			printf("  Last error: %s\n", ata_last_error());
+		}
+		return;
+	}
+
+	printf("  Nr  ");
+	ps_print_left("Model", DF_MODEL_WIDTH);
+	fs_print_right_text("Sectors", 10);
+	fs_print_right_text("MiB", 11);
+	printf("\n");
+
+	for(drive = 0; drive < ATA_MAX_DRIVES; drive++)
+	{
+		if(!ata_present(drive)) continue;
+
+		sectors = ata_sectors(drive);
+
+		printf("  ");
+		mem_print_right((uint32_t)drive, 2);
+		printf("  ");
+		ps_print_left(ata_model(drive), DF_MODEL_WIDTH);
+		mem_print_right(sectors, 10);
+
+		/* Divided rather than multiplied: sectors * 512 overflows 32 bits
+		   at 8 GiB, and a drive that large is entirely plausible. */
+		mem_print_right(sectors / (1024 * 1024 / ATA_SECTOR_SIZE), 11);
+		printf("\n");
+	}
+}
+
+void listdir(char *cmd)
+{
+	char path[100];
+
+	if(prmc(cmd) == 0)
+	{
+		/* No argument means the root, which is what fat_readdir() reads for
+		   "/" as well as for the empty string. */
+		strcpy(path, "/");
+	} else {
+		/* prmv() hands back a pointer into one static buffer, so the path is
+		   copied out before anything else can call prmv() again. */
+		strcpy(path, prmv(1, cmd));
+	}
+
+	if(path[0] == '-')
+	{
+		printf("Syntax: ls [PATH]\n");
+		printf("\t          List the root directory\n");
+		printf("\tPATH      List that directory instead\n");
+		return;
+	}
+
+	if(!fs_require_mount("ls")) return;
+
+	fs_list(path);
+}
+
+void printfile(char *cmd)
+{
+	char path[100];
+
+	if(prmc(cmd) == 0)
+	{
+		printf("Syntax: cat PATH\n");
+		printf("\t          Print the file PATH as text\n");
+		printf("\t          \"ls\" lists what there is\n");
+		return;
+	}
+
+	strcpy(path, prmv(1, cmd));
+
+	if(!fs_require_mount("cat")) return;
+
+	fs_cat(path);
+}
+
+void diskfree(char *cmd)
+{
+	if(prmc(cmd) != 0)
+	{
+		printf("Syntax: df\n");
+		printf("\t          Show the mounted filesystem and the drives found\n");
+		return;
+	}
+
+	fs_df();
+}
+
 void help(void)
 {
 	printf("TomatOS Help\n");
@@ -2279,6 +2769,9 @@ void help(void)
 	printf("\t          user -i tests the address space isolation\n");
 	printf("\tps        List the loaded modules and the running tasks\n");
 	printf("\texec      exec NAME runs the module NAME as a ring 3 task\n");
+	printf("\tls        ls [PATH] lists a directory, the root without PATH\n");
+	printf("\tcat       cat PATH prints a file as text\n");
+	printf("\tdf        Show the mounted filesystem and the drives found\n");
 	printf("\treboot    Restart the computer\n");
 	printf("\texit      Exit the shell\n");
 }
