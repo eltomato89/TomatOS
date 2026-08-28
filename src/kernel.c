@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <hardware.h>
 #include <mm.h>
+#include <syscall.h>
 #include <vmm.h>
 #define cpuid(in, a, b, c, d) __asm__("cpuid": "=a" (a), "=b" (b), "=c" (c), "=d" (d) : "a" (in));
 
@@ -254,10 +255,15 @@ int kernel(uint32_t magic, multiboot_info *mbi_phys)
 
 	printf("\n\nLoading TomatOS/x86\n");
 	printf("Loading Driver Components.\n");
-    gdt_install();    
+    gdt_install();
     idt_install();
     isrs_install();
     irq_install();
+	/* After idt_install(), which clears the table: syscall_install() adds
+	*  vector 0x80 as the one gate ring 3 may reach. gdt_install() has
+	*  already loaded the TSS the CPU needs to find a kernel stack when a
+	*  ring 3 task traps into the kernel. */
+	syscall_install();
 	mt_install();
     pic_install();
     keyboard_install();

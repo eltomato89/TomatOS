@@ -83,8 +83,30 @@ extern void panic(char *desc);
 extern void display_update_statusbar();
 
 /* GDT.C */
+
+/* Segment selectors, i.e. the byte offset of the descriptor inside the GDT.
+*  The kernel pair is used as-is (RPL 0); ring 3 always adds RPL 3 to the
+*  user selectors, so user code runs with CS 0x1B and SS 0x23 - see the
+*  comment in gdt.c. */
+#define GDT_ENTRIES      6
+#define GDT_NULL         0x00
+#define GDT_KERNEL_CODE  0x08
+#define GDT_KERNEL_DATA  0x10
+#define GDT_USER_CODE    0x18
+#define GDT_USER_DATA    0x20
+#define GDT_TSS          0x28
+
+/* Requested privilege level to or into a selector before it reaches a
+*  segment register in ring 3. */
+#define GDT_RPL_USER     0x03
+
 extern void gdt_set_gate(int num, unsigned long base, unsigned long limit, unsigned char access, unsigned char gran);
 extern void gdt_install();
+
+/* Point the TSS at the kernel stack the CPU should switch to on the next
+*  entry from ring 3. The scheduler calls this on every task switch with the
+*  top of the incoming task's kernel stack. */
+extern void tss_set_kernel_stack(uint32_t esp0);
 
 /* IDT.C */
 extern void idt_set_gate(unsigned char num, unsigned long base, unsigned short sel, unsigned char flags);
@@ -120,6 +142,7 @@ extern void kb_flush();
 extern void mt_install();
 extern void taskmgr_list_tasks();
 extern int taskmgr_add_task( void* tfunct, const char *name, int cpu_time);
+extern int taskmgr_add_user_task(void *tfunct, const char *name, int prio);
 extern int taskmgr_get_currpid();
 extern void taskmgr_task_abort(int pid, int error_number, const char *error_descr);
 extern void taskmgr_task_start(int pid);

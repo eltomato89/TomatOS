@@ -2,7 +2,8 @@
 
 A 32-bit x86 hobby kernel (Multiboot 1) — preemptive scheduler, VGA text
 console, PS/2 keyboard with German layout, PIT timer, CMOS clock, physical
-frame allocator, kernel heap, paging and a small shell. Originally written between
+frame allocator, kernel heap, paging, ring 3 with system calls, and a small
+shell. Originally written between
 2006 and 2011, ported to a current Linux toolchain in 2026.
 
 ## Requirements
@@ -36,8 +37,8 @@ QEMU loads the Multiboot ELF directly via `-kernel`, with no bootloader
 involved — the fastest way to try a change. Quit with `Ctrl-C` in the
 terminal.
 
-The shell offers `help`, `taskmgr`, `start`, `mem`, `page`, `reboot` and
-`exit`. `taskmgr` without an argument prints its own syntax, `mem` and `page`
+The shell offers `help`, `taskmgr`, `start`, `mem`, `page`, `user`, `reboot`
+and `exit`. `taskmgr` without an argument prints its own syntax, `mem` and `page`
 show the memory and paging state, and `mem -t` / `page -t` run self-tests.
 
 ### Memory layout
@@ -60,6 +61,29 @@ read-only page table entries in ring 0.
 
 `page -f` triggers a null pointer write on purpose to demonstrate the fault
 handler; it kills the calling task, and the system carries on.
+
+### Ring 3 and system calls
+
+`user` starts a task that runs in **ring 3** and can only reach the kernel
+through `int 0x80` — call number in `eax`, arguments in `ebx`/`ecx`/`edx`,
+result in `eax`. `user -t` exercises the call path and the argument guards.
+
+Vector `0x80` is the only IDT gate with DPL 3; every exception and IRQ
+vector stays DPL 0, so user code cannot fake a page fault or a timer
+interrupt. It is a *trap* gate rather than an interrupt gate, because an
+interrupt gate clears `IF` and `SYS_SLEEP` would then wait forever for a
+timer tick that can never arrive.
+
+Each task owns a kernel stack; the TSS points `esp0` at the current one, so
+the CPU has somewhere to switch to when a ring 3 task traps into the kernel.
+User stacks sit below the kernel window with an unmapped guard page beneath
+each, and are zeroed on allocation — the frame allocator hands out dirty
+memory and ring 3 must not see what the previous owner left there.
+
+Pointer arguments from ring 3 are validated by address range and mapping
+before the kernel follows them. Note the current limits: all tasks share one
+page directory, so these checks stop kernel reads and unmapped pages but do
+**not** provide process isolation.
 
 ### Display
 

@@ -8,6 +8,7 @@
 #include <math.h>
 #include <mm.h>
 #include <vmm.h>
+#include <syscall.h>
 //#include <wmessages.h>
 
 #define NULL 0
@@ -44,6 +45,47 @@
 /* Pattern written through the freshly created mapping. */
 #define PAGE_TEST_PATTERN 0xC0FFEE01
 
+/* --- ring 3 ------------------------------------------------------------- */
+
+/* The one page of memory ring 3 is allowed to read and write. It holds the
+   strings the demo prints and nothing else -- see the comment on user_demo()
+   for why the strings cannot simply be literals.
+
+   The address is a fixed constant on purpose: a constant compiles into the
+   instruction stream as an immediate, whereas a kernel variable holding the
+   address would have to be read out of kernel memory, which is exactly what
+   ring 3 must not do.
+
+   1 GiB is comfortably below the kernel window at 0xC0000000, comfortably
+   above anything a user image would ever be loaded at, and comfortably clear
+   of the per task user stacks the task manager parks just under the kernel. */
+#define USER_PAGE_VIRT   0x40000000u
+
+/* Slots inside that page, one message each. */
+#define USER_MSG_SIZE    0x40
+#define USER_MSG_HELLO   (USER_PAGE_VIRT + 0x000)
+#define USER_MSG_PID     (USER_PAGE_VIRT + 0x040)
+#define USER_MSG_SLEPT   (USER_PAGE_VIRT + 0x080)
+#define USER_MSG_BYE     (USER_PAGE_VIRT + 0x0C0)
+#define USER_MSG_TEST    (USER_PAGE_VIRT + 0x100)
+
+/* Pages of kernel text that user_setup() opens for ring 3, counted from the
+   page user_demo() starts in. The routine is a few hundred bytes long, so it
+   fits in one page and can at worst straddle one boundary -- two pages cover
+   it either way. */
+#define USER_TEXT_PAGES  2
+
+/* A call number that is not in the table, for the SYS_ENOSYS check. Well
+   above SYSCALL_MAX, so it stays unassigned when calls are added. */
+#define SYS_NOSUCHCALL   99
+
+#define USER_DEMO_SLEEP  120  /* ms the ring 3 demo sleeps */
+#define USER_TEST_SLEEP  50   /* ms "user -t" sleeps       */
+#define USER_DEMO_WAIT   500  /* ms the shell waits for the demo to finish */
+
+/* tasks.c grew this alongside taskmgr_add_task(); system.h has not caught up
+   yet, and this file may not edit headers. Same signature as there. */
+
 void update_infobar() {
 	while(1)
 	{
@@ -62,6 +104,7 @@ void task() {
 void taskmanager(char *cmd);
 void memory(char *cmd);
 void paging(char *cmd);
+void usermode(char *cmd);
 void help(void);
 //void network_test(char *cmd);
 
@@ -76,6 +119,12 @@ static void page_selftest(void);
 static void page_fault_demo(void);
 static void page_check(int ok);
 
+static void user_demo(void);
+static int  user_setup(void);
+static void user_run(void);
+static void user_selftest(void);
+static void user_check(int ok);
+
 /* Self-test counters, maintained by mem_check(). */
 static int mem_tests_run = 0;
 static int mem_tests_ok = 0;
@@ -83,6 +132,10 @@ static int mem_tests_ok = 0;
 /* The same for page_check(). */
 static int page_tests_run = 0;
 static int page_tests_ok = 0;
+
+/* And for user_check(). */
+static int user_tests_run = 0;
+static int user_tests_ok = 0;
 
 void main()
 {
@@ -109,6 +162,7 @@ void main()
 		if(strcmp(word, "taskmgr") == 0) taskmanager(cmd);
 		else if(strcmp(word, "mem") == 0) memory(cmd);
 		else if(strcmp(word, "page") == 0) paging(cmd);
+		else if(strcmp(word, "user") == 0) usermode(cmd);
 		else if(strcmp(word, "reboot") == 0) reboot();
 		else if(strcmp(word, "help") == 0) help();
 		else if(strcmp(word, "start") == 0) taskmgr_task_start(taskmgr_add_task( task, "Test Task", TASK_PRIORITY_LOW ));
@@ -760,6 +814,420 @@ void paging(char *cmd)
 	}
 }
 
+/* --- user --------------------------------------------------------------- */
+
+/* The ring 3 side of the system call interface, in the spirit of a minimal
+   libc: one wrapper per call, and underneath them the two functions that
+   actually issue the int.
+
+   The convention is the one syscall.h lays down -- call number in eax, up to
+   three arguments in ebx, ecx and edx, result in eax. That is what the "=a"
+   output and the "a"/"b" inputs express; no call this kernel has needs more
+   than one argument yet, so ecx and edx stay unused for now.
+
+   Two constraints deserve a word:
+
+     "b"      GCC will not hand out ebx as an operand when it compiles
+              position independent code, because there ebx is reserved for the
+              GOT pointer. This build passes -fno-pic -fno-pie (a kernel
+              linked to a fixed address must not be PIC), so ebx is an
+              ordinary register here and the constraint is safe. Should that
+              flag ever disappear, these wrappers have to save and restore ebx
+              around the int themselves.
+
+     "memory" The kernel may read (SYS_WRITE) or write memory on our behalf
+              during the call, so nothing may be kept in a register across it.
+
+   always_inline is not decoration either. user_demo() below executes with
+   CPL 3, and the only kernel code it may execute is the couple of pages
+   user_setup() opens for it. A real call to an out-of-line sys_call1() would
+   jump out of those pages and fault. Inlining keeps user_demo() one
+   contiguous, call free routine. */
+#define USER_INLINE static __inline__ __attribute__((always_inline))
+
+USER_INLINE int sys_call0(int nr)
+{
+	int ret;
+	__asm__ __volatile__("int $0x80" : "=a"(ret) : "a"(nr) : "memory");
+	return ret;
+}
+
+USER_INLINE int sys_call1(int nr, int arg)
+{
+	int ret;
+	__asm__ __volatile__("int $0x80" : "=a"(ret) : "a"(nr), "b"(arg) : "memory");
+	return ret;
+}
+
+USER_INLINE void u_exit(int status)  { sys_call1(SYS_EXIT, status); }
+USER_INLINE int  u_write(char *text) { return sys_call1(SYS_WRITE, (int)text); }
+USER_INLINE int  u_getpid(void)      { return sys_call0(SYS_GETPID); }
+USER_INLINE int  u_sleep(int ms)     { return sys_call1(SYS_SLEEP, ms); }
+USER_INLINE int  u_putch(int c)      { return sys_call1(SYS_PUTCH, c); }
+USER_INLINE int  u_uptime(void)      { return sys_call0(SYS_UPTIME); }
+
+/* Decimal output for ring 3. printf() is a kernel function and out of reach,
+   so the digits are produced on the stack and pushed out one SYS_PUTCH at a
+   time. The buffer is an automatic array that is never initialised from a
+   literal, so it costs nothing in .rodata. */
+USER_INLINE void u_putuint(unsigned int value)
+{
+	char digits[12];
+	int i;
+
+	i = 0;
+	do
+	{
+		digits[i] = (char)('0' + (value % 10u));
+		value = value / 10u;
+		i++;
+	} while(value != 0 && i < 11);
+
+	while(i > 0)
+	{
+		i--;
+		u_putch((int)digits[i]);
+	}
+}
+
+/* The demo, and the only routine in this file that runs with CPL 3.
+*
+*  It may touch exactly two things: its own stack, which the task manager maps
+*  one page of for every ring 3 task, and the page at USER_PAGE_VIRT. Every
+*  other page in the system is mapped without PAGE_USER and faults on the
+*  first access from here.
+*
+*  That rules out more than the obvious. printf() and putch() are kernel
+*  functions and unreachable. So is every kernel global. And so -- this is the
+*  part that is easy to miss -- is every string literal: a literal lives in
+*  .rodata, which after vmm_init() sits somewhere around 0xC01xxxxx with no
+*  PAGE_USER bit. Merely computing its address would be fine, but the moment
+*  such a pointer went to SYS_WRITE the kernel would refuse it with SYS_EFAULT
+*  (it rejects everything at or above KERNEL_VIRTUAL_BASE), and reading the
+*  bytes here in ring 3 would fault outright.
+*
+*  So the strings this routine prints are not in this routine. user_setup()
+*  copies them into the user page before ring 3 is ever entered, and the code
+*  below names them by their fixed virtual address. USER_MSG_HELLO and its
+*  siblings are compile time constants, so they end up as immediate operands
+*  inside the instruction stream -- no load from kernel memory, no relocation
+*  into it. The one thing ring 3 is allowed to know about the address space is
+*  a number.
+*
+*  The other rule is that this function must not return: a freshly built user
+*  stack has no return address on it. SYS_EXIT is the way out. */
+static void user_demo(void)
+{
+	int pid;
+	int before;
+	int after;
+
+	u_write((char *)USER_MSG_HELLO);
+
+	pid = u_getpid();
+	u_write((char *)USER_MSG_PID);
+	u_putuint((unsigned int)pid);
+	u_putch('\n');
+
+	before = u_uptime();
+	u_sleep(USER_DEMO_SLEEP);
+	after = u_uptime();
+
+	u_write((char *)USER_MSG_SLEPT);
+	u_putuint((unsigned int)(after - before));
+	u_write((char *)USER_MSG_BYE);
+
+	u_exit(0);
+
+	/* Not reached. If SYS_EXIT ever did come back, spinning here is still
+	   better than returning into nothing. */
+	for(;;);
+}
+
+/* Physical frame behind the user page, and whether the setup has run. */
+static uint32_t user_page_frame = 0;
+static int user_page_ready = 0;
+
+/* Copies one message into its slot in the user page. Bounded, so a message
+   that outgrows its slot is cut short instead of running into the next one. */
+static void user_store(uint32_t at, char *text)
+{
+	char *dest;
+	int i;
+
+	dest = (char *)at;
+	for(i = 0; i < USER_MSG_SIZE - 1 && text[i] != EOS; i++)
+	{
+		dest[i] = text[i];
+	}
+	dest[i] = EOS;
+}
+
+/* Prepares everything ring 3 needs, once. Returns 1 when user_demo() can be
+*  entered, 0 otherwise.
+*
+*  Two mappings are involved, opened for quite different reasons:
+*
+*    - one fresh frame at USER_PAGE_VIRT, present, writable and PAGE_USER.
+*      This is the demo's data, i.e. its strings and nothing else. It is
+*      zeroed first: the pmm hands out frames with the previous owner's
+*      contents still in them, and ring 3 is about to be able to read them.
+*
+*    - the kernel text pages holding user_demo(), re-mapped with PAGE_USER
+*      added so ring 3 can fetch those instructions. They stay without
+*      PAGE_WRITE, so this grants read and execute, not write.
+*
+*  That second mapping is the coarse move in the whole exercise and is worth
+*  naming rather than hiding: a page is the smallest thing paging can talk
+*  about, so whatever else the linker put next to user_demo() becomes readable
+*  from ring 3 as well. A grown-up kernel links user code into a section of its
+*  own and maps only that. What is deliberately *not* opened is .rodata -- the
+*  strings stay in the user page precisely so this stays a text-only exception. */
+static int user_setup(void)
+{
+	uint32_t page;
+	uint32_t phys;
+	int i;
+
+	if(user_page_ready) return 1;
+
+	if(!vmm_enabled())
+	{
+		printf("user: paging is off -- there is no ring 3 to enter.\n");
+		return 0;
+	}
+
+	user_page_frame = (uint32_t)pmm_alloc_frame();
+	if(user_page_frame == 0)
+	{
+		printf("user: no free frame for the user data page.\n");
+		return 0;
+	}
+
+	if(vmm_map((uint32_t)USER_PAGE_VIRT, user_page_frame,
+	           PAGE_PRESENT | PAGE_WRITE | PAGE_USER) != 0)
+	{
+		pmm_free_frame((void *)user_page_frame);
+		user_page_frame = 0;
+		printf("user: the user data page could not be mapped.\n");
+		return 0;
+	}
+
+	memset((void *)USER_PAGE_VIRT, (char)0, (size_t)PAGE_SIZE);
+
+	user_store(USER_MSG_HELLO, "\n[ring 3] Hello from user mode!\n");
+	user_store(USER_MSG_PID,   "[ring 3] getpid() says ");
+	user_store(USER_MSG_SLEPT, "[ring 3] uptime moved on by ");
+	user_store(USER_MSG_BYE,   " ms, now exit(0).\n");
+	user_store(USER_MSG_TEST,  "SYS_WRITE through a user page\n");
+
+	page = (uint32_t)user_demo & ~((uint32_t)PAGE_SIZE - 1);
+	for(i = 0; i < USER_TEXT_PAGES; i++)
+	{
+		phys = vmm_get_phys(page);
+		if(phys == 0 || vmm_map(page, phys, PAGE_PRESENT | PAGE_USER) != 0)
+		{
+			printf("user: kernel text at ");
+			page_print_hex(page, 8);
+			printf(" could not be opened for ring 3.\n");
+			return 0;
+		}
+		page += PAGE_SIZE;
+	}
+
+	user_page_ready = 1;
+	return 1;
+}
+
+/* "user": start the demo and say what came of it. The demo is a task of its
+   own -- it has to be, because it ends in SYS_EXIT and that would take the
+   shell down with it otherwise -- so the shell starts it, waits, and then
+   reports what the syscall counter saw in the meantime. */
+static void user_run(void)
+{
+	uint32_t before;
+	uint32_t after;
+	int pid;
+
+	if(!user_setup()) return;
+
+	printf("Ring 3 demo:\n");
+	printf("  Entry:   ");
+	page_print_hex((uint32_t)user_demo, 8);
+	printf("  kernel text, opened for ring 3\n");
+	printf("  Strings: ");
+	page_print_hex((uint32_t)USER_PAGE_VIRT, 8);
+	printf("  user page, PAGE_USER | PAGE_WRITE\n");
+
+	before = syscall_count();
+
+	pid = taskmgr_add_user_task(user_demo, "Ring 3 Demo", TASK_PRIORITY_NORMAL);
+	if(pid < 0) return;
+
+	taskmgr_task_start(pid);
+	printf("  Task %i started in ring 3, waiting for it to exit.\n", pid);
+
+	/* Its own sleep plus a margin, so the shell is back at the prompt only
+	   after the demo has run its course. */
+	sleep(USER_DEMO_WAIT);
+
+	after = syscall_count();
+	printf("  Back in the shell, %u system calls served in between.\n",
+	       (int)(after - before));
+}
+
+/* Records the result of a check and writes the marker to the start of the
+   line, exactly as mem_check() and page_check() do. Both markers are eight
+   characters wide, so the text behind them lines up. */
+static void user_check(int ok)
+{
+	user_tests_run++;
+
+	if(ok)
+	{
+		user_tests_ok++;
+		printf("  [  OK  ] ");
+	} else {
+		printf("  [FAILED] ");
+	}
+}
+
+/* "user -t".
+*
+*  Every call below is issued from ring 0, because "int 0x80" works from
+*  either side of the privilege boundary and running the checks here means
+*  they can be reported in one place instead of shouting results out of a task
+*  that is about to exit. That has a consequence worth stating on screen: what
+*  these checks prove is that the call path works and that the kernel guards
+*  its arguments. They do not prove the privilege drop -- only "user" does.
+*
+*  SYS_EXIT is not among them for the obvious reason. */
+static void user_selftest(void)
+{
+	char *kernel_text = "THIS TEXT LIVES IN KERNEL MEMORY";
+	uint32_t before;
+	uint32_t after;
+	int pid;
+	int sys_pid;
+	int written;
+	int put;
+	int t0;
+	int t1;
+	int t2;
+	int slept;
+	int slept_ret;
+	int bogus;
+	int fault;
+
+	user_tests_run = 0;
+	user_tests_ok = 0;
+
+	printf("System call self-test:\n");
+
+	if(!user_setup()) return;
+
+	before = syscall_count();
+	printf("  Vector 0x%X, %u calls served since boot\n",
+	       SYSCALL_VECTOR, (int)before);
+	printf("  Issued from ring 0: these check the call path and the argument\n");
+	printf("  guards, not the privilege drop -- \"user\" does that.\n");
+
+	/* 1. The kernel has to answer with the pid of whoever is asking, which
+	      right now is this very shell task. */
+	pid = taskmgr_get_currpid();
+	sys_pid = sys_call0(SYS_GETPID);
+	user_check(pid >= 0 && sys_pid == pid);
+	printf("SYS_GETPID = %i, taskmgr_get_currpid() = %i\n", sys_pid, pid);
+
+	/* 2. SYS_WRITE with a pointer into the user page: accepted, and the
+	      return value is the number of characters it put out. The text
+	      appears one line above the marker, which is where it belongs. */
+	written = sys_call1(SYS_WRITE, (int)USER_MSG_TEST);
+	user_check(written == (int)strlen((char *)USER_MSG_TEST));
+	printf("SYS_WRITE(user page) = %i, string is %i characters long\n",
+	       written, (int)strlen((char *)USER_MSG_TEST));
+
+	/* 3. SYS_PUTCH puts out exactly one character and says so. The second
+	      call closes the line, so the marker below still starts in the
+	      column all the other markers do. */
+	put = sys_call1(SYS_PUTCH, (int)'*');
+	put += sys_call1(SYS_PUTCH, (int)'\n');
+	user_check(put == 2);
+	printf("SYS_PUTCH twice = %i, the star above is the first of them\n",
+	       put);
+
+	/* 4. Uptime has to be a plausible number of milliseconds -- the kernel
+	      has been up at least long enough to reach the shell. */
+	t0 = sys_call0(SYS_UPTIME);
+	user_check(t0 > 0);
+	printf("SYS_UPTIME = %i ms since boot\n", t0);
+
+	/* 5. And it has to move on across a SYS_SLEEP. The read is taken
+	      immediately before the sleep so the screen output above does not
+	      count towards the difference. Half the requested time is the floor,
+	      because the tick resolution rounds and the scheduler may hand the
+	      CPU on in between -- it may take longer, never noticeably less. */
+	t1 = sys_call0(SYS_UPTIME);
+	slept_ret = sys_call1(SYS_SLEEP, USER_TEST_SLEEP);
+	t2 = sys_call0(SYS_UPTIME);
+	slept = t2 - t1;
+	user_check(slept_ret == 0 && slept >= USER_TEST_SLEEP / 2);
+	printf("SYS_SLEEP(%i) = %i, uptime %i -> %i (+%i ms)\n",
+	       USER_TEST_SLEEP, slept_ret, t1, t2, slept);
+
+	/* 6. A call number the table does not know must come back as
+	      SYS_ENOSYS rather than as a jump through a null entry. */
+	bogus = sys_call0(SYS_NOSUCHCALL);
+	user_check(bogus == SYS_ENOSYS);
+	printf("Call number %i = %i (SYS_ENOSYS is %i)\n",
+	       SYS_NOSUCHCALL, bogus, SYS_ENOSYS);
+
+	/* 7. The check that is actually about security. kernel_text is a plain
+	      string literal, so it lives in .rodata at or above
+	      KERNEL_VIRTUAL_BASE. Handing that to SYS_WRITE must be refused with
+	      SYS_EFAULT -- if the kernel followed the pointer instead, the
+	      sentence would be sitting on the screen for everyone to see, which
+	      is the whole reason the check reads that way. */
+	fault = sys_call1(SYS_WRITE, (int)kernel_text);
+	user_check((uint32_t)kernel_text >= KERNEL_VIRTUAL_BASE &&
+	           fault == SYS_EFAULT);
+	printf("SYS_WRITE(");
+	page_print_hex((uint32_t)kernel_text, 8);
+	printf(") = %i, kernel memory stayed unread\n", fault);
+
+	/* 8. All of the above went through the one entry point, so the kernel's
+	      own counter must have moved by at least the ten calls made here. */
+	after = syscall_count();
+	user_check(after >= before + 10);
+	printf("syscall_count() %u -> %u\n", (int)before, (int)after);
+
+	printf("  Result: %i of %i checks passed\n",
+	       user_tests_ok, user_tests_run);
+	printf("  Not covered: SYS_EXIT -- from ring 0 it would end the shell.\n");
+}
+
+void usermode(char *cmd)
+{
+	char opt[100];
+
+	if(prmc(cmd) == 0)
+	{
+		user_run();
+		return;
+	}
+
+	strcpy(opt, prmv(1, cmd));
+
+	if(strcmp(opt, "-t") == 0)
+	{
+		user_selftest();
+	} else {
+		printf("Syntax: user [-t]\n");
+		printf("\t          Run the ring 3 demo\n");
+		printf("\t-t        Run the system call self-test\n");
+	}
+}
+
 void help(void)
 {
 	printf("TomatOS Help\n");
@@ -769,6 +1237,7 @@ void help(void)
 	printf("\tstart     Start a test task\n");
 	printf("\tmem       Show memory usage, mem -t tests the heap\n");
 	printf("\tpage      Show paging state, page -t tests paging\n");
+	printf("\tuser      Run the ring 3 demo, user -t tests the system calls\n");
 	printf("\treboot    Restart the computer\n");
 	printf("\texit      Exit the shell\n");
 }

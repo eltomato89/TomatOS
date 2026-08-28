@@ -628,7 +628,112 @@ irq_common_stub:
     pop ds
     popa
     add esp, 8
-	
+
+    iret
+
+; ---------------------------------------------------------------------------
+; Ring 3 support.
+;
+; Segment selectors, as laid out by the GDT:
+;
+;   0x08  ring 0 code      0x10  ring 0 data
+;   0x18  ring 3 code      0x20  ring 3 data
+;
+; The two user selectors are always used with RPL 3 (the low two bits), which
+; is what turns 0x18/0x20 into 0x1B/0x23. Loading a user data selector with
+; RPL 0 from ring 3 would fault, and an iret to a CS whose RPL is not 3 would
+; not leave ring 0 at all.
+; ---------------------------------------------------------------------------
+KERNEL_DATA_SEL     equ 0x10
+USER_CODE_SEL       equ (0x18 | 3)     ; 0x1B
+USER_DATA_SEL       equ (0x20 | 3)     ; 0x23
+
+; EFLAGS for a freshly started ring 3 thread: bit 1 is the reserved
+; always-one bit, bit 9 is IF. IF MUST be set here -- ring 3 cannot execute
+; sti (it is privileged), so a task started with interrupts disabled could
+; never be preempted by the timer and would own the CPU forever.
+USER_EFLAGS         equ 0x202
+
+extern syscall_handler
+
+; System call entry, installed as the handler for vector 0x80.
+;
+; Deliberately no 'cli': the gate for 0x80 is a TRAP gate, so the CPU leaves
+; IF alone and a system call stays preemptible by the timer. That is what
+; makes a blocking call such as sleep() possible in the first place -- inside
+; an interrupt gate IF would be clear and the tick that has to wake us could
+; never arrive. The stub itself is agnostic: it neither clears nor sets IF, so
+; it also behaves correctly behind an interrupt gate, only without preemption.
+;
+; The frame built here is byte for byte the one the ISR/IRQ stubs build, so
+; the C side sees a plain 'struct regs *'. syscall_handler() reads the call
+; number and the arguments out of the saved eax/ebx/ecx/edx and writes the
+; result back into r->eax; the popa below is what hands it to the caller.
+global syscall_stub
+syscall_stub:
+    ; int 0x80 pushes no error code, so supply a dummy one to keep the layout
+    ; identical to the exceptions that do, then the vector number.
+    push byte 0                 ; err_code
+    push dword 0x80             ; int_no (0x80 does not fit in a signed imm8)
+
+    pusha
+    push ds
+    push es
+    push fs
+    push gs
+
+    ; Coming from ring 3, ds/es/fs/gs still hold the USER selectors (0x23).
+    ; Every kernel access through them would run against a DPL 3 descriptor,
+    ; so they are reloaded before a single line of C runs. The originals were
+    ; saved above and are restored on the way out, which is what lets the
+    ; iret return into ring 3 with the user's segments intact.
+    mov ax, KERNEL_DATA_SEL
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+
+    push esp                    ; struct regs *r
+    call syscall_handler
+    add esp, 4                  ; drop the argument; the handler returns void
+
+    pop gs
+    pop fs
+    pop es
+    pop ds
+    popa
+    add esp, 8                  ; discard int_no and err_code
+    iret
+
+; void enter_user_mode(uint32_t entry, uint32_t user_stack);
+;
+; There is no instruction that switches to ring 3. The way in is to build the
+; exact stack frame an iret coming back from a ring 3 interrupt would consume
+; and then execute that iret: because the target CS has RPL 3, the CPU treats
+; it as a return to a less privileged level and pops SS:ESP as well.
+;
+; Never returns.
+global enter_user_mode
+enter_user_mode:
+    ; cdecl arguments, read BEFORE anything is pushed -- once the iret frame
+    ; is being built, [esp + 4] no longer points at our own arguments.
+    mov eax, [esp + 4]          ; entry     -> user EIP
+    mov ecx, [esp + 8]          ; user_stack -> user ESP
+
+    ; iret restores SS from the frame, but not ds/es/fs/gs: those have to be
+    ; switched to the user data segment by hand, here, while we still may.
+    mov dx, USER_DATA_SEL
+    mov ds, dx
+    mov es, dx
+    mov fs, dx
+    mov gs, dx
+
+    ; The frame, in the order the CPU pops it (last pushed is popped first).
+    push dword USER_DATA_SEL    ; SS
+    push ecx                    ; ESP
+    push dword USER_EFLAGS      ; EFLAGS, IF set
+    push dword USER_CODE_SEL    ; CS, RPL 3 -- this is what drops the CPL
+    push eax                    ; EIP
     iret
 
 ; Here is the definition of our BSS section. Right now, we'll use
