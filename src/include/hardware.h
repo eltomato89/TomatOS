@@ -1,0 +1,16 @@
+extern int detect_cpu(void);
+extern int do_intel(void);
+extern void printregs(int eax, int ebx, int ecx, int edx);
+extern int do_amd(void);
+extern unsigned long getRamSize(char unit);
+extern void init_serial();
+extern int serial_received();
+extern char read_serial();
+extern int is_transmit_empty();
+extern void write_serial(char a);
+extern void writes_serial(char*);
+extern void setup_pit();
+extern void audio_switch_on();
+extern void audio_switch_off();
+extern void audio_sound(unsigned frequenz);
+extern void audio_beep(unsigned frequenz, int duration);

@@ -1,0 +1,9 @@
+* Speichermanagement
+* DMA-Modus zum lesen von Laufwerken
+* FAT-Format Treiber
+* VGA/SVGA Modus
+* v86 Mode Treiber
+* Paging
+* x64 Modus (maybe)
+* Network Stack
+* USB Host Stack

@@ -1,0 +1,14 @@
+# Build-Ausgaben
+build/
+*.o
+*.elf
+*.iso
+
+# Alte Windows-Toolchain (55 MB Binaries, bleibt lokal unter legacy/tools/)
+legacy/tools/
+tools/
+
+# Editor-/OS-Muell
+.DS_Store
+*~
+*.swp
