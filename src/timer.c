@@ -9,17 +9,17 @@
 #include <system.h>
 #include <stdio.h>
 
-#define PIT_FREQ 1193181 // die Standardfrequenz des PIT
+#define PIT_FREQ 1193181 // the standard frequency of the PIT
 
-/* Voreinstellung des Timers in Hz. Ersetzt das frühere, unbenutzte
-*  "#define FREQ 40" -- es gab zwei konkurrierende Frequenzangaben, benutzt
-*  wurde aber immer nur die Variable frequency. */
+/* Default timer setting in Hz. Replaces the former, unused
+*  "#define FREQ 40" -- there were two competing frequency definitions, but
+*  only the variable frequency was ever used. */
 #define TIMER_DEFAULT_HZ 1000
 
-/* Obergrenzen für timer_wait(). Beide Werte sind so gewählt, dass das
-*  Produkt (Millisekunden * Hz) sicher in einen 32-Bit-long passt. */
-#define TIMER_WAIT_MAX_MS 600000L /* max. 10 Minuten am Stück warten */
-#define TIMER_MAX_HZ      3000L   /* darüber wird die Wartezeit gedeckelt */
+/* Upper limits for timer_wait(). Both values are chosen so that the
+*  product (milliseconds * Hz) safely fits into a 32 bit long. */
+#define TIMER_WAIT_MAX_MS 600000L /* wait at most 10 minutes in one go */
+#define TIMER_MAX_HZ      3000L   /* above this the wait time is capped */
 
 /* ------------------------------------------------------------------ */
 /* CMOS / RTC                                                          */
@@ -36,28 +36,28 @@
 #define CMOS_REG_STATUS_A 0x0A
 #define CMOS_REG_STATUS_B 0x0B
 
-#define CMOS_A_UPDATE_IN_PROGRESS 0x80 /* Statusregister A, Bit 7 */
-#define CMOS_B_24_HOUR_MODE       0x02 /* Statusregister B, Bit 1 */
-#define CMOS_B_BINARY_MODE        0x04 /* Statusregister B, Bit 2 */
-#define CMOS_HOURS_PM_FLAG        0x80 /* nur im 12-Stunden-Modus */
+#define CMOS_A_UPDATE_IN_PROGRESS 0x80 /* status register A, bit 7 */
+#define CMOS_B_24_HOUR_MODE       0x02 /* status register B, bit 1 */
+#define CMOS_B_BINARY_MODE        0x04 /* status register B, bit 2 */
+#define CMOS_HOURS_PM_FLAG        0x80 /* only in 12 hour mode */
 
-/* Wie oft maximal auf das Ende eines RTC-Updates gewartet wird. Ein Update
-*  dauert unter 2 ms; die Schleife ist nur eine Notbremse, damit kaputte
-*  oder emulierte Hardware den Kernel nicht dauerhaft blockiert. */
+/* How long we wait at most for an RTC update to finish. An update takes
+*  less than 2 ms; the loop is only an emergency brake so that broken or
+*  emulated hardware cannot block the kernel permanently. */
 #define CMOS_UIP_MAX_SPINS 1000000UL
 
-/* Wie oft die Register maximal doppelt gelesen werden, bis zwei
-*  aufeinanderfolgende Lesungen identisch sind. */
+/* How often the registers are read twice at most, until two consecutive
+*  readings are identical. */
 #define CMOS_READ_MAX_ATTEMPTS 10
 
-/* Die RTC läuft üblicherweise in UTC, die Statusleiste soll aber Ortszeit
-*  anzeigen. 2 entspricht MESZ (Mitteleuropäische Sommerzeit, UTC+2), für
-*  MEZ (Winterzeit) wäre hier 1 einzutragen. Eine automatische
-*  Sommerzeit-Umschaltung gibt es bewusst nicht.
+/* The RTC usually runs in UTC, but the status bar is supposed to show local
+*  time. 2 corresponds to CEST (Central European Summer Time, UTC+2); for
+*  CET (winter time) 1 would have to be entered here. There is deliberately
+*  no automatic daylight saving switch.
 *
-*  Einschränkung: verschoben wird ausschließlich die Stunde. Ein durch den
-*  Offset ausgelöster Tageswechsel zieht Tag/Monat/Jahr NICHT mit -- für
-*  eine Uhr in der Statusleiste wäre das Overkill. */
+*  Limitation: only the hour is shifted. A day rollover triggered by the
+*  offset does NOT carry over into day/month/year -- for a clock in the
+*  status bar that would be overkill. */
 #define TIMEZONE_OFFSET_HOURS 2
 
 #define BCD2BIN(val) (((val) & 0x0F) + ((val) >> 4) * 10)
@@ -65,14 +65,14 @@
 /* This will keep track of how many ticks that the system
 *  has been running for */
 static volatile int timer_ticks=0;
-/* Sekundenzähler seit dem Start. Wird bislang von niemandem ausgelesen,
-*  aber vom Handler mitgeführt. */
+/* Seconds counter since startup. Nobody reads it so far, but the handler
+*  keeps it up to date. */
 static volatile int seconds=0;
 static int frequency = TIMER_DEFAULT_HZ;
 
 extern void irqMT();
 
-/* lokale Hilfsfunktionen -- stehen in keinem Header */
+/* local helper functions -- not declared in any header */
 static unsigned char cmos_read_register(unsigned char reg);
 static int cmos_wait_ready(void);
 static void cmos_read_raw(datetime *out);
@@ -137,8 +137,8 @@ void timer_notify_handlers(struct regs *r)
 void timer_handler(struct regs *r)
 {
    timer_ticks++;
-   /* frequency == 0 würde hier eine Division durch Null und damit ein #DE
-   *  mitten im IRQ-Handler auslösen. */
+   /* frequency == 0 would cause a division by zero here and thus a #DE
+   *  right in the middle of the IRQ handler. */
    if (frequency > 0 && timer_ticks%frequency==0)
    {
       seconds++;
@@ -157,9 +157,9 @@ void pic_install()
 	int counter;
 	int i;
 
-	/* Erst die Handler-Tabelle leeren, dann den IRQ scharf schalten --
-	*  sonst könnte ein früher Timer-Interrupt in eine Tabelle laufen,
-	*  die gleich darauf überschrieben wird. */
+	/* Clear the handler table first, then arm the IRQ -- otherwise an early
+	*  timer interrupt could run into a table that is about to be
+	*  overwritten. */
 	for(i=0; i <= 15; i++)
 		timer_handlers[i] = 0;
 
@@ -167,7 +167,7 @@ void pic_install()
 		frequency = TIMER_DEFAULT_HZ;
 
 	counter = PIT_FREQ / frequency;
-	/* Der Teiler ist 16 Bit breit; 0 bedeutet beim PIT 65536. */
+	/* The divisor is 16 bits wide; on the PIT 0 means 65536. */
 	if(counter < 1)
 		counter = 1;
 	if(counter > 65535)
@@ -185,7 +185,7 @@ void sleep(int ticks)
 	timer_wait(ticks);
 }
 
-/* Wartet die angegebene Zahl von Millisekunden ab. */
+/* Waits for the given number of milliseconds. */
 void timer_wait(int ticks)
 {
 	long ms;
@@ -208,41 +208,41 @@ void timer_wait(int ticks)
 	if(hz > TIMER_MAX_HZ)
 		hz = TIMER_MAX_HZ;
 
-	/* Millisekunden -> Timer-Ticks. Erst multiplizieren, dann teilen: die
-	*  alte Rechnung ticks/(1000/frequency) rundete den Kehrwert vorher auf
-	*  eine ganze Zahl ab und wurde für frequency > 1000 sogar zu einer
-	*  Division durch Null. Durch die Deckelung von ms und hz kann das
-	*  Produkt nicht überlaufen. */
+	/* Milliseconds -> timer ticks. Multiply first, then divide: the old
+	*  calculation ticks/(1000/frequency) truncated the reciprocal to a whole
+	*  number beforehand and even turned into a division by zero for
+	*  frequency > 1000. Because ms and hz are capped, the product cannot
+	*  overflow. */
 	wait_ticks = (ms * hz) / 1000L;
 	if(wait_ticks <= 0)
-		wait_ticks = 1; /* mindestens einen Tick warten */
+		wait_ticks = 1; /* wait at least one tick */
 
-	/* Wenn die Interrupts gesperrt sind, darf hier kein hlt stehen -- die
-	*  CPU käme nie wieder daraus hervor. Dann bleibt nur die (ebenso
-	*  aussichtslose, aber wenigstens unterbrechbare) Warteschleife. */
+	/* If interrupts are disabled, there must be no hlt here -- the CPU would
+	*  never come out of it again. In that case only the (equally hopeless,
+	*  but at least interruptible) busy loop remains. */
 	__asm__ __volatile__ ("pushfl; popl %0" : "=r" (flags) : : "memory");
 	irqs_enabled = (flags & 0x200) != 0;
 
 	start = (unsigned int)timer_ticks;
 
-	/* Differenzvergleich in unsigned: timer_ticks läuft irgendwann über,
-	*  die Differenz zweier Momentaufnahmen bleibt aber korrekt. Die alte
-	*  Fassung verglich einen volatile int gegen einen unsigned long -- der
-	*  Vergleich kippte beim Überlauf und die Schleife lief endlos. */
+	/* Difference comparison in unsigned: timer_ticks overflows eventually,
+	*  but the difference between two snapshots stays correct. The old
+	*  version compared a volatile int against an unsigned long -- that
+	*  comparison flipped on overflow and the loop ran forever. */
 	while(((unsigned int)timer_ticks - start) < (unsigned int)wait_ticks)
 	{
-		/* hlt ist hier zulässig: der Timer-IRQ läuft weiter, weckt die CPU
-		*  bei jedem Tick und führt bei Bedarf auch den Taskwechsel durch.
-		*  Nach einem Taskwechsel setzt der Task die Schleife an dieser
-		*  Stelle fort und prüft die Bedingung erneut. */
+		/* hlt is allowed here: the timer IRQ keeps running, wakes the CPU on
+		*  every tick and also performs the task switch when needed. After a
+		*  task switch the task resumes the loop at this point and checks the
+		*  condition again. */
 		if(irqs_enabled)
 			__asm__ __volatile__ ("hlt");
 	}
 }
 
-/* Laufzeit seit dem Start in Millisekunden. Es gibt (noch) keinen Prototyp
-*  dafür in den Headern -- src/include/time.h deklariert stattdessen
-*  uptime() und get_ticks(), die nirgends definiert sind. */
+/* Uptime since startup in milliseconds. There is (as yet) no prototype for
+*  this in the headers -- src/include/time.h instead declares uptime() and
+*  get_ticks(), which are defined nowhere. */
 int timer_get_ticks()
 {
 	int hz;
@@ -253,12 +253,12 @@ int timer_get_ticks()
 		hz = TIMER_DEFAULT_HZ;
 
 	t = timer_ticks;
-	/* aufgeteilt gerechnet, damit t * 1000 nicht überläuft */
+	/* computed in two parts so that t * 1000 does not overflow */
 	return (t / hz) * 1000 + ((t % hz) * 1000) / hz;
 }
 
 /* ------------------------------------------------------------------ */
-/* RTC auslesen                                                        */
+/* Reading the RTC                                                     */
 /* ------------------------------------------------------------------ */
 
 static unsigned char cmos_read_register(unsigned char reg)
@@ -267,9 +267,9 @@ static unsigned char cmos_read_register(unsigned char reg)
 	return inportb(CMOS_DATA_PORT);
 }
 
-/* Wartet, bis das "Update in progress"-Bit in Statusregister A gelöscht
-*  ist. Liefert 1 wenn die RTC bereit ist, 0 wenn die Obergrenze erreicht
-*  wurde (kaputte oder emulierte Hardware). */
+/* Waits until the "update in progress" bit in status register A is clear.
+*  Returns 1 if the RTC is ready, 0 if the upper limit was reached (broken
+*  or emulated hardware). */
 static int cmos_wait_ready(void)
 {
 	unsigned long spins;
@@ -282,8 +282,8 @@ static int cmos_wait_ready(void)
 	return 0;
 }
 
-/* Liest die Register 0x00-0x09 roh aus (noch ohne BCD-Umwandlung und ohne
-*  Zeitzone), nachdem ein laufendes Update abgewartet wurde. */
+/* Reads registers 0x00-0x09 raw (still without BCD conversion and without
+*  the time zone), after waiting for a running update to finish. */
 static void cmos_read_raw(datetime *out)
 {
 	cmos_wait_ready();
@@ -317,16 +317,15 @@ datetime cmos_readtime()
 	int is_24h;
 	int local_hours;
 
-	/* EFLAGS sichern und erst dann die Interrupts sperren. Ein
-	*  bedingungsloses sti am Ende würde die Interrupts auch dann wieder
-	*  einschalten, wenn der Aufrufer sie absichtlich gesperrt hatte. */
+	/* Save EFLAGS and only then disable the interrupts. An unconditional sti
+	*  at the end would re-enable the interrupts even when the caller had
+	*  deliberately disabled them. */
 	__asm__ __volatile__ ("pushfl; popl %0; cli" : "=r" (flags) : : "memory");
 
-	/* Zweimal lesen und wiederholen, bis zwei aufeinanderfolgende Lesungen
-	*  identisch sind. Zusammen mit dem Update-in-Progress-Check verhindert
-	*  das halb aktualisierte Werte (klassisch: aus 12:59:59 wird 12:00:59).
-	*  Bricht nach CMOS_READ_MAX_ATTEMPTS ab, damit die Funktion nie
-	*  endlos blockiert. */
+	/* Read twice and repeat until two consecutive readings are identical.
+	*  Together with the update-in-progress check this prevents half updated
+	*  values (the classic one: 12:59:59 turns into 12:00:59). Gives up after
+	*  CMOS_READ_MAX_ATTEMPTS so that the function never blocks forever. */
 	cmos_read_raw(&prev);
 	for(attempt = 0; attempt < CMOS_READ_MAX_ATTEMPTS; attempt++)
 	{
@@ -340,16 +339,16 @@ datetime cmos_readtime()
 
 	__asm__ __volatile__ ("pushl %0; popfl" : : "r" (flags) : "memory", "cc");
 
-	/* Statusregister B, Bit 1: 1 = 24-Stunden-Modus, 0 = 12-Stunden-Modus.
-	*  Im 12-Stunden-Modus markiert Bit 7 der Stundenregister PM; das Bit
-	*  muss vor der BCD-Umwandlung ausmaskiert werden. */
+	/* Status register B, bit 1: 1 = 24 hour mode, 0 = 12 hour mode. In 12
+	*  hour mode bit 7 of the hours register marks PM; that bit has to be
+	*  masked out before the BCD conversion. */
 	is_24h = (status_b & CMOS_B_24_HOUR_MODE) != 0;
 	is_pm  = !is_24h && (now.hours & CMOS_HOURS_PM_FLAG) != 0;
 	now.hours &= (unsigned int)~CMOS_HOURS_PM_FLAG;
 
-	/* Statusregister B, Bit 2: 1 = binär, 0 = BCD. Die alte Fassung fragte
-	*  Bit 5 (Alarm-Interrupt-Enable) ab und traf den BCD-Fall nur durch
-	*  Zufall, weil dieses Bit üblicherweise 0 ist. */
+	/* Status register B, bit 2: 1 = binary, 0 = BCD. The old version tested
+	*  bit 5 (alarm interrupt enable) and hit the BCD case only by chance,
+	*  because that bit is usually 0. */
 	if(!(status_b & CMOS_B_BINARY_MODE))
 	{
 		now.seconds = BCD2BIN(now.seconds);
@@ -360,11 +359,11 @@ datetime cmos_readtime()
 		now.years   = BCD2BIN(now.years);
 	}
 
-	/* Erst jetzt, NACH der BCD-Umwandlung, das Jahrhundert aufschlagen --
-	*  das CMOS-Jahresregister liefert nur zwei Stellen. */
+	/* Only now, AFTER the BCD conversion, add the century -- the CMOS year
+	*  register only supplies two digits. */
 	now.years += 2000; //we are in the 21'st century ya' know...
 
-	/* 12-Stunden-Modus auf 0..23 umrechnen: 12 AM -> 0, 12 PM -> 12. */
+	/* Convert 12 hour mode to 0..23: 12 AM -> 0, 12 PM -> 12. */
 	if(!is_24h)
 	{
 		now.hours = now.hours % 12;
@@ -372,9 +371,9 @@ datetime cmos_readtime()
 			now.hours += 12;
 	}
 
-	/* Zeitzone. In int gerechnet, damit ein negativer Offset nicht auf
-	*  einen riesigen unsigned-Wert unterläuft (das tat vorher schlicht
-	*  "hours - 1" bei hours == 0). */
+	/* Time zone. Computed in int so that a negative offset does not
+	*  underflow into a huge unsigned value (which is exactly what plain
+	*  "hours - 1" did when hours == 0). */
 	local_hours = (int)(now.hours % 24) + TIMEZONE_OFFSET_HOURS;
 	local_hours = ((local_hours % 24) + 24) % 24;
 	now.hours = (unsigned int)local_hours;

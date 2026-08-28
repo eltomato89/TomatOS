@@ -12,7 +12,7 @@
 #define NULL 0
 #define BCD2BIN(val) (((val) & 0x0F) + ((val) >> 4) * 10)
 
-/* Groesse der Bloecke, mit denen "mem -t" den Heap abklopft. */
+/* Size of the blocks that "mem -t" uses to probe the heap. */
 #define MEM_TEST_SIZE   64
 #define MEM_TEST_SMALL  32
 #define MEM_TEST_LARGE  128
@@ -30,7 +30,7 @@ void task() {
 	{
 		sleep(1000);
 	}
-}	
+}
 
 void taskmanager(char *cmd);
 void memory(char *cmd);
@@ -42,7 +42,7 @@ static void mem_show_status(void);
 static void mem_selftest(void);
 static void mem_check(int ok);
 
-/* Zaehler des Selbsttests, von mem_check() gefuehrt. */
+/* Self-test counters, maintained by mem_check(). */
 static int mem_tests_run = 0;
 static int mem_tests_ok = 0;
 
@@ -53,29 +53,29 @@ void main()
 
     printf("eltomato's TomatOS 0.31 [Version 0.31 Build 2011/27/09]\n");
     printf("(c) Copyright 2006-2011 Jens Köhler\n\n");
-	
+
 	taskmgr_task_start(taskmgr_add_task( update_infobar, "Statusbar Update Task", TASK_PRIORITY_HIGH ));
 	//taskmgr_task_start(taskmgr_add_task( task, "Test Task", TASK_PRIORITY_LOW ));
-	
+
 	do{
 		printf("\n@TomatOS> ");
-		
+
 		scan(cmd);
 
-		/* prmv() gibt einen Zeiger auf einen statischen Puffer zurueck --
-		   das erste Wort wird deshalb weggesichert, bevor irgendwo sonst
-		   (z.B. in taskmanager()) erneut prmv() aufgerufen wird. */
+		/* prmv() returns a pointer to a static buffer -- the first word is
+		   therefore saved away before prmv() is called again anywhere else
+		   (e.g. in taskmanager()). */
 		strcpy(word, prmv(0, cmd));
 
-		/* strcmp() liefert jetzt 0 bei Gleichheit (uebliche C-Semantik). */
+		/* strcmp() now returns 0 on equality (the usual C semantics). */
 		if(strcmp(word, "taskmgr") == 0) taskmanager(cmd);
 		else if(strcmp(word, "mem") == 0) memory(cmd);
 		else if(strcmp(word, "reboot") == 0) reboot();
 		else if(strcmp(word, "help") == 0) help();
 		else if(strcmp(word, "start") == 0) taskmgr_task_start(taskmgr_add_task( task, "Test Task", TASK_PRIORITY_LOW ));
-		else if(strcmp(word, "exit") == 0) ; /* wird von der Schleifenbedingung erledigt */
-		/* Nur bei leerer Eingabe kommentarlos ein neuer Prompt. */
-		else if(word[0] != EOS) printf("Unbekannter Befehl: %s\n", word);
+		else if(strcmp(word, "exit") == 0) ; /* handled by the loop condition */
+		/* Only an empty input silently brings up a new prompt. */
+		else if(word[0] != EOS) printf("Unknown command: %s\n", word);
 
 		//if(strcmp(word, "test") == 0) network_test(cmd);
 
@@ -84,9 +84,9 @@ void main()
 	//taskmgr_killall();
 
 	cls();
-	printf("Sie können den Computer jetzt ausschalten!");
+	printf("It is now safe to turn off your computer!");
 
-	/* main() laeuft als Task und darf nicht zurueckkehren. */
+	/* main() runs as a task and must not return. */
 	for(;;);
 }
 /*
@@ -98,7 +98,7 @@ void network_test(char *cmd)
 	{
 		mac_address[i] = inportb(ioaddr + i); // ioaddr is the base address obtainable from the PCI device configuration space.
 	}
-	
+
 	printf("MAC ADDRESS: %s", mac_address);
 }
 */
@@ -107,34 +107,34 @@ void taskmanager(char *cmd)
 	if(prmc(cmd)==0)
 	{
 		printf("Syntax: taskmgr [-l] [-k pid] [-s pid] [-r pid]\n");
-		printf("\t-l        Tasks auflisten\n");
-		printf("\t-k PID    Task beenden\n");
-		printf("\t-s PID    Task anhalten\n");
-		printf("\t-r PID    Task fortführen\n");
+		printf("\t-l        List tasks\n");
+		printf("\t-k PID    Kill task\n");
+		printf("\t-s PID    Suspend task\n");
+		printf("\t-r PID    Resume task\n");
 	}
-	
-	/* strcmp() liefert 0 bei Gleichheit -- der Rueckgabewert darf deshalb
-	   nicht mehr direkt als Wahrheitswert benutzt werden. */
+
+	/* strcmp() returns 0 on equality -- the return value must therefore no
+	   longer be used directly as a truth value. */
 	if(strcmp(prmv(1, cmd), "-l") == 0) //List tasks
 	{
 		taskmgr_list_tasks();
 	}
-	
+
 	if(strcmp(prmv(1, cmd), "-k") == 0) //Kill PID
 	{
 		if(prmc(cmd) < 2)
 		{
-			printf("Keine PID angegeben!\n");
+			printf("No PID given!\n");
 		} else {
 			taskmgr_task_abort(atoi(prmv(2, cmd)), 0, "Canceled by user");
 		}
 	}
-	
+
 	if(strcmp(prmv(1, cmd), "-s") == 0) //Suspend PID
 	{
 		if(prmc(cmd) < 2)
 		{
-			printf("Keine PID angegeben!\n");
+			printf("No PID given!\n");
 		} else {
 			taskmgr_task_suspend(atoi(prmv(2, cmd)));
 		}
@@ -143,19 +143,19 @@ void taskmanager(char *cmd)
 	{
 		if(prmc(cmd) < 2)
 		{
-			printf("Keine PID angegeben!\n");
+			printf("No PID given!\n");
 		} else {
 			taskmgr_task_start(atoi(prmv(2, cmd)));
 		}
 	}
-	
+
 }
 
 /* --- mem ---------------------------------------------------------------- */
 
-/* Gibt value rechtsbündig in einem Feld der Breite width aus. printf() kennt
-   keine Feldbreiten wie %5i, also zählen wir die Stellen selbst ab und legen
-   die fehlenden Leerzeichen davor. */
+/* Prints value right-aligned in a field of the given width. printf() knows no
+   field widths like %5i, so we count the digits ourselves and put the missing
+   spaces in front. */
 static void mem_print_right(uint32_t value, int width)
 {
 	uint32_t rest;
@@ -178,9 +178,9 @@ static void mem_print_right(uint32_t value, int width)
 	printf("%u", (int)value);
 }
 
-/* Eine Zeile der Tabelle: Beschriftung, MiB, KiB und Frame-Zahl.
-   Alles wird aus der Frame-Zahl gerechnet, damit die drei Zeilen
-   zueinander passen: 1 Frame = 4 KiB, 256 Frames = 1 MiB. */
+/* One row of the table: label, MiB, KiB and frame count.
+   Everything is computed from the frame count so that the three rows
+   match up: 1 frame = 4 KiB, 256 frames = 1 MiB. */
 static void mem_print_frames(char *label, uint32_t frames)
 {
 	printf("%s", label);
@@ -200,29 +200,29 @@ static void mem_show_status(void)
 	heapused = heap_used();
 	heaptotal = heap_total();
 
-	printf("Speicherbelegung:\n");
+	printf("Memory usage:\n");
 	printf("                     MiB        KiB       Frames\n");
-	mem_print_frames("  Physisch gesamt:", pmm_total_frames());
-	mem_print_frames("  Physisch belegt:", used);
-	mem_print_frames("  Physisch frei:  ", pmm_free_frames_count());
-	printf("  Frame-Größe %u Bytes, Memory-Map %u KiB nutzbar\n",
+	mem_print_frames("  Physical total: ", pmm_total_frames());
+	mem_print_frames("  Physical used:  ", used);
+	mem_print_frames("  Physical free:  ", pmm_free_frames_count());
+	printf("  Frame size %u bytes, memory map %u KiB usable\n",
 	       (int)PMM_FRAME_SIZE, (int)(pmm_total_bytes() / 1024));
 
-	printf("  Heap belegt:  ");
+	printf("  Heap used:    ");
 	mem_print_right(heapused, 8);
-	printf(" Bytes (");
+	printf(" bytes (");
 	mem_print_right(heapused / 1024, 6);
 	printf(" KiB)\n");
 
-	printf("  Heap gesamt:  ");
+	printf("  Heap total:   ");
 	mem_print_right(heaptotal, 8);
-	printf(" Bytes (");
+	printf(" bytes (");
 	mem_print_right(heaptotal / 1024, 6);
 	printf(" KiB)\n");
 }
 
-/* Vermerkt das Ergebnis einer Prüfung und schreibt die Marke an den
-   Zeilenanfang. Den Rest der Zeile gibt der Aufrufer aus. */
+/* Records the result of a check and writes the marker to the start of the
+   line. The rest of the line is printed by the caller. */
 static void mem_check(int ok)
 {
 	mem_tests_run++;
@@ -232,12 +232,12 @@ static void mem_check(int ok)
 		mem_tests_ok++;
 		printf("  [  OK  ] ");
 	} else {
-		printf("  [FEHLER] ");
+		printf("  [FAILED] ");
 	}
 }
 
-/* Muster, das in die Testbloecke geschrieben wird. Bewusst von der Position
-   abhaengig, damit ein verschobener oder ueberschriebener Block auffaellt. */
+/* Pattern that is written into the test blocks. Deliberately depends on the
+   position so that a moved or overwritten block stands out. */
 static unsigned char mem_pattern(int i)
 {
 	return (unsigned char)((i * 7 + 3) & 0xFF);
@@ -261,12 +261,12 @@ static void mem_selftest(void)
 	mem_tests_ok = 0;
 	base = heap_used();
 
-	printf("Heap-Selbsttest:\n");
-	printf("  Start: %u Bytes belegt, %u Bytes angefordert\n",
+	printf("Heap self-test:\n");
+	printf("  Start: %u bytes used, %u bytes requested\n",
 	       (int)base, (int)heap_total());
 
-	/* 1. malloc() liefert Speicher, der sich beschreiben und wieder
-	      auslesen lässt. */
+	/* 1. malloc() returns memory that can be written to and read back
+	      again. */
 	a = (unsigned char *)malloc(MEM_TEST_SIZE);
 	good = 0;
 	if(a != 0)
@@ -281,11 +281,11 @@ static void mem_selftest(void)
 		}
 	}
 	mem_check(a != 0 && good == MEM_TEST_SIZE);
-	printf("malloc(%i) = 0x%X, Muster %i/%i Bytes\n",
+	printf("malloc(%i) = 0x%X, pattern %i/%i bytes\n",
 	       MEM_TEST_SIZE, (int)a, good, MEM_TEST_SIZE);
 
-	/* 2. Eine zweite Allokation darf die erste weder überlappen noch
-	      beschädigen -- b wird deshalb vollgeschrieben und a nachgeprüft. */
+	/* 2. A second allocation must neither overlap nor damage the first --
+	      b is therefore filled completely and a is checked afterwards. */
 	b = (unsigned char *)malloc(MEM_TEST_SIZE);
 	good2 = 0;
 	if(a != 0 && b != 0)
@@ -298,11 +298,11 @@ static void mem_selftest(void)
 	}
 	mem_check(a != 0 && b != 0 && good2 == MEM_TEST_SIZE &&
 	          (a + MEM_TEST_SIZE <= b || b + MEM_TEST_SIZE <= a));
-	printf("0x%X und 0x%X getrennt, %i/%i Bytes unberührt\n",
+	printf("0x%X and 0x%X separate, %i/%i bytes untouched\n",
 	       (int)a, (int)b, good2, MEM_TEST_SIZE);
 
-	/* 3. Nach free() muss dieselbe Größe wieder aus dem freigewordenen
-	      Platz kommen, der Heap also nicht endlos wachsen. */
+	/* 3. After free() the same size must come out of the freed space
+	      again, so the heap does not grow without end. */
 	used_before = heap_used();
 	free(a);
 	free(b);
@@ -310,12 +310,12 @@ static void mem_selftest(void)
 	b = (unsigned char *)malloc(MEM_TEST_SIZE);
 	used_after = heap_used();
 	mem_check(a != 0 && b != 0 && used_after == used_before);
-	printf("free + malloc: belegt %u -> %u Bytes\n",
+	printf("free + malloc: used %u -> %u bytes\n",
 	       (int)used_before, (int)used_after);
 	free(a);
 	free(b);
 
-	/* 4. calloc() muss genullten Speicher liefern. */
+	/* 4. calloc() must return zeroed memory. */
 	c = (unsigned char *)calloc(16, 4);
 	good = 0;
 	if(c != 0)
@@ -326,11 +326,11 @@ static void mem_selftest(void)
 		}
 	}
 	mem_check(c != 0 && good == MEM_TEST_SIZE);
-	printf("calloc(16,4) = 0x%X, %i/%i Bytes genullt\n",
+	printf("calloc(16,4) = 0x%X, %i/%i bytes zeroed\n",
 	       (int)c, good, MEM_TEST_SIZE);
 	free(c);
 
-	/* 5. realloc() muss den bisherigen Inhalt mitnehmen. */
+	/* 5. realloc() must carry the previous contents over. */
 	r = (unsigned char *)malloc(MEM_TEST_SMALL);
 	if(r != 0)
 	{
@@ -349,7 +349,7 @@ static void mem_selftest(void)
 		}
 	}
 	mem_check(r != 0 && r2 != 0 && good == MEM_TEST_SMALL);
-	printf("realloc(%i -> %i) = 0x%X, %i/%i Bytes erhalten\n",
+	printf("realloc(%i -> %i) = 0x%X, %i/%i bytes kept\n",
 	       MEM_TEST_SMALL, MEM_TEST_LARGE, (int)r2, good, MEM_TEST_SMALL);
 	if(r2 != 0)
 	{
@@ -358,20 +358,20 @@ static void mem_selftest(void)
 		free(r);
 	}
 
-	/* 6. free(0) ist erlaubt und darf nicht abstürzen. Kommen wir hier
-	      wieder heraus, ist die Prüfung bestanden. */
+	/* 6. free(0) is allowed and must not crash. If we get back out of it,
+	      the check has passed. */
 	free(NULL);
 	mem_check(1);
-	printf("free(0) überstanden\n");
+	printf("free(0) survived\n");
 
-	/* 7. Alles Angeforderte ist zurückgegeben -- der Heap muss wieder
-	      auf dem Ausgangswert stehen. */
+	/* 7. Everything requested has been given back -- the heap must be back
+	      at its starting value. */
 	used_after = heap_used();
 	mem_check(used_after == base);
-	printf("Heap wieder bei %u Bytes (Start %u Bytes)\n",
+	printf("Heap back at %u bytes (start %u bytes)\n",
 	       (int)used_after, (int)base);
 
-	printf("  Ergebnis: %i von %i Prüfungen bestanden\n",
+	printf("  Result: %i of %i checks passed\n",
 	       mem_tests_ok, mem_tests_run);
 }
 
@@ -392,19 +392,19 @@ void memory(char *cmd)
 		mem_selftest();
 	} else {
 		printf("Syntax: mem [-t]\n");
-		printf("\t          Speicherbelegung anzeigen\n");
-		printf("\t-t        Heap-Selbsttest ausführen\n");
+		printf("\t          Show memory usage\n");
+		printf("\t-t        Run the heap self-test\n");
 	}
 }
 
 void help(void)
 {
 	printf("TomatOS Help\n");
-	printf("Verfügbare Befehle:\n");
-	printf("\thelp      Diese Übersicht anzeigen\n");
-	printf("\ttaskmgr   Tasks auflisten und steuern\n");
-	printf("\tstart     Einen Test-Task starten\n");
-	printf("\tmem       Speicherbelegung anzeigen, mem -t testet den Heap\n");
-	printf("\treboot    Rechner neu starten\n");
-	printf("\texit      Shell beenden\n");
+	printf("Available commands:\n");
+	printf("\thelp      Show this overview\n");
+	printf("\ttaskmgr   List and control tasks\n");
+	printf("\tstart     Start a test task\n");
+	printf("\tmem       Show memory usage, mem -t tests the heap\n");
+	printf("\treboot    Restart the computer\n");
+	printf("\texit      Exit the shell\n");
 }

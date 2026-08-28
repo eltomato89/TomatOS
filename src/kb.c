@@ -10,12 +10,15 @@
 #include <string.h>
 #include <stdio.h>
 
-/* Die Zeichenwerte sind CP437-Codepunkte, denn der VGA-Textmodus stellt
-*  CP437 dar und nicht Latin-1. */
+/* German keyboard layout, unshifted. The array is indexed by scancode, so no
+*  entry may ever be moved.
+*  The character values are CP437 code points, because the VGA text mode
+*  renders CP437 and not Latin-1 - with the former Latin-1 values, typed
+*  umlauts showed up as completely different characters. */
 unsigned char kbdde_s[128] =
 {
     0,  27, '1', '2', '3', '4', '5', '6', '7', '8',	/* 9 */
-  '9', '0', 0xE1 /* ß */, 0x27 /* ´ (CP437 kennt kein Akut) */, '\b',	/* Backspace */
+  '9', '0', 0xE1 /* ß */, 0x27 /* ´ key (CP437 has no acute accent) */, '\b',	/* Backspace */
   '\t',			/* Tab */
   'q', 'w', 'e', 'r',	/* 19 */
   't', 'z', 'u', 'i', 'o', 'p', 0x81 /* ü */, '+', '\n',		/* Enter key */
@@ -51,6 +54,8 @@ unsigned char kbdde_s[128] =
     0,	/* F12 Key */
     0,	/* All other keys are undefined */
 };
+/* Same layout with shift held down; CP437 code points as above, so this table
+*  yields the uppercase umlauts. */
 unsigned char kbdde_b[128] =
 {
     0,  27, '!', '\"', 0x15 /* § */, '$', '%', '&', '/', '(',	/* 9 */
@@ -137,10 +142,10 @@ unsigned char getch()
 {   
     char ky;
 
-    /* last_key ist volatile, die Schleife darf also nicht wegoptimiert
-    *  werden. Statt busy zu pollen warten wir stromsparend mit 'hlt' auf
-    *  den naechsten Interrupt - der Tastatur-IRQ (und notfalls der Timer)
-    *  weckt uns wieder auf. */
+    /* last_key is volatile, so the loop must not be optimised away. Instead
+    *  of busy polling we wait power-savingly with 'hlt' for the next
+    *  interrupt - the keyboard IRQ (or, failing that, the timer) wakes us
+    *  up again. */
     while(last_key == EOS)
     {
       __asm__ __volatile__("hlt");
@@ -167,15 +172,15 @@ unsigned char getchn()
 	return x;
 }
 
-/* gets() wurde entfernt: die Funktion gab einen Zeiger auf ein lokales
-*  Array zurueck (Undefined Behaviour), hatte keinen einzigen Aufrufer und
-*  scan() leistet dasselbe ueber einen Ausgabeparameter. */
+/* gets() has been removed: the function returned a pointer to a local array
+*  (undefined behaviour), had no caller at all, and scan() does the same job
+*  through an output parameter. */
 
-/* Achtung: scan() kopiert das Ergebnis mit strcpy() nach 'var', ohne dessen
-*  Groesse zu kennen. Der Zielpuffer muss darum mindestens SCAN_BUFSZ Bytes
-*  fassen. Ohne Signaturaenderung (die Deklaration steht in stdio.h) laesst
-*  sich das nicht sauberer loesen; wenigstens ist der interne Puffer jetzt
-*  begrenzt und die maximale Kopierlaenge damit bekannt. */
+/* Careful: scan() copies the result to 'var' with strcpy() without knowing
+*  its size. The destination buffer must therefore hold at least SCAN_BUFSZ
+*  bytes. Without changing the signature (the declaration lives in stdio.h)
+*  this cannot be solved more cleanly; at least the internal buffer is now
+*  bounded and the maximum copy length is thus known. */
 #define SCAN_BUFSZ 80
 
 void scan(char* var)
@@ -190,7 +195,7 @@ void scan(char* var)
 
       if(ky >= 32 && ky != 127)
       {
-        /* Ist der Puffer voll, werden weitere Zeichen ignoriert. */
+        /* Once the buffer is full, further characters are ignored. */
         if(i < SCAN_BUFSZ - 1)
         {
           ret[i] = ky;
@@ -217,8 +222,8 @@ void scan(char* var)
 	strcpy(var, ret);
   }
   
-  /* Gleiche Einschraenkung wie bei scan(): 'var' muss mindestens
-  *  SCAN_BUFSZ Bytes fassen. */
+  /* Same restriction as for scan(): 'var' must hold at least SCAN_BUFSZ
+  *  bytes. */
   void scan_h(char* var, int out)
   {
     unsigned char ky;
@@ -231,7 +236,7 @@ void scan(char* var)
 
       if(ky >= 32 && ky != 127)
       {
-        /* Ist der Puffer voll, werden weitere Zeichen ignoriert. */
+        /* Once the buffer is full, further characters are ignored. */
         if(i < SCAN_BUFSZ - 1)
         {
           ret[i] = ky;

@@ -12,11 +12,11 @@
 
 global start
 start:
-    ; Der Bootloader uebergibt laut Multiboot-Spezifikation die Magic
-    ; 0x2BADB002 in eax und die physische Adresse der Info-Struktur in ebx.
-    ; Beides wird als allererstes weggesichert: einen eigenen Stack haben wir
-    ; hier noch nicht (esp zeigt noch in den Bootloader), pushen ist also
-    ; keine Option. Ab jetzt duerfen eax/ebx beliebig ueberschrieben werden.
+    ; Per the Multiboot specification the bootloader hands us the magic
+    ; 0x2BADB002 in eax and the physical address of the info structure in ebx.
+    ; Both are saved away first thing: we do not have a stack of our own yet
+    ; (esp still points into the bootloader), so pushing them is not an
+    ; option. From here on eax/ebx may be overwritten freely.
     mov [mboot_magic], eax
     mov [mboot_info], ebx
 
@@ -44,12 +44,12 @@ mboot:
 ; before the 'jmp $'.
 stublet:
 	 extern kernel
-	 ; cdecl: die Argumente werden von rechts nach links gepusht, fuer
-	 ; kernel(magic, mbi) also erst der mbi-Zeiger, dann die Magic.
+	 ; cdecl: arguments are pushed from right to left, so for
+	 ; kernel(magic, mbi) the mbi pointer goes first, then the magic.
 	 push dword [mboot_info]
 	 push dword [mboot_magic]
 	 call kernel
-	 add esp, 8             ; cdecl: der Aufrufer raeumt die Argumente ab
+	 add esp, 8             ; cdecl: the caller cleans up the arguments
 	 jmp $
 
 ; This will set up our new segment registers. We need to do
@@ -533,64 +533,64 @@ EnableA20Gate:
 	push	ebp
 	mov		ebp, esp
 	
-	;Warten das ein Befehl gesendet werden kann
+	;Wait until a command can be sent
 .1:
 	in		al, 0x64
 	test	al, 00000010b
 	jnz		.1
 	
-	;Befehl zum lesen des Statusbytes senden
+	;Send the command to read the status byte
 	mov		al, 0xD0
 	out		0x64, al
 	
-	;Warten das das Byte gelesen werden kann
+	;Wait until the byte can be read
 .2:
 	in		al, 0x64
 	test	al, 00000001b
 	jz		.2
 	
-	;Statusbyte lesen
+	;Read the status byte
 	in		al, 0x60
-	or		al, 00000010b	;A20 Gate Enable Bit setzen
+	or		al, 00000010b	;set the A20 gate enable bit
 	push	eax
 	
-	;Warten das ein Befehl gesendet werden kann
+	;Wait until a command can be sent
 .3:
 	in		al, 0x64
 	test	al, 00000010b
 	jnz		.3
 	
-	;Befehl zum schreiben des Statusbytes senden	
+	;Send the command to write the status byte
 	mov		al, 0xD1
 	out		0x64, al
 	
-	;Warten das ein Byte gesendet werden kann
+	;Wait until a byte can be sent
 .4:	
 	in		al, 0x64
 	test	al, 00000010b
 	jnz		.4
 	
-	;Statusbyte senden
+	;Send the status byte
 	pop		eax
 	out		0x60, al
 	
-	;Warten das ein Befehl gesendet werden kann
+	;Wait until a command can be sent
 .5:	
 	in		al, 0x64
 	test	al, 00000010b
 	jnz		.5
 	
-	;Befehl zum lesen des Statusbytes senden
+	;Send the command to read the status byte
 	mov		al, 0xD0
 	out		0x64, al
 	
-	;Warten das ein Byte gelesen werden kann
+	;Wait until a byte can be read
 .6:
 	in		al, 0x64
 	test	al, 00000001b
 	jz		.6
 	
-	;Statusbyte lesen
+	;Read the status byte
 	in		al, 0x60
 	test	al, 00000010b
 	jnz		.success
@@ -607,9 +607,9 @@ EnableA20Gate:
 	ret
 
 SECTION .bss
-; Kopien der Multiboot-Register aus 'start'. Sie liegen bewusst VOR dem
-; Stackbereich: der Stack waechst von sys_stack nach unten, hinter sys_stack
-; abgelegte Werte wuerde der erste push zerstoeren.
+; Copies of the multiboot registers saved in 'start'. They deliberately sit
+; BEFORE the stack area: the stack grows downwards from sys_stack, so values
+; placed behind sys_stack would be destroyed by the very first push.
 mboot_magic: resd 1
 mboot_info:  resd 1
 

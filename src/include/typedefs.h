@@ -1,5 +1,5 @@
-/* Mehrfachinklusion verhindern: mm.h zieht typedefs.h direkt und ueber
-*  multiboot.h ein zweites Mal herein. */
+/* Prevent multiple inclusion: mm.h pulls typedefs.h in directly and a second
+*  time via multiboot.h. */
 #ifndef __TYPEDEFS_H
 #define __TYPEDEFS_H
 

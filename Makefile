@@ -83,39 +83,39 @@ LIBGCC    = $(shell $(CC) -m32 -print-libgcc-file-name)
 
 LDFLAGS  := -m elf_i386 -T $(LINKER_SCRIPT) -nostdlib -no-pie
 
-# Tastaturlayout. Der Kernel bringt eine deutsche Keymap mit (src/kb.c), QEMU
-# muss also deutsche Scancodes liefern. Unter Wayland reicht QEMU keine rohen
-# Scancodes durch, sondern uebersetzt ueber das Keysym -- ohne -k landet dabei
-# die US-Belegung im Gast, und die Minus-Taste kommt als "ss" an.
-# Ueberschreibbar:  make run QEMU_KEYMAP=en-us
+# Keyboard layout. The kernel carries a German keymap (src/kb.c), so QEMU has
+# to deliver German scancodes. Under Wayland QEMU does not pass raw scancodes
+# through but translates via the keysym -- without -k the guest ends up with
+# the US layout, and the minus key arrives as the German sharp s.
+# Override with:  make run QEMU_KEYMAP=en-us
 QEMU_KEYMAP ?= de
 
 QEMUFLAGS := -m 32 -k $(QEMU_KEYMAP)
 
 # ---------------------------------------------------------------------------
-#  Anzeige ueber VNC
+#  Display via VNC
 #
-#  Dieses QEMU ist ohne grafische Display-Backends gebaut -- "-display help"
-#  meldet nur "none", denn qemu-ui-gtk und Verwandte sind bei Arch eigene
-#  Pakete. Der eingebaute VNC-Server (aus qemu-common) ist damit der Weg zum
-#  Bild. Die run-Targets starten ihn und haengen automatisch einen Client an.
+#  This QEMU is built without graphical display backends -- "-display help"
+#  reports only "none", because qemu-ui-gtk and friends are separate packages
+#  on Arch. The built-in VNC server (from qemu-common) is therefore the way to
+#  get a picture. The run targets start it and attach a client automatically.
 #
-#  Gebunden wird bewusst an 127.0.0.1: QEMU lauscht sonst auf allen
-#  Interfaces, und zwar ohne Passwort.
+#  Binding to 127.0.0.1 is deliberate: otherwise QEMU listens on all
+#  interfaces, and without a password at that.
 #
-#  Abschalten (z.B. wenn qemu-ui-gtk installiert ist):  make run VNC=0
-#  Anderer Client:      make run VNC_CLIENT=gvncviewer
-#  Andere Anzeige-Nr.:  make run VNC_DISPLAY=3
+#  Disable (e.g. when qemu-ui-gtk is installed):  make run VNC=0
+#  Different client:   make run VNC_CLIENT=gvncviewer
+#  Different display:  make run VNC_DISPLAY=3
 VNC         ?= 1
 VNC_DISPLAY ?= 1
 VNC_HOST    := 127.0.0.1
 VNC_PORT    := $(shell expr 5900 + $(VNC_DISPLAY))
 
-# Ersten verfuegbaren Client aus der Liste nehmen, sofern nicht vorgegeben.
+# Pick the first client available from the list, unless one was given.
 VNC_CLIENT ?= $(firstword $(foreach c,vncviewer gvncviewer vinagre xtightvncviewer krdc, \
                   $(shell command -v $(c) 2>/dev/null)))
 
-# Aufrufform je Client: die meisten wollen "host:display", remmina eine URL.
+# Invocation differs per client: most want "host:display", remmina a URL.
 VNC_TARGET = $(if $(findstring remmina,$(VNC_CLIENT)), \
                  vnc://$(VNC_HOST):$(VNC_PORT), \
                  $(VNC_HOST):$(VNC_DISPLAY))
@@ -126,20 +126,20 @@ else
   QEMU_DISPLAY_FLAGS :=
 endif
 
-# Startet QEMU und verbindet parallel den VNC-Client.
+# Starts QEMU and attaches the VNC client alongside it.
 #
-# QEMU laeuft im Vordergrund und behaelt damit stdio fuer die serielle
-# Ausgabe; Ctrl-C beendet wie gewohnt. Der Client wartet in einer Subshell,
-# bis der Port offen ist, und wird beim Beenden von QEMU mitgenommen.
-#   $(1) = QEMU-Argumente fuer das jeweilige Bootmedium
+# QEMU stays in the foreground and therefore keeps stdio for the serial
+# output; Ctrl-C quits as usual. The client waits in a subshell until the
+# port is open, and is taken down when QEMU exits.
+#   $(1) = QEMU arguments for the respective boot medium
 define run_qemu
 	$(call need,$(QEMU),qemu-system-x86)
 	@if [ "$(VNC)" = "1" ] && [ -z "$(VNC_CLIENT)" ]; then \
-		printf '\nERROR: kein VNC-Client gefunden.\n'; \
-		printf '       Gesucht wurde nach: vncviewer gvncviewer vinagre xtightvncviewer krdc\n'; \
-		printf '       Installieren, z.B.:  sudo pacman -S tigervnc\n'; \
-		printf '       Oder eigenen Client angeben:  make $@ VNC_CLIENT=/pfad/zum/client\n'; \
-		printf '       Oder ohne VNC starten:        make $@ VNC=0\n\n'; \
+		printf '\nERROR: no VNC client found.\n'; \
+		printf '       Looked for: vncviewer gvncviewer vinagre xtightvncviewer krdc\n'; \
+		printf '       Install one, e.g.:  sudo pacman -S tigervnc\n'; \
+		printf '       Or name your own:   make $@ VNC_CLIENT=/path/to/client\n'; \
+		printf '       Or run without VNC: make $@ VNC=0\n\n'; \
 		exit 1; \
 	fi
 	@if [ "$(VNC)" = "1" ]; then \
@@ -154,7 +154,7 @@ define run_qemu
 	       fi; \
 	       sleep 0.1; \
 	     done; \
-	     echo "  VNC-Port $(VNC_PORT) kam nicht hoch - Client nicht gestartet." >&2 \
+	     echo "  VNC port $(VNC_PORT) never came up - client not started." >&2 \
 	   ) >/dev/null 2>&1 & \
 	   CLIENT_PID=$$!; \
 	   trap 'kill $$CLIENT_PID 2>/dev/null; pkill -P $$CLIENT_PID 2>/dev/null; true' EXIT INT TERM; \
@@ -326,11 +326,11 @@ help:
 	@echo "  clean       Remove $(BUILD_DIR)/"
 	@echo "  help        This text"
 	@echo ""
-	@echo "Optionen fuer die run-Targets:"
-	@echo "  VNC=0                 ohne VNC starten"
-	@echo "  VNC_CLIENT=<prog>     anderen VNC-Client verwenden"
-	@echo "  VNC_DISPLAY=<n>       andere Anzeige-Nummer (Port 5900+n)"
-	@echo "  QEMU_KEYMAP=<layout>  Tastaturlayout, Vorgabe: de"
+	@echo "Options for the run targets:"
+	@echo "  VNC=0                 run without VNC"
+	@echo "  VNC_CLIENT=<prog>     use a different VNC client"
+	@echo "  VNC_DISPLAY=<n>       different display number (port 5900+n)"
+	@echo "  QEMU_KEYMAP=<layout>  keyboard layout, default: de"
 	@echo ""
 
 # Header dependencies generated by -MMD -MP (kept last on purpose).

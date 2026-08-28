@@ -1,36 +1,36 @@
-/* TomatOS - Multiboot 1 Strukturen
-*  Desc: Was der Bootloader (GRUB oder QEMU -kernel) uns beim Start uebergibt.
+/* TomatOS - Multiboot 1 structures
+*  Desc: What the bootloader (GRUB or QEMU -kernel) hands us at startup.
 *
-*  Die 64-Bit-Felder der Memory-Map sind bewusst als Paare aus zwei 32-Bit-
-*  Werten abgebildet: der Kernel ist 32-bittig, und so vermeiden wir
-*  64-Bit-Arithmetik und die zugehoerigen libgcc-Hilfsroutinen.
+*  The 64-bit fields of the memory map are deliberately modelled as pairs of
+*  two 32-bit values: the kernel is 32-bit, and this way we avoid 64-bit
+*  arithmetic and the libgcc helper routines that come with it.
 */
 #ifndef __MULTIBOOT_H
 #define __MULTIBOOT_H
 
 #include "typedefs.h"
 
-/* Wert, den der Bootloader laut Spezifikation in eax hinterlaesst */
+/* Value the bootloader leaves in eax according to the specification */
 #define MULTIBOOT_BOOTLOADER_MAGIC  0x2BADB002
 
-/* Bits im flags-Feld der Info-Struktur */
-#define MULTIBOOT_INFO_MEMORY       0x00000001  /* mem_lower / mem_upper gueltig */
+/* Bits in the flags field of the info structure */
+#define MULTIBOOT_INFO_MEMORY       0x00000001  /* mem_lower / mem_upper valid */
 #define MULTIBOOT_INFO_BOOTDEV      0x00000002
 #define MULTIBOOT_INFO_CMDLINE      0x00000004
 #define MULTIBOOT_INFO_MODS         0x00000008
-#define MULTIBOOT_INFO_MEM_MAP      0x00000040  /* mmap_addr / mmap_length gueltig */
+#define MULTIBOOT_INFO_MEM_MAP      0x00000040  /* mmap_addr / mmap_length valid */
 #define MULTIBOOT_INFO_BOOT_LOADER  0x00000200
 
-/* Typen eines Memory-Map-Eintrags */
+/* Types of a memory map entry */
 #define MULTIBOOT_MEMORY_AVAILABLE  1
 #define MULTIBOOT_MEMORY_RESERVED   2
 #define MULTIBOOT_MEMORY_ACPI_RECLAIMABLE 3
 #define MULTIBOOT_MEMORY_NVS        4
 #define MULTIBOOT_MEMORY_BADRAM     5
 
-/* Ein Eintrag der Memory-Map.
- * Achtung: size zaehlt die Bytes NACH dem size-Feld selbst. Zum naechsten
- * Eintrag geht es daher ueber (addr_des_eintrags + size + 4). */
+/* A single entry of the memory map.
+ * Careful: size counts the bytes AFTER the size field itself. Advancing to
+ * the next entry therefore goes via (address_of_entry + size + 4). */
 typedef struct
 {
     uint32_t size;
@@ -45,7 +45,7 @@ typedef struct
 {
     uint32_t flags;
 
-    /* gueltig bei MULTIBOOT_INFO_MEMORY - in KiB */
+    /* valid with MULTIBOOT_INFO_MEMORY - in KiB */
     uint32_t mem_lower;
     uint32_t mem_upper;
 
@@ -57,7 +57,7 @@ typedef struct
 
     uint32_t syms[4];
 
-    /* gueltig bei MULTIBOOT_INFO_MEM_MAP */
+    /* valid with MULTIBOOT_INFO_MEM_MAP */
     uint32_t mmap_length;
     uint32_t mmap_addr;
 

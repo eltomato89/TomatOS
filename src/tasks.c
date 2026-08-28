@@ -19,9 +19,9 @@ char *readable_task_state[] =
 	"Unused"
 };
 
-//Sichere Kopie in einen Puffer fester Groesse: kopiert hoechstens size-1 Zeichen
-//und terminiert immer mit '\0'. Ersetzt strcpy() an den Stellen, an denen die
-//Quelle aus einem Aufruferpuffer beliebiger Laenge stammt.
+//Safe copy into a fixed-size buffer: copies at most size-1 characters and always
+//terminates with '\0'. Replaces strcpy() in those places where the source comes
+//from a caller buffer of arbitrary length.
 static void copy_bounded(char *dest, const char *src, int size)
 {
 	int i;
@@ -47,13 +47,13 @@ struct regs* init_task(uint8_t* stack, void* entry)
     struct regs new_state = {
         .eax = 0, .ebx = 0, .ecx = 0, .edx = 0,
         .esi = 0, .edi = 0, .ebp = 0,
-        //.esp = unbenutzt (kein Ring-Wechsel)
+        //.esp = unused (no ring switch)
         .eip = (uint32_t) entry,
  
-        /* Ring-0-Segmentregister */
+        /* ring 0 segment register */
         .cs  = 0x08,
 
-        /* IRQs einschalten (IF = 1) */
+        /* enable IRQs (IF = 1) */
         .eflags = 0x202,
 		
 		.gs=16, .fs=16,	.es=16,	.ds=16,
@@ -76,13 +76,13 @@ struct regs* schedule(struct regs* cpu)
 	int next;
 	int start;
 
-	//Wenn Task laeuft, Zustand sichern.
+	//If a task is running, save its state.
     if (current_task >= 0) {
         task_states[current_task] = cpu;
     }
 
-	//Beim allerersten Aufruf ist current_task noch -1, dann direkt einen Task suchen
-	//(kein Zugriff auf tasks[-1]).
+	//On the very first call current_task is still -1, so look for a task right away
+	//(no access to tasks[-1]).
 	if(current_task < 0 || tasks[current_task].cpu_time <= 0)
 	{
 		if(current_task >= 0)
@@ -90,9 +90,10 @@ struct regs* schedule(struct regs* cpu)
 			tasks[current_task].cpu_time = tasks[current_task].priority;
 		}
 
-		//nächsten auszuführenden Task suchen, höchstens ein kompletter Umlauf
+		//look for the next task to run; the search wraps around at most once
+		//instead of spinning forever inside the interrupt handler
 		next = -1;
-		start = current_task + 1;	//bei current_task == -1 also ab Slot 0
+		start = current_task + 1;	//so for current_task == -1 this starts at slot 0
 		for(i=0; i <= MAX_TASKS-1; i++)
 		{
 			slot = (start + i) % MAX_TASKS;
@@ -103,7 +104,7 @@ struct regs* schedule(struct regs* cpu)
 			}
 		}
 
-		//Kein lauffähiger Task gefunden: bisherigen Kontext unverändert weiterbenutzen
+		//No runnable task found: keep using the previous context unchanged
 		if(next < 0) return cpu;
 
 		current_task = next;
@@ -117,11 +118,11 @@ struct regs* schedule(struct regs* cpu)
     return cpu;
 }
 
-//Kein Aufrufer wertet ein Ergebnis aus, daher void statt int.
+//No caller evaluates a result, hence void instead of int.
 void mt_install()
 {
 	int i;
-	for(i=0; i <= MAX_TASKS-1; i++) //Alle Task-Slots als unbenutzt definieren
+	for(i=0; i <= MAX_TASKS-1; i++) //Mark all task slots as unused
 	{
 		tasks[i].state = TASK_STATE_NULL;
 	}
@@ -141,12 +142,12 @@ int taskmgr_add_task( void* tfunct, const char *bezeichnung, int prio)
 			
 			task_states[i] = init_task(task_stacks[i], tfunct);
 			
-			//printf("Task '%s' gestartet mit PID %i\n", bezeichnung, i);
+			//printf("Task '%s' started with PID %i\n", bezeichnung, i);
 			return i;
 		}
 	}
 	
-	//Abgebrochene Tasks nur überschreiben, wenn keine freien Tasks-Slots mehr verfügbar sind
+	//Only overwrite aborted tasks when no free task slots are available any more
 	for(i=0; i <= MAX_TASKS-1; i++)
 	{
 		if(tasks[i].state == TASK_STATE_ABORTED)
@@ -158,7 +159,7 @@ int taskmgr_add_task( void* tfunct, const char *bezeichnung, int prio)
 			
 			task_states[i] = init_task(task_stacks[i], tfunct);
 			
-			//printf("Task '%s' gestartet mit PID %i\n", bezeichnung, i);
+			//printf("Task '%s' started with PID %i\n", bezeichnung, i);
 			return i;
 		}
 	}
@@ -168,7 +169,7 @@ int taskmgr_add_task( void* tfunct, const char *bezeichnung, int prio)
 	return -1;
 }
 
-//Reine Ausgabefunktion, kein Aufrufer wertet ein Ergebnis aus, daher void statt int.
+//Pure output function, no caller evaluates a result, hence void instead of int.
 void taskmgr_list_tasks()
 {
 	int i;
@@ -221,10 +222,10 @@ void taskmgr_task_abort(int pid, int error_number, const char *error_descr)
 		tasks[pid].error_no = error_number;
 		copy_bounded(tasks[pid].error, error_descr, sizeof(tasks[pid].error));
 
-		//Der Stack-Slot bleibt bewusst belegt, taskmgr_add_task() recycelt ihn spaeter.
-		//Wird aber der gerade laufende Task abgebrochen, muss seine restliche Rechenzeit
-		//verfallen: sonst laeuft er in schedule() im else-Zweig noch bis zum Ablauf von
-		//cpu_time weiter, obwohl er nicht mehr TASK_STATE_RUNNING ist.
+		//The stack slot deliberately stays occupied, taskmgr_add_task() recycles it later.
+		//But if the currently running task is aborted, its remaining CPU time must be
+		//dropped: otherwise it would keep running in the else branch of schedule() until
+		//cpu_time expires, even though it is no longer TASK_STATE_RUNNING.
 		if(pid == current_task)
 		{
 			tasks[pid].cpu_time = 0;
@@ -254,8 +255,8 @@ void taskmgr_task_suspend(int pid)
 	} else {
 		tasks[pid].state = TASK_STATE_SUSPENDED;
 
-		//Gleiches Problem wie beim Abbruch: der aktuell laufende Task darf seine
-		//Restrechenzeit nach dem Suspendieren nicht weiter aufbrauchen.
+		//Same problem as on abort: after being suspended, the currently running task
+		//must not keep using up its remaining CPU time.
 		if(pid == current_task)
 		{
 			tasks[pid].cpu_time = 0;
@@ -263,10 +264,10 @@ void taskmgr_task_suspend(int pid)
 	}
 }
 
-//Beendet alle Tasks ab Index 1. Slot 0 wird bewusst verschont: dort laeuft die
-//Konsole (der System-Task), ueber die killall ueberhaupt erst aufgerufen wird —
-//wuerde sie mit abgebrochen, bliebe kein lauffaehiger Task mehr uebrig.
-//Kein Aufrufer wertet ein Ergebnis aus, daher void statt int.
+//Terminates all tasks from index 1 on. Slot 0 is deliberately spared: it runs the
+//console (the system task) through which killall is invoked in the first place -
+//if it were aborted as well, no runnable task would be left.
+//No caller evaluates a result, hence void instead of int.
 void taskmgr_killall()
 {
 	int i;

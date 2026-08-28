@@ -1,125 +1,123 @@
 # TomatOS
 
-Ein 32-Bit-x86-Hobbykernel (Multiboot 1) — eigener präemptiver Scheduler,
-VGA-Textkonsole, PS/2-Tastatur mit deutschem Layout, PIT-Timer, CMOS-Uhr
-und eine kleine Shell. Ursprünglich 2006–2011 entstanden, 2026 auf eine
-aktuelle Linux-Toolchain portiert.
+A 32-bit x86 hobby kernel (Multiboot 1) — preemptive scheduler, VGA text
+console, PS/2 keyboard with German layout, PIT timer, CMOS clock, physical
+frame allocator, kernel heap and a small shell. Originally written between
+2006 and 2011, ported to a current Linux toolchain in 2026.
 
-## Voraussetzungen
+## Requirements
 
-Eine Cross-Toolchain wird **nicht** gebraucht — der System-GCC erzeugt mit
-`-m32` den nötigen 32-Bit-Code.
+No cross toolchain is needed — the system GCC produces the required 32-bit
+code with `-m32`.
 
 ```sh
 sudo pacman -S --needed nasm qemu-system-x86 grub libisoburn mtools
 ```
 
-`nasm` und `qemu-system-x86` reichen zum Bauen und Testen. `grub` und
-`libisoburn` werden nur für `make iso` gebraucht, `mtools` nur für
-`make floppy`.
+`nasm` and `qemu-system-x86` are enough to build and test. `grub` and
+`libisoburn` are only needed for `make iso`, `mtools` only for `make floppy`.
 
-## Kompilieren
+## Building
 
 ```sh
 make
 ```
 
-Ergebnis ist `build/kernel.elf`. Alle Zwischenprodukte landen in `build/`,
-`make clean` räumt auf.
+The result is `build/kernel.elf`. All intermediate files go to `build/`, and
+`make clean` removes them.
 
-## In QEMU starten
+## Running under QEMU
 
 ```sh
 make run
 ```
 
-QEMU lädt den Multiboot-ELF direkt per `-kernel`, ganz ohne Bootloader —
-das ist der schnellste Weg zum Ausprobieren. Beenden mit `Ctrl-C` im
-Terminal.
+QEMU loads the Multiboot ELF directly via `-kernel`, with no bootloader
+involved — the fastest way to try a change. Quit with `Ctrl-C` in the
+terminal.
 
-### Anzeige
+The shell offers `help`, `taskmgr`, `start`, `mem`, `reboot` and `exit`.
+`taskmgr` without an argument prints its own syntax, `mem` shows the memory
+state, and `mem -t` runs a heap self-test.
 
-Das QEMU-Paket unter Arch bringt keine grafischen Display-Backends mit
-(`-display help` meldet nur `none`; `qemu-ui-gtk` und Verwandte sind eigene
-Pakete). Die `run`-Targets nutzen deshalb QEMUs eingebauten VNC-Server und
-starten automatisch einen Client, sobald der Port offen ist. Der Server
-lauscht nur auf `127.0.0.1` — ohne diese Bindung wäre die VM ohne Passwort
-aus dem Netz erreichbar.
+### Display
 
-Ein Client wird gebraucht, z.B. `sudo pacman -S tigervnc`. Gesucht wird
-nach `vncviewer`, `gvncviewer`, `vinagre`, `xtightvncviewer` und `krdc`.
+The QEMU package on Arch ships without graphical display backends
+(`-display help` reports only `none`; `qemu-ui-gtk` and friends are separate
+packages). The `run` targets therefore use QEMU's built-in VNC server and
+launch a client automatically once the port is up. The server binds to
+`127.0.0.1` only — without that, the running VM would be reachable from the
+network without a password.
+
+A client is required, for example `sudo pacman -S tigervnc`. The build looks
+for `vncviewer`, `gvncviewer`, `vinagre`, `xtightvncviewer` and `krdc`.
 
 ```sh
-make run VNC_CLIENT=gvncviewer   # anderer Client
-make run VNC_DISPLAY=3           # andere Anzeige-Nummer (Port 5903)
-make run VNC=0                   # ohne VNC
+make run VNC_CLIENT=gvncviewer   # different client
+make run VNC_DISPLAY=3           # different display number (port 5903)
+make run VNC=0                   # no VNC
 ```
 
-Alternativ lässt sich mit `sudo pacman -S qemu-ui-gtk` ein natives Fenster
-nachrüsten; dann genügt `make run VNC=0 QEMUFLAGS="-m 32 -k de -display gtk"`.
+Alternatively, `sudo pacman -S qemu-ui-gtk` adds a native window; then
+`make run VNC=0 QEMUFLAGS="-m 32 -k de -display gtk"` is enough.
 
-An der Shell stehen `help`, `taskmgr`, `start`, `mem`, `reboot` und `exit` zur
-Verfügung. `taskmgr` ohne Argument zeigt seine eigene Syntax, `mem` den
-Speicherzustand und `mem -t` einen Selbsttest des Heaps.
+### Keyboard layout
 
-### Tastaturlayout
-
-Der Kernel bringt eine deutsche Keymap mit, deshalb startet `make run` QEMU
-mit `-k de`. Ohne das übersetzt QEMU unter Wayland über das Keysym und legt
-die US-Belegung zugrunde — das Minus käme dann als `ß` an. Für ein anderes
-Layout:
+The kernel carries a German keymap, so `make run` starts QEMU with `-k de`.
+Without it, QEMU translates via the keysym under Wayland and assumes the US
+layout — the minus key would then arrive as `ß`. For a different layout:
 
 ```sh
 make run QEMU_KEYMAP=en-us
 ```
 
-## Alle Targets
+## All targets
 
-| Befehl | Wirkung |
+| Command | Effect |
 |---|---|
-| `make` | Kernel nach `build/kernel.elf` bauen |
-| `make run` | Direkt in QEMU starten (schnellster Testzyklus) |
-| `make iso` | BIOS-bootfähiges `build/tomatos.iso` via GRUB 2 |
-| `make run-iso` | Dieses ISO in QEMU booten |
-| `make floppy` | Kernel in eine Kopie des GRUB-Legacy-Floppy-Images legen |
-| `make run-floppy` | Dieses Floppy-Image in QEMU booten |
-| `make debug` | QEMU angehalten starten, GDB-Stub auf Port 1234 |
-| `make usb DEV=/dev/sdX` | ISO auf einen USB-Stick schreiben (fragt vorher nach) |
-| `make clean` | `build/` löschen |
-| `make help` | Diese Liste |
+| `make` | Build the kernel to `build/kernel.elf` |
+| `make run` | Boot directly in QEMU (fastest test cycle) |
+| `make iso` | BIOS-bootable `build/tomatos.iso` via GRUB 2 |
+| `make run-iso` | Boot that ISO in QEMU |
+| `make floppy` | Place the kernel into a copy of the GRUB Legacy floppy image |
+| `make run-floppy` | Boot that floppy image in QEMU |
+| `make debug` | Start QEMU halted with a GDB stub on port 1234 |
+| `make usb DEV=/dev/sdX` | Write the ISO to a USB stick (asks first) |
+| `make clean` | Remove `build/` |
+| `make help` | This list |
 
-## Auf echter Hardware
+## On real hardware
 
-`make iso` erzeugt ein Image, das per **Legacy-BIOS/CSM** bootet. Auf einen
-Stick kommt es mit `make usb DEV=/dev/sdX` — das Ziel wird vorher angezeigt
-und muss mit `yes` bestätigt werden. Vorsicht bei der Gerätewahl, `lsblk`
-hilft beim Identifizieren.
+`make iso` produces an image that boots via **legacy BIOS/CSM**. It goes onto
+a stick with `make usb DEV=/dev/sdX` — the target device is shown first and
+has to be confirmed with `yes`. Choose the device carefully; `lsblk` helps to
+identify it.
 
-Auf reinen UEFI-Geräten ohne CSM bleibt der Bildschirm schwarz: der Kernel
-schreibt direkt in den VGA-Textpuffer bei `0xB8000`, den es dort nicht mehr
-gibt. Dafür bräuchte es einen Framebuffer-Ausgabepfad.
+On UEFI-only machines without CSM the screen stays black: the kernel writes
+directly to the VGA text buffer at `0xB8000`, which no longer exists there.
+That would require a framebuffer output path.
 
-## Debuggen
+## Debugging
 
 ```sh
-make debug          # Terminal 1 — QEMU wartet angehalten
-gdb build/kernel.elf # Terminal 2
+make debug           # terminal 1 — QEMU waits, halted
+gdb build/kernel.elf # terminal 2
 (gdb) target remote :1234
 (gdb) break kernel
 (gdb) continue
 ```
 
-Da der Kernel als ELF gelinkt wird, stehen GDB alle Symbole zur Verfügung.
+Since the kernel is linked as ELF, GDB has all symbols available.
 
-## Aufbau
+## Layout
 
 ```
-src/            Kernelquellen
-src/include/    eigene Header (src/include/sys/ ist ungenutzter DJGPP-Rest)
-linker.ld       Linkerskript, lädt bei 1 MiB
-bin/            das originale GRUB-Legacy-Floppy-Image (Vorlage, wird nie verändert)
-legacy/         die alte Windows-Toolchain von 2011 (DJGPP, VFD) und ihre Batchdateien
+src/            kernel sources
+src/include/    own headers (src/include/sys/ is an unused DJGPP leftover)
+linker.ld       linker script, loads at 1 MiB
+bin/            the original GRUB Legacy floppy image (template, never modified)
+legacy/         the 2011 Windows toolchain (DJGPP, VFD) and its batch files
 ```
 
-Die Quellen sind UTF-8 mit LF. Gebaut wird mit `-std=gnu89`; unter neueren
-Standards werden die impliziten Deklarationen des Originalcodes zu Fehlern.
+Sources are UTF-8 with LF. The build uses `-std=gnu89`; under newer standards
+the implicit declarations of the original code become hard errors.

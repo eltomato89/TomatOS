@@ -1,18 +1,18 @@
 /* TomatOS - v0.1 pre Alpha
 *  By:   Jens Köhler (eltomato@googlemail.com)
-*  Desc: Kernel-Heap. malloc()/free() auf Basis des physischen
-*        Frame-Allocators aus pmm.c.
+*  Desc: Kernel heap. malloc()/free() on top of the physical frame
+*        allocator from pmm.c.
 *
-*  Bauart: eine einzige, nach Adressen sortierte doppelt verkettete Liste
-*  ueber *alle* Bloecke (belegte wie freie), jeder mit einem Kopf davor.
-*  Die Adressordnung ist der Kniff: Verschmelzen zweier freier Nachbarn
-*  ist damit ein Blick auf prev/next, und die Frage "grenzen die beiden
-*  wirklich aneinander?" beantwortet ein Adressvergleich -- noetig, weil
-*  der Heap aus mehreren, nicht zwangslaeufig zusammenhaengenden
-*  Frame-Bloecken des pmm besteht.
+*  Design: a single, address-sorted doubly linked list over *all* blocks
+*  (used as well as free), each with a header in front of it.
+*  The address ordering is the trick: merging two free neighbours is then
+*  just a look at prev/next, and the question "do those two really touch?"
+*  is answered by an address comparison -- necessary, because the heap
+*  consists of several, not necessarily contiguous frame blocks from the
+*  pmm.
 *
-*  Ein Buddy- oder Slab-Allocator waere fuer einen Kernel dieser Groesse
-*  ueberdimensioniert; die Freispeicherliste reicht voellig.
+*  A buddy or slab allocator would be overkill for a kernel of this size;
+*  the free list is entirely sufficient.
 *
 *  Notes: No warranty expressed or implied. Use at own risk.
 */
@@ -21,62 +21,64 @@
 #include <stdio.h>
 #include <mm.h>
 
-/* Ausrichtung aller zurueckgegebenen Zeiger. 8 Byte, damit spaetere
-*  Strukturen mit 64-Bit-Feldern (uint64, double) sauber liegen und der
-*  Prozessor keine Zugriffe ueber Wortgrenzen aufteilen muss. */
+/* Alignment of every returned pointer. 8 bytes, so that later structures
+*  with 64-bit fields (uint64, double) sit properly and the processor does
+*  not have to split accesses across word boundaries. */
 #define HEAP_ALIGN          8
 
-/* Kennung im Blockkopf. Damit erkennt free() Zeiger, die gar nicht vom
-*  Heap stammen, statt die Verwaltung still zu zerlegen -- im Ring 0 ohne
-*  Speicherschutz der einzige Schutz, den wir haben. */
+/* Signature in the block header. It lets free() recognise pointers that do
+*  not come from the heap at all, instead of silently tearing down the
+*  bookkeeping -- in ring 0 without memory protection the only protection
+*  we have. */
 #define HEAP_MAGIC          0xA110CA7EUL
 
-/* Anfangsgroesse und Mindest-Nachschlag, jeweils in Frames (4 KiB).
-*  16 Frames = 64 KiB. Lieber in groesseren Schritten wachsen, als den
-*  pmm bei jedem malloc() zu belaestigen. */
+/* Initial size and minimum top-up, each in frames (4 KiB).
+*  16 frames = 64 KiB. Better to grow in larger steps than to pester the
+*  pmm on every malloc(). */
 #define HEAP_INITIAL_FRAMES 16
 #define HEAP_GROW_FRAMES    16
 
-/* Obergrenze fuer eine einzelne Anforderung. Verhindert, dass die
-*  Aufrundung auf ganze Frames weiter unten ueberlaeuft. */
+/* Upper limit for a single request. Prevents the rounding up to whole
+*  frames further below from overflowing. */
 #define HEAP_MAX_ALLOC      0x3FFFFFFFUL
 
 struct heap_block
 {
-    uint32_t magic;             /* HEAP_MAGIC, sonst kein gueltiger Block */
-    uint32_t size;              /* Nutzlast in Bytes, stets Vielfaches von 8 */
-    uint32_t used;              /* 0 = frei, 1 = belegt */
-    uint32_t fill;              /* haelt den Kopf auf 24 Byte (s.u.) */
-    struct heap_block *prev;    /* Vorgaenger in Adressreihenfolge */
-    struct heap_block *next;    /* Nachfolger in Adressreihenfolge */
+    uint32_t magic;             /* HEAP_MAGIC, otherwise not a valid block */
+    uint32_t size;              /* payload in bytes, always a multiple of 8 */
+    uint32_t used;              /* 0 = free, 1 = in use */
+    uint32_t fill;              /* keeps the header at 24 bytes (see below) */
+    struct heap_block *prev;    /* predecessor in address order */
+    struct heap_block *next;    /* successor in address order */
 };
 
-/* 24 Byte, ein Vielfaches von HEAP_ALIGN. Zusammen damit, dass jede
-*  Nutzlastgroesse auf 8 aufgerundet wird und die pmm-Frames an 4-KiB-Grenzen
-*  liegen, ist jeder Blockanfang -- und damit jede Nutzlast -- 8-ausgerichtet. */
+/* 24 bytes, a multiple of HEAP_ALIGN. Together with the fact that every
+*  payload size is rounded up to 8 and that the pmm frames lie on 4 KiB
+*  boundaries, every block start -- and hence every payload -- is
+*  8-aligned. */
 #define HEAP_HEADER_SIZE    ((uint32_t)sizeof(struct heap_block))
 
-/* Kleinste Nutzlast, die ein Block noch tragen darf. */
+/* Smallest payload a block is still allowed to carry. */
 #define HEAP_MIN_PAYLOAD    HEAP_ALIGN
 
-/* Uebersetzungszeit-Zusicherung: waere der Kopf kein Vielfaches von
-*  HEAP_ALIGN, kaeme jede zweite Nutzlast schief heraus. Bricht die
-*  Uebersetzung mit "negative array size" ab, falls das je verletzt wird. */
+/* Compile-time assertion: were the header not a multiple of HEAP_ALIGN,
+*  every second payload would come out skewed. Aborts the compilation with
+*  "negative array size" should that ever be violated. */
 typedef char heap_header_alignment_check
     [(sizeof(struct heap_block) % HEAP_ALIGN) == 0 ? 1 : -1];
 
-/* Aufrunden auf die naechste Ausrichtungsgrenze. */
+/* Round up to the next alignment boundary. */
 #define HEAP_ALIGN_UP(x)    (((x) + (uint32_t)(HEAP_ALIGN - 1)) & ~(uint32_t)(HEAP_ALIGN - 1))
 
-static struct heap_block *heap_first = 0;   /* Kopf der Adressliste */
-static uint32_t heap_bytes = 0;             /* insgesamt vom pmm geholt */
+static struct heap_block *heap_first = 0;   /* head of the address list */
+static uint32_t heap_bytes = 0;             /* total taken from the pmm */
 static int heap_ready = 0;
 
-/* --- Interne Helfer ------------------------------------------------------ */
+/* --- Internal helpers ---------------------------------------------------- */
 
-/* Liegt b unmittelbar hinter der Nutzlast von a? Nur dann duerfen die
-*  beiden verschmolzen werden -- Listennachbarschaft allein genuegt nicht,
-*  weil zwei getrennte pmm-Anforderungen eine Luecke lassen koennen. */
+/* Does b lie immediately behind the payload of a? Only then may the two be
+*  merged -- being neighbours in the list alone is not enough, because two
+*  separate pmm requests can leave a gap between them. */
 static int heap_adjacent(struct heap_block *a, struct heap_block *b)
 {
     if(a == 0 || b == 0)
@@ -84,9 +86,9 @@ static int heap_adjacent(struct heap_block *a, struct heap_block *b)
     return ((unsigned char *)a + HEAP_HEADER_SIZE + a->size) == (unsigned char *)b;
 }
 
-/* Schluckt den Nachfolger. Aufrufer garantiert: beide frei und benachbart.
-*  Der Kopf des Nachfolgers verschwindet in der Nutzlast und wird deshalb
-*  entwertet -- ein noch herumliegender Zeiger darauf faellt dann auf. */
+/* Swallows the successor. The caller guarantees: both free and adjacent.
+*  The successor's header vanishes into the payload and is therefore
+*  invalidated -- a pointer to it still lying around then stands out. */
 static void heap_merge_next(struct heap_block *blk)
 {
     struct heap_block *n;
@@ -99,9 +101,9 @@ static void heap_merge_next(struct heap_block *blk)
     n->magic = 0;
 }
 
-/* Verschmilzt einen frisch freigegebenen Block mit beiden Nachbarn.
-*  Erst nach hinten, dann nach vorne: so bleibt hoechstens ein einziger
-*  freier Block uebrig, egal in welcher Reihenfolge freigegeben wurde. */
+/* Merges a freshly released block with both neighbours. Forward first, then
+*  backward: that way at most a single free block remains, no matter in
+*  which order things were released. */
 static void heap_coalesce(struct heap_block *blk)
 {
     if(blk->next != 0 && blk->next->used == 0 && heap_adjacent(blk, blk->next))
@@ -111,10 +113,10 @@ static void heap_coalesce(struct heap_block *blk)
         heap_merge_next(blk->prev);
 }
 
-/* Teilt blk so, dass vorne genau need Byte Nutzlast stehen. Der Rest wird
-*  ein eigener freier Block -- aber nur, wenn er noch einen Kopf *und* eine
-*  brauchbare Nutzlast traegt. Sonst bleibt der Ueberhang beim Block, das
-*  ist billiger als ein unbenutzbarer Splitter. */
+/* Splits blk so that exactly need bytes of payload sit at the front. The
+*  remainder becomes a free block of its own -- but only if it can still
+*  carry a header *and* a usable payload. Otherwise the excess stays with
+*  the block, which is cheaper than an unusable splinter. */
 static void heap_split(struct heap_block *blk, uint32_t need)
 {
     struct heap_block *rest;
@@ -136,10 +138,10 @@ static void heap_split(struct heap_block *blk, uint32_t need)
     blk->size = need;
 }
 
-/* Haengt einen frisch vom pmm geholten Bereich als freien Block in die
-*  Adressliste ein und versucht sofort, ihn mit den Nachbarn zu verschmelzen.
-*  Der pmm darf uns Frames unterhalb wie oberhalb des bisherigen Heaps geben,
-*  darum wird an der richtigen Stelle einsortiert und nicht bloss angehaengt. */
+/* Links a region freshly obtained from the pmm into the address list as a
+*  free block and immediately tries to merge it with its neighbours.
+*  The pmm may give us frames below as well as above the existing heap,
+*  which is why it is inserted at the right place and not merely appended. */
 static void heap_add_region(void *base, uint32_t bytes)
 {
     struct heap_block *blk;
@@ -186,8 +188,8 @@ static void heap_add_region(void *base, uint32_t bytes)
     heap_coalesce(blk);
 }
 
-/* Fordert beim pmm so viele Frames nach, dass need Byte Nutzlast
-*  hineinpassen -- mindestens aber HEAP_GROW_FRAMES. Liefert 1 bei Erfolg. */
+/* Asks the pmm for as many frames as it takes for need bytes of payload to
+*  fit in -- but at least HEAP_GROW_FRAMES. Returns 1 on success. */
 static int heap_grow(uint32_t need)
 {
     uint32_t bytes;
@@ -208,8 +210,8 @@ static int heap_grow(uint32_t need)
     base = pmm_alloc_frames(frames);
     if(base == 0 && frames != minimum)
     {
-        /* Fuer den grosszuegigen Wunsch war kein zusammenhaengender Block
-        *  mehr da -- zweiter Versuch mit dem, was wirklich noetig ist. */
+        /* There was no contiguous block left for the generous wish --
+        *  second attempt with what is really needed. */
         frames = minimum;
         base = pmm_alloc_frames(frames);
     }
@@ -220,8 +222,8 @@ static int heap_grow(uint32_t need)
     return 1;
 }
 
-/* Erster passender freier Block (First-Fit). Bei den paar Dutzend Bloecken
-*  eines Hobbykernels ist Best-Fit den Aufwand nicht wert. */
+/* First matching free block (first fit). With the few dozen blocks of a
+*  hobby kernel, best fit is not worth the effort. */
 static struct heap_block *heap_find(uint32_t need)
 {
     struct heap_block *blk;
@@ -236,18 +238,18 @@ static struct heap_block *heap_find(uint32_t need)
     return 0;
 }
 
-/* Vom Nutzzeiger zurueck auf den Blockkopf, mit Plausibilitaetspruefung.
-*  Liefert 0 und meldet den Fehler, wenn der Zeiger nicht vom Heap stammt. */
+/* From the payload pointer back to the block header, with a sanity check.
+*  Returns 0 and reports the error if the pointer is not from the heap. */
 static struct heap_block *heap_block_of(void *ptr)
 {
     struct heap_block *blk;
 
-    /* Billiger Vortest vor dem Dereferenzieren: jede Nutzlast des Heaps ist
-    *  8-ausgerichtet und liegt hinter einem Kopf, also nie ganz unten. */
+    /* Cheap pre-check before dereferencing: every heap payload is 8-aligned
+    *  and sits behind a header, so it is never right down at the bottom. */
     if((((uint32_t)ptr) & (uint32_t)(HEAP_ALIGN - 1)) != 0 ||
        ((uint32_t)ptr) < HEAP_HEADER_SIZE)
     {
-        printf("heap: Zeiger %X stammt nicht vom Heap (Ausrichtung)\n",
+        printf("heap: pointer %X does not come from the heap (alignment)\n",
                (uint32_t)ptr);
         return 0;
     }
@@ -255,7 +257,7 @@ static struct heap_block *heap_block_of(void *ptr)
     blk = (struct heap_block *)((unsigned char *)ptr - HEAP_HEADER_SIZE);
     if(blk->magic != HEAP_MAGIC)
     {
-        printf("heap: ungueltiger Zeiger %X (Magic %X)\n",
+        printf("heap: invalid pointer %X (magic %X)\n",
                (uint32_t)ptr, blk->magic);
         return 0;
     }
@@ -263,8 +265,8 @@ static struct heap_block *heap_block_of(void *ptr)
     return blk;
 }
 
-/* Rundet eine Nutzeranforderung auf die interne Blockgroesse auf.
-*  malloc(0) landet dabei auf HEAP_MIN_PAYLOAD (siehe malloc()). */
+/* Rounds a user request up to the internal block size.
+*  malloc(0) thereby ends up at HEAP_MIN_PAYLOAD (see malloc()). */
 static uint32_t heap_round(size_t size)
 {
     uint32_t need;
@@ -275,7 +277,7 @@ static uint32_t heap_round(size_t size)
     return need;
 }
 
-/* --- Oeffentliche Schnittstelle ------------------------------------------ */
+/* --- Public interface ---------------------------------------------------- */
 
 void heap_init(void)
 {
@@ -288,29 +290,29 @@ void heap_init(void)
 
     if(heap_grow((uint32_t)HEAP_INITIAL_FRAMES * (uint32_t)PMM_FRAME_SIZE
                  - HEAP_HEADER_SIZE) == 0)
-        printf("heap: kein Speicher fuer den Heap-Anfang vom pmm\n");
+        printf("heap: no memory from the pmm for the initial heap\n");
 }
 
-/* malloc(0) liefert einen gueltigen, eindeutigen Zeiger auf einen Block
-*  mit HEAP_MIN_PAYLOAD Byte Nutzlast -- also *keinen* Nullzeiger. So muss
-*  kein Aufrufer die 0 als Sonderfall behandeln, und der Rueckgabewert darf
-*  ganz normal an free() oder realloc() gehen. Dereferenzieren darf man ihn
-*  natuerlich nicht. (C erlaubt beide Auslegungen; das ist unsere.) */
+/* malloc(0) returns a valid, unique pointer to a block with
+*  HEAP_MIN_PAYLOAD bytes of payload -- that is, *not* a null pointer. This
+*  way no caller has to treat 0 as a special case, and the return value may
+*  go to free() or realloc() perfectly normally. Dereferencing it is of
+*  course not allowed. (C permits both readings; this is ours.) */
 void *malloc(size_t size)
 {
     struct heap_block *blk;
     uint32_t need;
 
-    /* size_t ist in diesem Projekt "int", also vorzeichenbehaftet. Eine
-    *  negative Groesse ist ein Programmierfehler und wird abgewiesen,
-    *  statt sie als knapp 4 GiB zu deuten. */
+    /* In this project size_t is "int", that is, signed. A negative size is
+    *  a programming error and is rejected, rather than being read as just
+    *  under 4 GiB. */
     if(size < 0)
     {
-        printf("heap: malloc mit negativer Groesse (%d)\n", size);
+        printf("heap: malloc with negative size (%d)\n", size);
         return 0;
     }
 
-    /* Falls jemand den Heap vor heap_init() benutzt: still nachholen. */
+    /* In case somebody uses the heap before heap_init(): quietly catch up. */
     if(heap_ready == 0)
         heap_init();
 
@@ -321,9 +323,9 @@ void *malloc(size_t size)
     blk = heap_find(need);
     if(blk == 0)
     {
-        /* Nichts Passendes da -- beim pmm nachfordern und einmal
-        *  wiederholen. Nach dem Verschmelzen kann auch ein bereits
-        *  vorhandener Block der richtige sein, darum die volle Suche. */
+        /* Nothing suitable there -- ask the pmm for more and retry once.
+        *  After the merging an already existing block may be the right one
+        *  as well, hence the full search. */
         if(heap_grow(need) == 0)
             return 0;
         blk = heap_find(need);
@@ -341,17 +343,17 @@ void free(void *ptr)
 {
     struct heap_block *blk;
 
-    /* free(0) ist ausdruecklich folgenlos. */
+    /* free(0) is explicitly without effect. */
     if(ptr == 0)
         return;
 
     blk = heap_block_of(ptr);
     if(blk == 0)
-        return;                 /* Fehler wurde bereits gemeldet */
+        return;                 /* error has already been reported */
 
     if(blk->used == 0)
     {
-        printf("heap: doppeltes free() auf %X\n", (uint32_t)ptr);
+        printf("heap: double free() on %X\n", (uint32_t)ptr);
         return;
     }
 
@@ -366,19 +368,19 @@ void *calloc(size_t num, size_t size)
 
     if(num < 0 || size < 0)
     {
-        printf("heap: calloc mit negativer Groesse (%d * %d)\n", num, size);
+        printf("heap: calloc with negative size (%d * %d)\n", num, size);
         return 0;
     }
 
     if(num == 0 || size == 0)
         return malloc(0);
 
-    /* Ueberlaufschutz per Division statt 64-Bit-Multiplikation: passt
-    *  num nicht mehr in den erlaubten Bereich geteilt durch size, dann
-    *  wuerde das Produkt umlaufen. */
+    /* Overflow protection by division instead of 64-bit multiplication: if
+    *  num no longer fits into the permitted range divided by size, then the
+    *  product would wrap around. */
     if((uint32_t)num > HEAP_MAX_ALLOC / (uint32_t)size)
     {
-        printf("heap: calloc-Ueberlauf (%d * %d)\n", num, size);
+        printf("heap: calloc overflow (%d * %d)\n", num, size);
         return 0;
     }
 
@@ -400,15 +402,15 @@ void *realloc(void *ptr, size_t size)
 
     if(size < 0)
     {
-        printf("heap: realloc mit negativer Groesse (%d)\n", size);
+        printf("heap: realloc with negative size (%d)\n", size);
         return 0;
     }
 
-    /* realloc(0, n) ist malloc(n) ... */
+    /* realloc(0, n) is malloc(n) ... */
     if(ptr == 0)
         return malloc(size);
 
-    /* ... und realloc(p, 0) ist free(p). */
+    /* ... and realloc(p, 0) is free(p). */
     if(size == 0)
     {
         free(ptr);
@@ -421,7 +423,7 @@ void *realloc(void *ptr, size_t size)
 
     if(blk->used == 0)
     {
-        printf("heap: realloc auf bereits freigegebenem Block %X\n",
+        printf("heap: realloc on already freed block %X\n",
                (uint32_t)ptr);
         return 0;
     }
@@ -430,7 +432,7 @@ void *realloc(void *ptr, size_t size)
     if(need > HEAP_MAX_ALLOC)
         return 0;
 
-    /* Passt schon: hoechstens den Ueberhang abschneiden, Zeiger bleibt. */
+    /* Already fits: at most cut off the excess, the pointer stays. */
     if(blk->size >= need)
     {
         heap_split(blk, need);
@@ -439,8 +441,8 @@ void *realloc(void *ptr, size_t size)
         return ptr;
     }
 
-    /* Waechst der direkt folgende freie Nachbar mit hinein, sparen wir uns
-    *  Kopieren und Umziehen komplett. */
+    /* If the directly following free neighbour grows into it, we save
+    *  ourselves the copying and moving entirely. */
     if(blk->next != 0 && blk->next->used == 0 && heap_adjacent(blk, blk->next) &&
        blk->size + HEAP_HEADER_SIZE + blk->next->size >= need)
     {
@@ -451,10 +453,10 @@ void *realloc(void *ptr, size_t size)
 
     neu = malloc(size);
     if(neu == 0)
-        return 0;               /* alter Block bleibt unangetastet gueltig */
+        return 0;               /* the old block stays untouched and valid */
 
-    /* Nur so viel kopieren, wie der alte Block wirklich hatte -- er ist
-    *  hier immer kleiner als der neue, aber die Klammer schadet nicht. */
+    /* Copy only as much as the old block really had -- here it is always
+    *  smaller than the new one, but the guard does no harm. */
     copy = blk->size;
     if(copy > need)
         copy = need;
@@ -465,9 +467,9 @@ void *realloc(void *ptr, size_t size)
     return neu;
 }
 
-/* Belegt: Nutzlast der benutzten Bloecke plus deren Verwaltungskoepfe.
-*  Wird durch Durchlaufen der Liste bestimmt statt mitgezaehlt -- bei den
-*  Blockzahlen hier vernachlaessigbar und dafuer nicht driftanfaellig. */
+/* In use: the payload of the used blocks plus their management headers.
+*  Determined by walking the list instead of being counted along -- with the
+*  block numbers here that is negligible, and in return it cannot drift. */
 uint32_t heap_used(void)
 {
     struct heap_block *blk;
@@ -484,7 +486,7 @@ uint32_t heap_used(void)
     return sum;
 }
 
-/* Insgesamt beim pmm angeforderter Speicher in Bytes. */
+/* Memory requested from the pmm in total, in bytes. */
 uint32_t heap_total(void)
 {
     return heap_bytes;

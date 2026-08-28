@@ -1,11 +1,11 @@
 /* TomatOS - v0.1 pre Alpha
 *  By:   Jens Köhler (eltomato@googlemail.com)
-*  Desc: Physischer Speichermanager (Frame-Allocator)
+*  Desc: Physical memory manager (frame allocator)
 *
-*  Verwaltet den physischen Speicher in Seiten zu 4 KiB. Die Belegung steht
-*  in einer Bitmap: ein Bit je Frame, 1 = belegt, 0 = frei. Die Bitmap liegt
-*  direkt hinter dem Kernel-Image, denn zu diesem Zeitpunkt gibt es noch
-*  kein malloc().
+*  Manages physical memory in pages of 4 KiB. The allocation state lives in
+*  a bitmap: one bit per frame, 1 = used, 0 = free. The bitmap is placed
+*  directly behind the kernel image, because at this point there is no
+*  malloc() yet.
 *
 *  Notes: No warranty expressed or implied. Use at own risk.
 */
@@ -14,49 +14,49 @@
 #include <stdio.h>
 #include <mm.h>
 
-/* Vom Linkerskript gestellte Marken. Als Array deklariert, damit der Name
-*  selbst schon die Adresse ist - ein "extern uint32_t kernel_end;" wuerde
-*  den Speicherinhalt an dieser Stelle lesen statt der Adresse. */
+/* Symbols provided by the linker script. Declared as arrays so that the
+*  name itself already is the address - an "extern uint32_t kernel_end;"
+*  would read the memory contents at that location instead of the address. */
 extern char kernel_start[];
 extern char kernel_end[];
 
-/* Rueckgabe von frame_find_free(), wenn nichts frei ist. Frame 0xFFFFF ist
-*  der letzte moegliche Index, 0xFFFFFFFF kann also nie ein gueltiger sein. */
+/* Return value of frame_find_free() when nothing is free. Frame 0xFFFFF is
+*  the last possible index, so 0xFFFFFFFF can never be a valid one. */
 #define PMM_NO_FRAME    0xFFFFFFFFUL
 
-/* Kleinste Adresse, ab der wir ueberhaupt Frames vergeben. Alles darunter
-*  gehoert BIOS, EBDA und dem Textmodus-Puffer bei 0xB8000. */
+/* Lowest address from which we hand out frames at all. Everything below
+*  belongs to the BIOS, the EBDA and the text mode buffer at 0xB8000. */
 #define PMM_LOW_LIMIT   0x00100000UL
 
-/* Quelle der Speicherinformation - beide Durchlaeufe muessen dieselbe sein */
-#define PMM_SRC_MMAP    0   /* Multiboot-Memory-Map */
-#define PMM_SRC_MEM     1   /* nur mem_lower / mem_upper */
-#define PMM_SRC_GUESS   2   /* gar nichts brauchbares gemeldet */
+/* Source of the memory information - both passes must use the same one */
+#define PMM_SRC_MMAP    0   /* multiboot memory map */
+#define PMM_SRC_MEM     1   /* only mem_lower / mem_upper */
+#define PMM_SRC_GUESS   2   /* nothing usable reported at all */
 
-/* --- Zustand -------------------------------------------------------------- */
+/* --- State ---------------------------------------------------------------- */
 
-static uint32_t *pmm_bitmap = 0;        /* Basis der Bitmap                   */
-static uint32_t  pmm_bitmap_bytes = 0;  /* ihre Groesse in Bytes              */
-static uint32_t  pmm_frames = 0;        /* Anzahl verwalteter Frames          */
-static uint32_t  pmm_used = 0;          /* davon belegt                       */
-static uint32_t  pmm_avail_bytes = 0;   /* nutzbarer Speicher laut Map        */
-static uint32_t  pmm_top_incl = 0;      /* hoechste nutzbare Byte-Adresse     */
-static int       pmm_have_top = 0;      /* wurde ueberhaupt etwas gefunden?   */
-static uint32_t  pmm_hint = 0;          /* Wortindex, ab dem gesucht wird     */
+static uint32_t *pmm_bitmap = 0;        /* base of the bitmap                 */
+static uint32_t  pmm_bitmap_bytes = 0;  /* its size in bytes                  */
+static uint32_t  pmm_frames = 0;        /* number of managed frames           */
+static uint32_t  pmm_used = 0;          /* of those, in use                   */
+static uint32_t  pmm_avail_bytes = 0;   /* usable memory according to the map */
+static uint32_t  pmm_top_incl = 0;      /* highest usable byte address        */
+static int       pmm_have_top = 0;      /* was anything found at all?         */
+static uint32_t  pmm_hint = 0;          /* word index to start searching at   */
 
-/* --- Bit-Ebene ------------------------------------------------------------ */
+/* --- Bit level ------------------------------------------------------------ */
 
-/* 1 = belegt. Ausserhalb der Bitmap gilt alles als belegt, damit sich kein
-*  Aufrufer versehentlich Speicher jenseits des Verwalteten nimmt. */
+/* 1 = used. Everything outside the bitmap counts as used, so that no caller
+*  accidentally takes memory beyond what is being managed. */
 static int frame_test(uint32_t idx)
 {
 	if (idx >= pmm_frames) return 1;
 	return (pmm_bitmap[idx >> 5] & ((uint32_t)1 << (idx & 31))) != 0;
 }
 
-/* Beide Markierer sind bewusst idempotent: sie zaehlen nur, wenn sich das
-*  Bit wirklich aendert. Damit kann weder doppeltes Belegen noch doppeltes
-*  Freigeben die Zaehler aus dem Tritt bringen. */
+/* Both markers are deliberately idempotent: they only count when the bit
+*  really changes. That way neither a double allocation nor a double free
+*  can throw the counters out of step. */
 static void frame_mark_used(uint32_t idx)
 {
 	if (idx >= pmm_frames) return;
@@ -73,26 +73,26 @@ static void frame_mark_free(uint32_t idx)
 	pmm_used--;
 }
 
-/* --- Bereichs-Ebene ------------------------------------------------------- */
+/* --- Region level --------------------------------------------------------- */
 
-/* Rechnet (base, len) in die letzte enthaltene Byte-Adresse um. Wir rechnen
-*  durchgehend mit dieser inklusiven Endadresse, weil base+len bei einem
-*  Bereich, der bis an die 4-GiB-Grenze reicht, ueberlaufen wuerde.
-*  Rueckgabe 0, wenn der Bereich leer ist. */
+/* Converts (base, len) into the last contained byte address. We compute with
+*  this inclusive end address throughout, because base+len would overflow for
+*  a region that reaches up to the 4 GiB boundary.
+*  Returns 0 when the region is empty. */
 static int region_bounds(uint32_t base, uint32_t len, uint32_t *end_incl)
 {
 	uint32_t e;
 
 	if (len == 0) return 0;
 	e = base + len - 1;
-	if (e < base) e = 0xFFFFFFFFUL;	/* Ueberlauf: bei 4 GiB abschneiden */
+	if (e < base) e = 0xFFFFFFFFUL;	/* overflow: clamp at 4 GiB */
 	*end_incl = e;
 	return 1;
 }
 
-/* Belegen: nach aussen runden. Jeder Frame, den der Bereich auch nur
-*  anschneidet, gilt als belegt - lieber ein Frame zu viel gesperrt als
-*  einer, in dem noch fremde Daten stehen. */
+/* Allocating: round outward. Every frame the region even touches counts as
+*  used - better to lock one frame too many than one that still holds
+*  somebody else's data. */
 static void region_mark_used(uint32_t base, uint32_t len)
 {
 	uint32_t end_incl;
@@ -112,8 +112,8 @@ static void region_mark_used(uint32_t base, uint32_t len)
 		frame_mark_used(i);
 }
 
-/* Freigeben: nach innen runden. Nur Frames, die vollstaendig im Bereich
-*  liegen, werden frei - ein angeschnittener Frame am Rand bleibt gesperrt. */
+/* Releasing: round inward. Only frames that lie entirely inside the region
+*  become free - a frame clipped at either edge stays locked. */
 static void region_mark_free(uint32_t base, uint32_t len)
 {
 	uint32_t end_incl;
@@ -124,12 +124,12 @@ static void region_mark_free(uint32_t base, uint32_t len)
 	if (pmm_frames == 0) return;
 	if (!region_bounds(base, len, &end_incl)) return;
 
-	/* Passt ueberhaupt ein ganzer Frame hinein? */
+	/* Does a whole frame fit in there at all? */
 	if (end_incl < PMM_FRAME_SIZE - 1) return;
 	if (base > 0xFFFFFFFFUL - (PMM_FRAME_SIZE - 1)) return;
 
-	first = (base + (PMM_FRAME_SIZE - 1)) >> 12;	/* Anfang aufrunden */
-	last  = (end_incl - (PMM_FRAME_SIZE - 1)) >> 12;	/* Ende abrunden  */
+	first = (base + (PMM_FRAME_SIZE - 1)) >> 12;	/* round start up */
+	last  = (end_incl - (PMM_FRAME_SIZE - 1)) >> 12;	/* round end down */
 
 	if (first > last) return;
 	if (first >= pmm_frames) return;
@@ -139,7 +139,7 @@ static void region_mark_free(uint32_t base, uint32_t len)
 		frame_mark_free(i);
 }
 
-/* Erster Durchlauf: hoechste Adresse und Gesamtmenge merken. */
+/* First pass: remember the highest address and the total amount. */
 static void region_note(uint32_t base, uint32_t len)
 {
 	uint32_t end_incl;
@@ -158,9 +158,9 @@ static void region_note(uint32_t base, uint32_t len)
 	else pmm_avail_bytes += clen;
 }
 
-/* --- Multiboot-Memory-Map ------------------------------------------------- */
+/* --- Multiboot memory map ------------------------------------------------- */
 
-/* pass == 0: nur messen, pass != 0: verfuegbare Bereiche freigeben. */
+/* pass == 0: only measure, pass != 0: release the available regions. */
 static void pmm_walk_mmap(multiboot_info *mbi, int pass)
 {
 	multiboot_mmap_entry *ent;
@@ -170,21 +170,21 @@ static void pmm_walk_mmap(multiboot_info *mbi, int pass)
 
 	addr = mbi->mmap_addr;
 	end  = addr + mbi->mmap_length;
-	if (end < addr) return;		/* unsinnige Laengenangabe */
+	if (end < addr) return;		/* nonsensical length given */
 
 	while (addr < end)
 	{
-		/* Reicht der Rest ueberhaupt fuer einen vollstaendigen Eintrag? */
+		/* Is the remainder even enough for a complete entry? */
 		if (end - addr < (uint32_t)sizeof(multiboot_mmap_entry)) break;
 
 		ent = (multiboot_mmap_entry *)addr;
 
-		/* size zaehlt die Bytes NACH dem size-Feld; unter 20 kann kein
-		*  gueltiger Eintrag liegen. Abbrechen statt endlos drehen. */
+		/* size counts the bytes AFTER the size field; no valid entry can
+		*  be smaller than 20. Bail out instead of spinning forever. */
 		if (ent->size < 20) break;
 
-		/* Nur echtes RAM, und nur was ein 32-Bit-Kernel adressieren kann:
-		*  alles mit gesetzten oberen Haelften liegt jenseits von 4 GiB. */
+		/* Only real RAM, and only what a 32-bit kernel can address:
+		*  anything with the upper halves set lies beyond 4 GiB. */
 		if (ent->type == MULTIBOOT_MEMORY_AVAILABLE &&
 		    ent->addr_high == 0 && ent->len_high == 0)
 		{
@@ -192,14 +192,14 @@ static void pmm_walk_mmap(multiboot_info *mbi, int pass)
 			else           region_mark_free(ent->addr_low, ent->len_low);
 		}
 
-		/* Der klassische Stolperstein: NICHT sizeof() weiterspringen. */
+		/* The classic pitfall: do NOT advance by sizeof(). */
 		next = addr + ent->size + 4;
-		if (next <= addr) break;	/* Ueberlauf oder Stillstand */
+		if (next <= addr) break;	/* overflow or standstill */
 		addr = next;
 	}
 }
 
-/* Rueckfallweg fuer karge Bootloader: mem_lower / mem_upper in KiB. */
+/* Fallback path for sparse bootloaders: mem_lower / mem_upper in KiB. */
 static void pmm_walk_meminfo(multiboot_info *mbi, int pass)
 {
 	uint32_t lower;
@@ -208,8 +208,8 @@ static void pmm_walk_meminfo(multiboot_info *mbi, int pass)
 	lower = mbi->mem_lower;
 	upper = mbi->mem_upper;
 
-	/* Unterhalb von 1 MiB gibt es hoechstens 640 KiB nutzbares RAM, und
-	*  oberhalb kappen wir so, dass 0x100000 + upper*1024 nicht ueberlaeuft. */
+	/* Below 1 MiB there is at most 640 KiB of usable RAM, and above it we
+	*  cap such that 0x100000 + upper*1024 does not overflow. */
 	if (lower > 640) lower = 640;
 	if (upper > 0x003FF000UL) upper = 0x003FF000UL;
 
@@ -225,7 +225,7 @@ static void pmm_walk_meminfo(multiboot_info *mbi, int pass)
 	}
 }
 
-/* --- Aufbau --------------------------------------------------------------- */
+/* --- Setup ---------------------------------------------------------------- */
 
 void pmm_init(multiboot_info *mbi)
 {
@@ -246,7 +246,7 @@ void pmm_init(multiboot_info *mbi)
 	kstart = (uint32_t)kernel_start;
 	kend   = (uint32_t)kernel_end;
 
-	/* 1. Durchlauf: Woher wissen wir, wieviel Speicher da ist? */
+	/* 1st pass: how do we know how much memory is there? */
 	src = PMM_SRC_GUESS;
 
 	if (mbi != 0 && (mbi->flags & MULTIBOOT_INFO_MEM_MAP) != 0 &&
@@ -263,11 +263,11 @@ void pmm_init(multiboot_info *mbi)
 		if (pmm_have_top) src = PMM_SRC_MEM;
 	}
 
-	/* Notnagel. Auch der Rueckfallweg kann Unsinn liefern - wenn hinter dem
-	*  Kernel-Image angeblich nichts mehr kommt, ist die Angabe wertlos. */
+	/* Last resort. The fallback path can deliver nonsense too - if there
+	*  supposedly is nothing behind the kernel image, the figure is worthless. */
 	if (!pmm_have_top || pmm_top_incl < kend)
 	{
-		printf("PMM: Bootloader meldet keinen brauchbaren Speicher, nehme 16 MiB an\n");
+		printf("PMM: bootloader reports no usable memory, assuming 16 MiB\n");
 		pmm_top_incl    = 0;
 		pmm_have_top    = 0;
 		pmm_avail_bytes = 0;
@@ -275,13 +275,13 @@ void pmm_init(multiboot_info *mbi)
 		region_note(PMM_LOW_LIMIT, 0x00F00000UL);	/* 1 MiB .. 16 MiB */
 	}
 
-	/* Frames: pmm_top_incl ist die letzte nutzbare Byte-Adresse, der Frame
-	*  mit diesem Index existiert also noch - daher das +1. */
+	/* Frames: pmm_top_incl is the last usable byte address, so the frame
+	*  with that index still exists - hence the +1. */
 	pmm_frames       = (pmm_top_incl >> 12) + 1;
 	pmm_bitmap_bytes = ((pmm_frames + 31) >> 5) * 4;
 
-	/* Die Bitmap kommt direkt hinter das Kernel-Image (4 Byte ausgerichtet,
-	*  weil wir sie wortweise durchsuchen). */
+	/* The bitmap goes directly behind the kernel image (4 byte aligned,
+	*  because we scan it word by word). */
 	bmp = ((uint32_t)kernel_end + 3) & ~(uint32_t)3;
 
 	if (bmp < kend || pmm_bitmap_bytes == 0 ||
@@ -289,32 +289,32 @@ void pmm_init(multiboot_info *mbi)
 	    bmp + pmm_bitmap_bytes - 1 > pmm_top_incl)
 	{
 		pmm_frames = 0;
-		panic("PMM: kein Platz fuer die Frame-Bitmap");
+		panic("PMM: no room for the frame bitmap");
 		return;
 	}
 
 	pmm_bitmap = (uint32_t *)bmp;
 
-	/* Erst gilt alles als belegt. Die Fuellbits im letzten Wort oberhalb von
-	*  pmm_frames bleiben dadurch dauerhaft 1 und koennen nie vergeben
-	*  werden - freigegeben wird nur ueber Indizes < pmm_frames. */
+	/* At first everything counts as used. The padding bits in the last word
+	*  above pmm_frames thereby stay 1 permanently and can never be handed
+	*  out - releasing only ever happens through indices < pmm_frames. */
 	memset(pmm_bitmap, (char)0xFF, (size_t)pmm_bitmap_bytes);
 	pmm_used = pmm_frames;
 
-	/* Dann die tatsaechlich verfuegbaren Bereiche freigeben. */
+	/* Then release the regions that are actually available. */
 	if (src == PMM_SRC_MMAP)     pmm_walk_mmap(mbi, 1);
 	else if (src == PMM_SRC_MEM) pmm_walk_meminfo(mbi, 1);
 	else                         region_mark_free(PMM_LOW_LIMIT, 0x00F00000UL);
 
-	/* Und zuletzt alles wieder sperren, was nicht vergeben werden darf. */
-	frame_mark_used(0);				/* Adresse 0 bleibt ungueltig    */
-	region_mark_used(0, PMM_LOW_LIMIT);		/* BIOS, EBDA, VGA bei 0xB8000   */
-	region_mark_used(kstart, kend - kstart);	/* das Kernel-Image selbst       */
-	region_mark_used(bmp, pmm_bitmap_bytes);	/* die Bitmap selbst             */
+	/* And finally lock everything again that must not be handed out. */
+	frame_mark_used(0);				/* address 0 stays invalid  */
+	region_mark_used(0, PMM_LOW_LIMIT);		/* BIOS, EBDA, VGA at 0xB8000 */
+	region_mark_used(kstart, kend - kstart);	/* the kernel image itself  */
+	region_mark_used(bmp, pmm_bitmap_bytes);	/* the bitmap itself        */
 
-	/* Die Multiboot-Strukturen legt der Bootloader irgendwo ins RAM ab -
-	*  meist unter 1 MiB, garantiert ist das aber nicht. Sperren, damit sie
-	*  nicht spaeter unter dem Kernel weg ueberschrieben werden. */
+	/* The bootloader puts the multiboot structures somewhere in RAM -
+	*  usually below 1 MiB, but that is not guaranteed. Lock them, so they
+	*  are not later overwritten out from under the kernel. */
 	if (mbi != 0)
 	{
 		region_mark_used((uint32_t)mbi, (uint32_t)sizeof(multiboot_info));
@@ -322,15 +322,15 @@ void pmm_init(multiboot_info *mbi)
 			region_mark_used(mbi->mmap_addr, mbi->mmap_length);
 	}
 
-	printf("PMM: %d KiB nutzbar, %d Frames zu 4 KiB, %d frei\n",
+	printf("PMM: %d KiB usable, %d frames of 4 KiB, %d free\n",
 	       (int)(pmm_avail_bytes >> 10), (int)pmm_frames,
 	       (int)(pmm_frames - pmm_used));
-	printf("PMM: Bitmap bei 0x%X, %d Bytes\n", (int)bmp, (int)pmm_bitmap_bytes);
+	printf("PMM: bitmap at 0x%X, %d bytes\n", (int)bmp, (int)pmm_bitmap_bytes);
 }
 
-/* --- Suche ---------------------------------------------------------------- */
+/* --- Search --------------------------------------------------------------- */
 
-/* Niedrigstes Nullbit im Wort w, oder PMM_NO_FRAME. */
+/* Lowest zero bit in word w, or PMM_NO_FRAME. */
 static uint32_t word_first_free(uint32_t w)
 {
 	uint32_t bits;
@@ -350,7 +350,7 @@ static uint32_t word_first_free(uint32_t w)
 	return PMM_NO_FRAME;
 }
 
-/* Erster freier Frame. Startet beim Hinweis und wickelt einmal um. */
+/* First free frame. Starts at the hint and wraps around once. */
 static uint32_t frame_find_free(void)
 {
 	uint32_t words;
@@ -375,7 +375,7 @@ static uint32_t frame_find_free(void)
 	return PMM_NO_FRAME;
 }
 
-/* --- Oeffentliche Schnittstelle ------------------------------------------- */
+/* --- Public interface ----------------------------------------------------- */
 
 void *pmm_alloc_frame(void)
 {
@@ -395,17 +395,17 @@ void pmm_free_frame(void *frame)
 	uint32_t addr;
 	uint32_t idx;
 
-	if (frame == 0) return;			/* Nullzeiger ist erlaubt */
+	if (frame == 0) return;			/* null pointer is allowed */
 	if (pmm_frames == 0) return;
 
 	addr = (uint32_t)frame;
-	if ((addr & (PMM_FRAME_SIZE - 1)) != 0) return;	/* nicht ausgerichtet */
+	if ((addr & (PMM_FRAME_SIZE - 1)) != 0) return;	/* not aligned */
 
 	idx = addr >> 12;
 	if (idx >= pmm_frames) return;
 
-	/* frame_mark_free() zaehlt nur herunter, wenn das Bit auch wirklich
-	*  gesetzt war - ein doppeltes free() bleibt damit folgenlos. */
+	/* frame_mark_free() only counts down when the bit really was set - so a
+	*  double free() has no effect. */
 	if ((idx >> 5) < pmm_hint) pmm_hint = idx >> 5;
 	frame_mark_free(idx);
 }
@@ -424,16 +424,16 @@ void *pmm_alloc_frames(uint32_t count)
 	run   = 0;
 	start = 0;
 
-	/* i laeuft nie ueber pmm_frames hinaus, die Bitmap wird also nur
-	*  innerhalb ihrer Grenzen gelesen. Ein Lauf gilt erst als gefunden,
-	*  wenn count Frames tatsaechlich geprueft wurden. */
+	/* i never runs past pmm_frames, so the bitmap is only read within its
+	*  own bounds. A run only counts as found once count frames have
+	*  actually been checked. */
 	for (i = 0; i < pmm_frames; i++)
 	{
-		/* Volle Woerter ueberspringen: 32 belegte Frames am Stueck. */
+		/* Skip full words: 32 used frames in a row. */
 		if ((i & 31) == 0 && pmm_bitmap[i >> 5] == 0xFFFFFFFFUL)
 		{
 			run = 0;
-			i += 31;	/* der Schleifenkopf zaehlt die 32. dazu */
+			i += 31;	/* the loop head adds the 32nd */
 			continue;
 		}
 
@@ -470,7 +470,7 @@ void pmm_free_frames(void *frames, uint32_t count)
 	if ((addr & (PMM_FRAME_SIZE - 1)) != 0) return;
 
 	idx = addr >> 12;
-	/* So formuliert, dass idx + count nicht ueberlaufen kann. */
+	/* Phrased so that idx + count cannot overflow. */
 	if (idx >= pmm_frames || count > pmm_frames - idx) return;
 
 	if ((idx >> 5) < pmm_hint) pmm_hint = idx >> 5;
@@ -479,7 +479,7 @@ void pmm_free_frames(void *frames, uint32_t count)
 		frame_mark_free(idx + i);
 }
 
-/* --- Kennzahlen ----------------------------------------------------------- */
+/* --- Statistics ----------------------------------------------------------- */
 
 uint32_t pmm_total_frames(void)
 {
@@ -496,9 +496,9 @@ uint32_t pmm_free_frames_count(void)
 	return pmm_frames - pmm_used;
 }
 
-/* Nutzbarer Speicher laut Memory-Map, also die Summe der als AVAILABLE
-*  gemeldeten Bereiche - nicht dasselbe wie pmm_total_frames() * 4096, das
-*  die Loecher zwischen den Bereichen mitzaehlt. */
+/* Usable memory according to the memory map, that is the sum of the regions
+*  reported as AVAILABLE - not the same as pmm_total_frames() * 4096, which
+*  also counts the holes between the regions. */
 uint32_t pmm_total_bytes(void)
 {
 	return pmm_avail_bytes;

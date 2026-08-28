@@ -83,9 +83,9 @@ int checkCPUID(void)
    }
 }
 
-/* Gibt die nutzbaren Bereiche der Multiboot-Memory-Map aus. Bewusst kompakt:
-*  der Textmodus hat nur 25 Zeilen, und die Bootmeldungen sollen hineinpassen.
-*  Reservierte Bereiche interessieren hier nicht, die wertet pmm_init() aus.
+/* Prints the usable regions of the multiboot memory map. Deliberately compact:
+*  text mode only has 25 lines, and the boot messages have to fit into them.
+*  Reserved regions are of no interest here, pmm_init() evaluates those.
 */
 static void print_memory_map(multiboot_info *mbi)
 {
@@ -97,7 +97,7 @@ static void print_memory_map(multiboot_info *mbi)
 
 	if(!(mbi->flags & MULTIBOOT_INFO_MEM_MAP))
 	{
-		printf("Memory-Map: keine vom Bootloader erhalten\n");
+		printf("Memory map: none received from the bootloader\n");
 		return;
 	}
 
@@ -105,15 +105,15 @@ static void print_memory_map(multiboot_info *mbi)
 	gezeigt = 0;
 	offset = 0;
 
-	printf("Memory-Map (nutzbar):\n");
+	printf("Memory map (usable):\n");
 	while(offset < mbi->mmap_length)
 	{
 		entry = (multiboot_mmap_entry *)(mbi->mmap_addr + offset);
-		/* size zaehlt erst ab dem Feld dahinter, daher die zusaetzlichen 4 */
+		/* size only counts from the field after it, hence the extra 4 */
 		offset += entry->size + 4;
 
 		if(entry->type != MULTIBOOT_MEMORY_AVAILABLE) continue;
-		/* Oberhalb von 4 GiB kommt ein 32-Bit-Kernel ohnehin nicht hin */
+		/* A 32-bit kernel cannot reach anything above 4 GiB anyway */
 		if(entry->addr_high != 0) continue;
 
 		if(entry->len_high != 0)
@@ -124,13 +124,13 @@ static void print_memory_map(multiboot_info *mbi)
 		summe_kib += laenge_kib;
 
 		if(gezeigt < 6)
-			printf("  0x%X  %i KiB  Typ %i\n", entry->addr_low, laenge_kib, entry->type);
+			printf("  0x%X  %i KiB  type %i\n", entry->addr_low, laenge_kib, entry->type);
 		else if(gezeigt == 6)
 			printf("  ...\n");
 		gezeigt++;
 	}
 
-	printf("  Summe: %i KiB (%i MiB) in %i Bereichen\n",
+	printf("  Total: %i KiB (%i MiB) in %i regions\n",
 		summe_kib, (summe_kib / 1024u), gezeigt);
 }
 
@@ -142,13 +142,13 @@ int kernel(uint32_t magic, multiboot_info *mbi)
     init_video();
     printf("\n\nTomatOS/x86 boot v0.2\n");
 
-	/* Ohne die Magic wissen wir nicht, ob ebx ueberhaupt auf eine
-	*  Multiboot-Info-Struktur zeigt. Alles Weitere waere geraten. */
+	/* Without the magic we do not know whether ebx points at a multiboot
+	*  info structure at all. Everything beyond this would be guesswork. */
 	if(magic != MULTIBOOT_BOOTLOADER_MAGIC)
 	{
-		printf("Multiboot-Magic: %X erwartet, %X erhalten\n",
+		printf("Multiboot magic: expected %X, got %X\n",
 			MULTIBOOT_BOOTLOADER_MAGIC, magic);
-		panic("Kein Multiboot-konformer Bootloader.\nTomatOS braucht die Speicherinformationen des Bootloaders.");
+		panic("No multiboot compliant bootloader.\nTomatOS needs the memory information from the bootloader.");
 		return 0;
 	}
 
@@ -161,12 +161,12 @@ int kernel(uint32_t magic, multiboot_info *mbi)
 		panic("An unsupported CPU ID has been detected\nTomatOS requires a i386 or above");
 		return 0;
 	   }
-	/* Speicherverwaltung aufsetzen. Die Groesse kommt jetzt aus der
-	*  Memory-Map des Bootloaders - kein destruktives Testschreiben quer durch
-	*  den Adressraum mehr.
-	*  Reihenfolge: pmm_init() braucht nur die Memory-Map, heap_init() setzt
-	*  auf einem fertigen pmm auf, und beide muessen vor mt_install() stehen,
-	*  damit auch Tasks Speicher anfordern koennen. */
+	/* Set up memory management. The size now comes from the bootloader's
+	*  memory map - no more destructive test writes across the address
+	*  space.
+	*  Order: pmm_init() only needs the memory map, heap_init() builds on a
+	*  ready pmm, and both must come before mt_install() so that tasks can
+	*  request memory as well. */
 	print_memory_map(mbi);
 	pmm_init(mbi);
 	heap_init();
@@ -193,11 +193,11 @@ int kernel(uint32_t magic, multiboot_info *mbi)
 	getchn(); // flush last keyboard character set by EnableA20Gate();
 	__asm__ __volatile__ ("sti");
 
-	task_console = taskmgr_add_task( main, "KONSOLE", TASK_PRIORITY_REALTIME );
+	task_console = taskmgr_add_task( main, "CONSOLE", TASK_PRIORITY_REALTIME );
 	taskmgr_task_start(task_console);
 
-	/* Ab hier uebernimmt der Timer-IRQ: der Scheduler springt in den
-	 * Konsolen-Task. Wir kehren nach start.asm zurueck, das dort in einer
-	 * Endlosschleife auf den ersten Taskwechsel wartet. */
+	/* From here on the timer IRQ takes over: the scheduler jumps into the
+	 * console task. We return to start.asm, which waits there in an
+	 * endless loop for the first task switch. */
 	return 0;
 }

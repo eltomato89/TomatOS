@@ -10,15 +10,15 @@
 #include <string.h>
 #include <stdio.h>
 
-/* settextcolor() lebt in scrn.c, hat aber (noch) keinen Prototyp in einem
-*  Header. Lokal deklarieren, damit -Wall hier nicht meckert. */
+/* settextcolor() lives in scrn.c, but does not (yet) have a prototype in any
+*  header. Declare it locally so that -Wall does not complain here. */
 extern void settextcolor(unsigned char forecolor, unsigned char backcolor);
 
-/* Wie oft schedule() hoechstens aufgerufen wird, um einen abgestuerzten Task
-*  zu verlassen. schedule() wechselt den Task erst, wenn dessen Zeitscheibe
-*  (cpu_time) aufgebraucht ist, und zieht pro Aufruf eine Scheibe ab. Die
-*  Obergrenze sorgt dafuer, dass wir im Interrupt-Kontext garantiert nicht
-*  endlos schleifen (groesste Prioritaet ist TASK_PRIORITY_REALTIME = 20). */
+/* How often schedule() is called at most in order to leave a crashed task.
+*  schedule() only switches tasks once their time slice (cpu_time) is used
+*  up, and subtracts one slice per call. The upper bound makes sure that we
+*  cannot possibly loop forever in interrupt context (the largest priority is
+*  TASK_PRIORITY_REALTIME = 20). */
 #define FAULT_SCHEDULE_TRIES 64
 
 extern void isr0();
@@ -93,9 +93,9 @@ void isrs_install()
     idt_set_gate(31, (unsigned)isr31, 0x08, 0x8E);
 }
 
-/* char* statt unsigned char*: die Texte gehen an printf("%s") und an
-*  taskmgr_task_abort(const char*), unsigned char* erzeugte dort nur
-*  -Wpointer-sign-Warnungen. */
+/* char* instead of unsigned char*: the texts go to printf("%s") and to
+*  taskmgr_task_abort(const char*), where unsigned char* only produced
+*  -Wpointer-sign warnings. */
 char *exception_messages[] =
 {
     "Division By Zero",
@@ -143,28 +143,26 @@ void fault_handler(struct regs *r)
 
 	pid = taskmgr_get_currpid();
 
-	/* Faellt ein laufender Task ueber eine Exception, wird er abgebrochen und
-	*  der Kontext auf den naechsten lauffaehigen Task umgebogen. Wuerden wir
-	*  hier einfach zurueckkehren, wuerde der iret am Ende von isr_common_stub
-	*  genau auf die fehlerhafte Instruktion springen und die Exception
-	*  endlos erneut ausloesen. */
+	/* If a running task trips over an exception, it is aborted and the
+	*  context is redirected to the next runnable task. If we simply returned
+	*  here, the iret at the end of isr_common_stub would jump straight back
+	*  to the faulting instruction and re-trigger the exception forever. */
 	if(pid >= 0 && r->int_no < 32)
 	{
 		taskmgr_task_abort(pid, r->err_code, exception_messages[r->int_no]);
 
-		/* Kurze, sichtbare Rueckmeldung - ein Absturz soll nicht
-		*  stillschweigend passieren. */
+		/* Short, visible feedback - a crash should not happen silently. */
 		settextcolor(4,0);
-		printf("Task %i abgebrochen: %s (Errorcode %i, eip %i)\n",
+		printf("Task %i aborted: %s (error code %i, eip %i)\n",
 		       pid, exception_messages[r->int_no], r->err_code, r->eip);
 		settextcolor(15,0);
 
-		/* schedule() wechselt den Task erst, wenn dessen Zeitscheibe
-		*  aufgebraucht ist, und liefert bis dahin den uebergebenen Kontext
-		*  zurueck. Deshalb so lange aufrufen, bis ein anderer Kontext
-		*  herauskommt - aber nur begrenzt oft, damit hier im Interrupt
-		*  keine Endlosschleife entstehen kann. Der abgebrochene Task ist
-		*  nicht mehr RUNNING und wird von der Suche uebersprungen. */
+		/* schedule() only switches tasks once their time slice is used up,
+		*  and until then returns the context it was handed. So call it until
+		*  a different context comes out - but only a bounded number of
+		*  times, so that no endless loop can arise here inside the
+		*  interrupt. The aborted task is no longer RUNNING and is skipped by
+		*  the search. */
 		next = r;
 		for(i=0; i < FAULT_SCHEDULE_TRIES; i++)
 		{
@@ -174,25 +172,25 @@ void fault_handler(struct regs *r)
 
 		if(next != r)
 		{
-			/* Kontext in place ersetzen: isr_common_stub stellt saemtliche
-			*  Register aus genau diesem Speicherbereich wieder her und
-			*  springt per iret hinein. Das entspricht dem "mov esp, eax"
-			*  des IRQ-Pfades, nur ohne Aenderung am Assembler. */
+			/* Replace the context in place: isr_common_stub restores all
+			*  registers from exactly this memory area and jumps into it via
+			*  iret. This is the equivalent of the IRQ path's "mov esp, eax",
+			*  only without touching the assembler. */
 			*r = *next;
 			return;
 		}
 
-		/* schedule() gibt den unveraenderten Kontext zurueck, wenn kein Task
-		*  mehr lauffaehig ist. Dann gibt es nichts, wohin der iret springen
-		*  koennte, ohne die Exception erneut auszuloesen -> anhalten. */
+		/* schedule() returns the unchanged context when no task is runnable
+		*  any more. In that case there is nowhere the iret could jump to
+		*  without triggering the exception again -> halt. */
 		settextcolor(4,0);
-		printf("Kein lauffaehiger Task mehr uebrig - CPU HALT\n");
+		printf("No runnable task left - CPU HALT\n");
 		settextcolor(15,0);
 		dump(r);
 		for(;;);
 	}
 
-	/* Kein Task aktiv: der Kernel selbst ist gestolpert -> Kernel-Panik. */
+	/* No task active: the kernel itself stumbled -> kernel panic. */
 	if (r->int_no < 32)
 	{
 
@@ -216,7 +214,7 @@ void fault_handler(struct regs *r)
 	  printf("----------------------------------------------------------\n");
 	  settextcolor(15,0);
 	  printf("The kernel made a boo-boo and couldn't fix it.\n");
-	  printf("Errorcode %i\nError: %s\n\n", r->err_code, exception_messages[r->int_no]);
+	  printf("Error code %i\nError: %s\n\n", r->err_code, exception_messages[r->int_no]);
 	  printf("PID: %i\n", pid);
 	  printf("CPU HALT\n");
 

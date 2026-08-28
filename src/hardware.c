@@ -346,10 +346,10 @@ int do_amd(void) {
 }
 
 
-/* getRamSize() ist entfallen. Die Funktion ermittelte den Speicher durch
- * destruktives Testschreiben quer durch den Adressraum - sie war die Ursache
- * eines Boot-Haengers und ueberschrieb dabei fremde Bereiche. Den Speicher
- * liefert jetzt die Memory-Map des Bootloaders, siehe pmm_init() in src/pmm.c. */
+/* getRamSize() is gone. The function determined the amount of memory by
+ * destructive test writes across the address space - it was the cause of a
+ * boot hang and overwrote foreign regions while doing so. The memory is now
+ * reported by the bootloader's memory map, see pmm_init() in src/pmm.c. */
 
 void init_serial() {
    outportb(PORT + 1, 0x00);    // Disable all interrupts
@@ -456,8 +456,8 @@ int floppy_detect(char drive)
 
 char *floppy_getDriveType(int num)
 {
-	/* Sechs Eintraege - das Array war frueher als [5] deklariert, wodurch der
-	 * letzte Typ verlorenging. Der Bereichscheck faengt unbekannte Nibbles ab. */
+	/* Six entries - the array used to be declared as [5], which lost the
+	 * last type. The range check catches unknown nibbles. */
 	static char *drive_type[6] = { "no floppy drive",
 							"360kb 5.25in floppy drive",
 							"1.2mb 5.25in floppy drive",

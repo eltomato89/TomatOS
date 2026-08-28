@@ -289,28 +289,28 @@ int printf(char * string, ...)
 }
 
 /* ------------------------------------------------------------------ */
-/* Statusleiste                                                        */
+/* Status bar                                                          */
 /* ------------------------------------------------------------------ */
 
-/* Die Leiste ist die oberste Bildschirmzeile und damit genau 80 Spalten
-*  breit. */
+/* The bar is the topmost line of the screen and therefore exactly 80
+*  columns wide. */
 #define STATUSBAR_WIDTH     80
 
-/* Die Uhr steht rechtsbündig: "hh:mm:ss" belegt acht Spalten ab Spalte 70,
-*  die beiden letzten Spalten bleiben leer (dort stand früher die
-*  Abschlussnull des Zeitstrings, die als Leerzeichen erschien). */
+/* The clock is right aligned: "hh:mm:ss" occupies eight columns starting at
+*  column 70, the last two columns stay empty (they used to hold the
+*  terminating zero of the time string, which showed up as a space). */
 #define STATUSBAR_CLOCK_LEN 8
 #define STATUSBAR_CLOCK_COL (STATUSBAR_WIDTH - 2 - STATUSBAR_CLOCK_LEN)
 
-/* Frames pro Megabyte: 1 MiB / 4 KiB = 256. Die Anzeige rechnet bewusst in
-*  Frames statt in Bytes -- ein Bytewert liefe bei 4 GiB über, die Zahl der
-*  Frames passt immer bequem in 32 Bit. */
+/* Frames per megabyte: 1 MiB / 4 KiB = 256. The display deliberately counts
+*  in frames rather than in bytes -- a byte value would overflow at 4 GiB,
+*  while the number of frames always fits comfortably into 32 bits. */
 #define STATUSBAR_FRAMES_PER_MB (1024 * 1024 / PMM_FRAME_SIZE)
 
-/* Schreibt text mit dem aktuell eingestellten attrib ab Spalte col in die
-*  Leiste und liefert die erste freie Spalte zurück. Was in den Bereich der
-*  Uhr laufen würde, wird verworfen: so kann weder eine lange Zahl noch eine
-*  hohe Taskzahl die Zeile sprengen oder in die nächste überlaufen. */
+/* Writes text with the currently set attrib into the bar starting at column
+*  col and returns the first free column. Anything that would run into the
+*  area of the clock is discarded: that way neither a long number nor a high
+*  task count can blow up the line or overflow into the next one. */
 static int statusbar_puts(int col, const char *text)
 {
 	volatile unsigned short *pos;
@@ -326,8 +326,8 @@ static int statusbar_puts(int col, const char *text)
 	return col;
 }
 
-/* Wie statusbar_puts(), aber für ein einzelnes Zeichen -- gebraucht für den
-*  Aktivitätspunkt 0xFE, der in keinem gewöhnlichen String steht. */
+/* Like statusbar_puts(), but for a single character -- needed for the
+*  activity dot 0xFE, which does not appear in any ordinary string. */
 static int statusbar_putc(int col, unsigned char c)
 {
 	volatile unsigned short *pos;
@@ -357,50 +357,48 @@ void display_update_statusbar()
 	char mem[24];
 	char time[9] = "00:00:00";
 
-	/* Die Uhrzeit vor der kritischen Sektion holen: cmos_readtime() wartet
-	*  unter Umständen auf das Ende eines RTC-Updates und sichert die
-	*  Interrupts bereits selbst ab. Innerhalb unseres cli zu warten würde
-	*  die Sperre unnötig lange halten. */
+	/* Fetch the time before the critical section: cmos_readtime() may wait
+	*  for an RTC update to finish and already guards the interrupts itself.
+	*  Waiting inside our own cli would hold the lock unnecessarily long. */
 	now = cmos_readtime();
 
-	/* EFLAGS sichern und erst dann sperren. Ein bedingungsloses sti am Ende
-	*  würde die Interrupts auch dann einschalten, wenn der Aufrufer sie
-	*  absichtlich gesperrt hatte. Die Sperre selbst ist nötig, weil hier
-	*  direkt in den VGA-Puffer geschrieben wird, während der Konsolen-Task
-	*  dasselbe über putch() tut. */
+	/* Save EFLAGS and only then disable. An unconditional sti at the end
+	*  would enable the interrupts even when the caller had deliberately
+	*  disabled them. The lock itself is necessary because we write directly
+	*  into the VGA buffer here, while the console task does the same via
+	*  putch(). */
 	__asm__ __volatile__ ("pushfl; popl %0; cli" : "=r" (flags) : : "memory");
 
 	org_attrib = attrib;
 
-	/* Kennzahlen und Zahlenformatierung gehören in die kritische Sektion:
-	*  itoa() liefert einen Zeiger auf einen statischen Puffer, den sich
-	*  alle Tasks teilen. */
+	/* The metrics and the number formatting belong inside the critical
+	*  section: itoa() returns a pointer to a static buffer that all tasks
+	*  share. */
 	taskcount = taskmgr_get_taskcount();
 	total_frames = pmm_total_frames();
 	used_frames = pmm_used_frames();
 
 	if(total_frames == 0)
 	{
-		/* Speicherverwaltung noch nicht aufgesetzt -- ehrlicher als eine
-		*  erfundene Zahl. */
+		/* Memory management not set up yet -- more honest than a made up
+		*  number. */
 		strcpy(mem, "n/a");
 	}
 	else
 	{
-		/* Belegt wird aufgerundet, damit eine kleine, aber vorhandene
-		*  Belegung nicht als "0" erscheint; die Gesamtgröße wird
-		*  abgerundet, damit die Leiste nie mehr Speicher verspricht, als
-		*  wirklich da ist. */
+		/* The used amount is rounded up so that a small but existing usage
+		*  does not show up as "0"; the total size is rounded down so that
+		*  the bar never promises more memory than is really there. */
 		strcpy(mem, itoa((int)((used_frames + STATUSBAR_FRAMES_PER_MB - 1)
 		                       / STATUSBAR_FRAMES_PER_MB)));
 		strcat(mem, "/");
-		/* Erst jetzt darf itoa() erneut laufen: der statische Puffer mit
-		*  dem ersten Wert ist oben weggesichert. */
+		/* Only now may itoa() run again: the static buffer holding the
+		*  first value has been copied away above. */
 		strcat(mem, itoa((int)(total_frames / STATUSBAR_FRAMES_PER_MB)));
 		strcat(mem, "mb");
 	}
 
-	/* Hintergrund der ganzen Zeile: schwarze Schrift auf hellgrau. */
+	/* Background of the whole line: black text on light grey. */
 	settextcolor(0x00, 0x7);
 	for(i = 0; i < STATUSBAR_WIDTH; i++)
 	{
@@ -410,15 +408,15 @@ void display_update_statusbar()
 
 	i = 0;
 
-	/* [cpu: .] -- Klammern schwarz, Beschriftung weiß */
+	/* [cpu: .] -- brackets black, label white */
 	i = statusbar_puts(i, "[");
 	settextcolor(15, back);
 	i = statusbar_puts(i, "cpu: ");
-	i = statusbar_putc(i, 0xFE);	/* Aktivitätspunkt, CPU */
+	i = statusbar_putc(i, 0xFE);	/* activity dot, CPU */
 	settextcolor(0x00, 0x7);
 	i = statusbar_puts(i, "] ");
 
-	/* [mem: belegt/gesamt mb] */
+	/* [mem: used/total mb] */
 	i = statusbar_puts(i, "[");
 	settextcolor(15, back);
 	i = statusbar_puts(i, "mem: ");
@@ -426,7 +424,7 @@ void display_update_statusbar()
 	settextcolor(0x00, 0x7);
 	i = statusbar_puts(i, "] ");
 
-	/* [task: ..] -- ein Punkt je laufendem Task */
+	/* [task: ..] -- one dot per running task */
 	i = statusbar_puts(i, "[");
 	settextcolor(15, back);
 	i = statusbar_puts(i, "task: ");
@@ -437,7 +435,7 @@ void display_update_statusbar()
 	settextcolor(0x00, 0x7);
 	i = statusbar_puts(i, "]");
 
-	/* Uhr, rechtsbündig. attrib steht bereits auf schwarz/hellgrau. */
+	/* Clock, right aligned. attrib is already set to black/light grey. */
 	if(now.hours < 10) {
 		time[1] = now.hours + '0';
 	} else {
@@ -467,8 +465,8 @@ void display_update_statusbar()
 
 	attrib = org_attrib;
 
-	/* EFLAGS zurück -- die Interrupts sind danach genau so gesperrt oder
-	*  freigegeben wie beim Eintritt. */
+	/* EFLAGS back -- afterwards the interrupts are disabled or enabled
+	*  exactly as they were on entry. */
 	__asm__ __volatile__ ("pushl %0; popfl" : : "r" (flags) : "memory", "cc");
 }
 

@@ -29,7 +29,7 @@ char *itoa(int val)
 		}
 	}
 
-	ret[stellen] = EOS; /* Ende des Strings (bei 0 beginnen) */
+	ret[stellen] = EOS; /* end of the string (indices start at 0) */
 	
 	for(i = stellen -1; i >= 0; i--)
 	{
@@ -49,10 +49,10 @@ char itoa_single(int val)
 
 int strcmp(const char *str1, const char *str2)
 {
-	/* Uebliche C-Semantik: 0 bei Gleichheit, sonst die Differenz des
-	   ersten abweichenden Zeichens (als unsigned char verglichen).
-	   Frueher lieferte diese Funktion 1 fuer "gleich" und las dabei
-	   ueber das Ende von str2 hinaus. */
+	/* Standard C semantics: 0 on equality, otherwise the difference of the
+	   first differing character (compared as unsigned char).
+	   This function used to return 1 for "equal" and read past the end of
+	   str2 while doing so. */
 	while(*str1 != EOS && *str1 == *str2)
 	{
 		str1++;
@@ -84,8 +84,8 @@ char *	strcat(char *_s1, const char *_s2)
 		_s1[lens1+i] = _s2[i];
 	}
 
-	/* Abschlussnull direkt hinter den angehaengten Text, nicht eine
-	   Position dahinter. */
+	/* Terminating null directly after the appended text, not one position
+	   beyond it. */
 	_s1[lens1+lens2] = EOS;
 
 	return _s1;
@@ -93,9 +93,9 @@ char *	strcat(char *_s1, const char *_s2)
 
 char *hextoa(int val)
 {
-	/* Druckt den Wert selbst (so erwartet es printf("%X") in scrn.c) und
-	   liefert zusaetzlich den erzeugten String zurueck. Der Puffer ist
-	   statisch, damit der Zeiger nach dem Return gueltig bleibt. */
+	/* Prints the value itself (that is what printf("%X") in scrn.c expects)
+	   and additionally returns the generated string. The buffer is static so
+	   that the pointer stays valid after the return. */
 	char hextoa_single(int);
 	static char ret[20];
 	char tmp[20];
@@ -103,11 +103,11 @@ char *hextoa(int val)
 	int i=0;
 	int x=0;
 
-	uval = (unsigned int)val;	/* %X gibt vorzeichenlos aus */
+	uval = (unsigned int)val;	/* %X prints unsigned */
 
 	if(uval == 0)
 	{
-		/* Sonderfall: fuer den Wert 0 kam frueher gar nichts heraus. */
+		/* Special case: the value 0 used to produce no output at all. */
 		tmp[i] = '0';
 		i++;
 	}
@@ -119,7 +119,7 @@ char *hextoa(int val)
 		i++;
 	}
 
-	/* tmp enthaelt die Ziffern rueckwaerts */
+	/* tmp holds the digits in reverse order */
 	while(i > 0)
 	{
 		i--;
@@ -134,7 +134,7 @@ char *hextoa(int val)
 
 char hextoa_single(int val)
 {
-	if(val <= 9) return (char)('0' + val);	/* die 9 fiel frueher durch */
+	if(val <= 9) return (char)('0' + val);	/* the 9 used to fall through */
 
 	switch(val)
 	{
@@ -146,7 +146,7 @@ char hextoa_single(int val)
 		case 15: return 'F';
 	}
 
-	return '?';	/* nicht erreichbar, macht die Funktion aber vollstaendig */
+	return '?';	/* unreachable, but makes the function complete */
 }
 
 int atoi(char* string)
@@ -169,14 +169,14 @@ int atoi(char* string)
 
 char *strsplit(char *str, int num, char delimiter)
 {
-	/* Rueckgabepuffer statisch wie bei itoa(): ein Zeiger auf ein lokales
-	   Array waere nach dem Return ungueltig. */
+	/* Return buffer static as in itoa(): a pointer to a local array would be
+	   invalid after the return. */
 	static char ret[100];
 	int i;
 	int wnum=0;
 	int cnum=0;
 
-	ret[0] = EOS;	/* definiert terminiert, auch wenn nichts gefunden wird */
+	ret[0] = EOS;	/* definitely terminated, even if nothing is found */
 
 	for(i=0; i < (int)strlen(str); i++)
 	{
@@ -221,8 +221,8 @@ int strleft(char *str, char *search)
 
 int strcharcount(char *str, char character)
 {	
-	//gibt die Anzahl bestimmter Buchstaben
-	//in einem String zurück
+	//returns the number of occurrences of a given
+	//character in a string
 	int i;
 	int cnt=0;
 	for(i=0; i <= strlen(str); i++)
@@ -235,13 +235,13 @@ int strcharcount(char *str, char character)
 
 char *replace(char *string, char *oldpiece, char *newpiece)
 {
-	/* Rueckgabepuffer statisch wie bei itoa(): ein Zeiger auf ein lokales
-	   Array waere nach dem Return ungueltig. */
+	/* Return buffer static as in itoa(): a pointer to a local array would be
+	   invalid after the return. */
 	static char retstr[256];
 	int i=0, j=0;
 	int strs=0, stre=-1;
 
-	retstr[0] = EOS;	/* definiert terminiert */
+	retstr[0] = EOS;	/* definitely terminated */
 
 	for(i=0; i <= (int)strlen(string)-1; i++)
 	{
@@ -264,7 +264,7 @@ char *replace(char *string, char *oldpiece, char *newpiece)
 	}
 	if(j != -1)
 	{
-		// es wurde ein string gefunden!
+		// a string was found!
 		
 		j=0;
 		for(i=0; i <= strs-1 && j < (int)sizeof(retstr)-1; i++)
@@ -285,21 +285,21 @@ char *replace(char *string, char *oldpiece, char *newpiece)
 
 	}
 
-	retstr[j] = EOS;	/* j ist der Schreibindex, nicht i */
+	retstr[j] = EOS;	/* j is the write index, not i */
 	return retstr;
 }
 
 char *prmv(int num, char *str)
 {
-	/* Rueckgabepuffer statisch wie bei itoa(): ein Zeiger auf ein lokales
-	   Array waere nach dem Return ungueltig. */
+	/* Return buffer static as in itoa(): a pointer to a local array would be
+	   invalid after the return. */
 	static char ret[100];
 	int i;
 	int wnum=0;
 	int cnum=0;
 
-	/* Wichtig: sofort terminieren. Sonst stuende bei prmv(1, "taskmgr")
-	   noch das Ergebnis des vorigen Aufrufs im Puffer. */
+	/* Important: terminate immediately. Otherwise, for prmv(1, "taskmgr"),
+	   the result of the previous call would still be in the buffer. */
 	ret[0] = EOS;
 
 	for(i=0; i < (int)strlen(str); i++)
