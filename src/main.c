@@ -78,11 +78,53 @@
 #define USER_MSG_ISO_OWN   (USER_PAGE_VIRT + 0x240)
 #define USER_MSG_ISO_LOST  (USER_PAGE_VIRT + 0x280)
 
-/* Pages of kernel text that user_setup() opens for ring 3, counted from the
-   page a ring 3 routine starts in. Each of them is well under 4 KiB long, so
-   it fits in one page and can at worst straddle one boundary -- two pages
-   cover it either way. */
-#define USER_TEXT_PAGES  2
+/* The ring 3 code, as the linker laid it out.
+*
+*  Every routine that executes with CPL 3 carries USER_TEXT below and is
+*  therefore linked into the .usertext section, which linker.ld gives an
+*  output section of its own with these two symbols around it, page aligned at
+*  both ends. The section is the unit of the whole exercise: user_setup()
+*  copies exactly this range into frames of its own and maps only those for
+*  ring 3, so no page of kernel .text is ever opened.
+*
+*  A linker symbol IS the address, hence the array declaration -- see the same
+*  trick on kernel_end in pmm.c. */
+extern char usertext_start[];
+extern char usertext_end[];
+
+/* Puts a function into the ring 3 code section. Applied to every routine that
+*  runs at CPL 3, and to nothing else: whatever carries this becomes readable
+*  and executable from ring 3, so the section has to stay exactly as large as
+*  the set of routines that need it. */
+#define USER_TEXT __attribute__((section(".usertext")))
+
+/* Where the copy of that section is mapped.
+*
+*  The address is in the kernel quarter rather than down next to the string
+*  page, and that is not a matter of taste. A ring 3 task runs in an address
+*  space of its own from its very first instruction, and vmm_create_space()
+*  zeroes the private 768 directory entries of a fresh space -- so a mapping
+*  below KERNEL_VIRTUAL_BASE made here, in the shell's space, simply is not
+*  there when the task starts, and the task would fault on its entry point
+*  before anything could map it. Only the top quarter is copied verbatim into
+*  every new space, so that is where code a task must be able to fetch on its
+*  first instruction has to live. The kernel half of the directory is shared,
+*  which is exactly why one vmm_map() here reaches every task.
+*
+*  What is opened by this is one page table entry per page of .usertext, and
+*  those pages hold ring 3 code and nothing else. The kernel's own text keeps
+*  its supervisor-only mapping.
+*
+*  Chosen 8 MiB below the top of the address space: far above the direct
+*  mapping of RAM (which would have to reach a gigabyte to get here), far
+*  below nothing, and clear of everything the kernel maps. user_text_map()
+*  verifies the range really is free before it uses it. */
+#define USER_TEXT_VIRT   0xFF800000u
+
+/* Upper bound on the size of .usertext, in pages. Two small routines live
+*  there today; the limit exists so a section that unexpectedly grows is
+*  reported instead of silently overrunning the frame table below. */
+#define USER_TEXT_MAX    4
 
 /* A call number that is not in the table, for the SYS_ENOSYS check. Well
    above SYSCALL_MAX, so it stays unassigned when calls are added. */
@@ -189,8 +231,8 @@ static void page_selftest(void);
 static void page_fault_demo(void);
 static void page_check(int ok);
 
-static void user_demo(void);
-static void user_iso_task(void);
+USER_TEXT static void user_demo(void);
+USER_TEXT static void user_iso_task(void);
 static int  user_setup(void);
 static void user_run(void);
 static void user_selftest(void);
@@ -911,10 +953,11 @@ void paging(char *cmd)
               during the call, so nothing may be kept in a register across it.
 
    always_inline is not decoration either. user_demo() below executes with
-   CPL 3, and the only kernel code it may execute is the couple of pages
-   user_setup() opens for it. A real call to an out-of-line sys_call1() would
-   jump out of those pages and fault. Inlining keeps user_demo() one
-   contiguous, call free routine. */
+   CPL 3, and the only code it may execute is the copy of the .usertext
+   section that user_setup() maps for it. A real call to an out-of-line
+   sys_call1() would leave that copy -- and, worse, would be a call to an
+   absolute address that no longer says anything after the copy. Inlining
+   keeps every ring 3 routine self contained. */
 #define USER_INLINE static __inline__ __attribute__((always_inline))
 
 USER_INLINE int sys_call0(int nr)
@@ -962,12 +1005,20 @@ USER_INLINE void u_putuint(unsigned int value)
 	}
 }
 
-/* The demo, and the only routine in this file that runs with CPL 3.
+/* The demo, and one of the two routines in this file that run with CPL 3.
 *
-*  It may touch exactly two things: its own stack, which the task manager maps
-*  one page of for every ring 3 task, and the page at USER_PAGE_VIRT. Every
-*  other page in the system is mapped without PAGE_USER and faults on the
-*  first access from here.
+*  It may touch exactly three things: its own stack, which the task manager
+*  maps one page of for every ring 3 task, the page at USER_PAGE_VIRT, and the
+*  copy of .usertext it is executing out of. Every other page in the system is
+*  mapped without PAGE_USER and faults on the first access from here.
+*
+*  It executes out of that copy, not out of the kernel image, so it has to be
+*  position independent: no absolute reference may leave the section. Calls
+*  between routines in .usertext are relative and therefore fine -- the whole
+*  section is copied as one block -- but a call to anything outside it, or a
+*  pointer to a kernel object taken here, would be an address that means
+*  nothing at the copy's location. See the note on USER_INLINE above; that is
+*  what always_inline on the system call wrappers is for.
 *
 *  That rules out more than the obvious. printf() and putch() are kernel
 *  functions and unreachable. So is every kernel global. And so -- this is the
@@ -994,7 +1045,7 @@ USER_INLINE void u_putuint(unsigned int value)
 *  this task has its own. The shell puts it into this task's space while the
 *  sleep below runs -- SYS_SLEEP needs no memory beyond the stack, so it is
 *  the one call that is safe to make before that has happened. */
-static void user_demo(void)
+USER_TEXT static void user_demo(void)
 {
 	int pid;
 	int before;
@@ -1055,7 +1106,7 @@ static void user_demo(void)
 *  Everything else follows the rules user_demo() lays out: strings come out of
 *  the string page, the routine never returns, and it must not touch a page
 *  before the shell has mapped it -- hence the sleep at the top. */
-static void user_iso_task(void)
+USER_TEXT static void user_iso_task(void)
 {
 	volatile uint32_t *page;
 	unsigned int role;
@@ -1128,7 +1179,129 @@ static void user_store(uint32_t at, char *text)
 	dest[i] = EOS;
 }
 
-/* Prepares everything ring 3 needs, once. Returns 1 when user_demo() can be
+/* The frames the ring 3 code was copied into, and how many are in use. Kept
+*  so that a setup which fails half way can hand back what it already took. */
+static uint32_t user_text_frames[USER_TEXT_MAX];
+static int user_text_pages = 0;
+
+/* Undoes a partial user_text_map(): drops the mappings made so far and gives
+*  the frames behind them back to the pmm. */
+static void user_text_unmap(void)
+{
+	int i;
+
+	for(i = 0; i < user_text_pages; i++)
+	{
+		vmm_unmap((uint32_t)USER_TEXT_VIRT + (uint32_t)i * PAGE_SIZE);
+		pmm_free_frame((void *)user_text_frames[i]);
+		user_text_frames[i] = 0;
+	}
+
+	user_text_pages = 0;
+}
+
+/* Puts the ring 3 code where ring 3 may fetch it, once.
+*
+*  What this does NOT do any more is re-map kernel text with PAGE_USER. That
+*  used to be how ring 3 reached user_demo(), and it was the coarse move in
+*  the whole exercise: a page is the smallest thing paging can talk about, so
+*  whatever else the linker had put next to user_demo() -- kernel code, all of
+*  it -- became readable from ring 3 along with it.
+*
+*  So the ring 3 routines are linked into .usertext instead, that range is
+*  copied into frames of its own through the direct mapping, and only the copy
+*  is mapped for ring 3. The pages that carry it then hold ring 3 code and
+*  nothing else, and not one page of kernel .text is user accessible.
+*
+*  The flags are PAGE_PRESENT | PAGE_USER, deliberately without PAGE_WRITE:
+*  read and execute, no write. Ring 3 cannot patch its own code, and neither
+*  can the kernel through this address -- the writable view is the direct
+*  mapping used for the copy, which no ring 3 task can reach.
+*
+*  Since the code is fetched from the copy, the routines run at an address
+*  they were not linked for. That is what the position independence rule in
+*  the comment on user_demo() is about, and what makes user_text_entry()
+*  necessary below. */
+static int user_text_map(void)
+{
+	uint32_t bytes;
+	uint32_t virt;
+	uint32_t frame;
+	int pages;
+	int i;
+
+	/* Page aligned at both ends by the linker script, so the division is
+	*  exact and the copy below never touches a neighbouring section. */
+	bytes = (uint32_t)usertext_end - (uint32_t)usertext_start;
+	pages = (int)(bytes / (uint32_t)PAGE_SIZE);
+
+	if(pages <= 0 || pages > USER_TEXT_MAX)
+	{
+		printf("user: .usertext spans %i pages, which is not between 1 and %i.\n",
+		       pages, USER_TEXT_MAX);
+		return 0;
+	}
+
+	for(i = 0; i < pages; i++)
+	{
+		virt = (uint32_t)USER_TEXT_VIRT + (uint32_t)i * PAGE_SIZE;
+
+		/* The address is a fixed constant, so it is checked rather than
+		*  assumed: anything already living there would be overwritten. */
+		if(vmm_is_mapped(virt))
+		{
+			printf("user: ");
+			page_print_hex(virt, 8);
+			printf(" is taken, the ring 3 code has nowhere to go.\n");
+			user_text_unmap();
+			return 0;
+		}
+
+		frame = (uint32_t)pmm_alloc_frame();
+		if(frame == 0)
+		{
+			printf("user: no free frame for the ring 3 code.\n");
+			user_text_unmap();
+			return 0;
+		}
+
+		/* Through the direct mapping, i.e. the kernel's own writable view
+		*  of the frame. The user mapping created right after is read only,
+		*  so this is the only moment the page is ever written. */
+		memcpy(P2V(frame), usertext_start + (uint32_t)i * PAGE_SIZE,
+		       (size_t)PAGE_SIZE);
+
+		if(vmm_map(virt, frame, PAGE_PRESENT | PAGE_USER) != 0)
+		{
+			pmm_free_frame((void *)frame);
+			printf("user: the ring 3 code page at ");
+			page_print_hex(virt, 8);
+			printf(" could not be mapped.\n");
+			user_text_unmap();
+			return 0;
+		}
+
+		user_text_frames[i] = frame;
+		user_text_pages = i + 1;
+	}
+
+	return 1;
+}
+
+/* Where a ring 3 routine ended up in the user mapping.
+*
+*  The routines are linked into .usertext but executed from the copy, so the
+*  linked address of user_demo() is not the address to start a task at. What
+*  survives the copy is the routine's OFFSET inside the section -- the copy is
+*  the section, byte for byte -- so the entry point is that offset added to
+*  where the copy is mapped. */
+static void *user_text_entry(void *fn)
+{
+	return (void *)((uint32_t)USER_TEXT_VIRT +
+	                ((uint32_t)fn - (uint32_t)usertext_start));
+}
+
+/* Prepares everything ring 3 needs, once. Returns 1 when the demo can be
 *  entered, 0 otherwise.
 *
 *  Two mappings are involved, opened for quite different reasons:
@@ -1138,47 +1311,13 @@ static void user_store(uint32_t at, char *text)
 *      zeroed first: the pmm hands out frames with the previous owner's
 *      contents still in them, and ring 3 is about to be able to read them.
 *
-*    - the kernel text pages holding user_demo(), re-mapped with PAGE_USER
-*      added so ring 3 can fetch those instructions. They stay without
-*      PAGE_WRITE, so this grants read and execute, not write.
+*    - the copy of .usertext at USER_TEXT_VIRT, present and PAGE_USER but not
+*      writable, so ring 3 can fetch its own instructions. See
+*      user_text_map().
 *
-*  That second mapping is the coarse move in the whole exercise and is worth
-*  naming rather than hiding: a page is the smallest thing paging can talk
-*  about, so whatever else the linker put next to user_demo() becomes readable
-*  from ring 3 as well. A grown-up kernel links user code into a section of its
-*  own and maps only that. What is deliberately *not* opened is .rodata -- the
-*  strings stay in the user page precisely so this stays a text-only exception. */
-/* Opens the pages holding one ring 3 routine for CPL 3. Called once per such
-*  routine, because the linker is free to place them anywhere in .text -- two
-*  functions next to each other in this file need not end up in the same page,
-*  and overlapping calls simply re-write the same entry with the same flags.
-*
-*  Kernel text sits above KERNEL_VIRTUAL_BASE, i.e. in the quarter every
-*  address space shares, so one vmm_map() here is visible to every task. */
-static int user_open_text(uint32_t addr)
-{
-	uint32_t page;
-	uint32_t phys;
-	int i;
-
-	page = addr & ~((uint32_t)PAGE_SIZE - 1);
-
-	for(i = 0; i < USER_TEXT_PAGES; i++)
-	{
-		phys = vmm_get_phys(page);
-		if(phys == 0 || vmm_map(page, phys, PAGE_PRESENT | PAGE_USER) != 0)
-		{
-			printf("user: kernel text at ");
-			page_print_hex(page, 8);
-			printf(" could not be opened for ring 3.\n");
-			return 0;
-		}
-		page += PAGE_SIZE;
-	}
-
-	return 1;
-}
-
+*  What is deliberately *not* opened is anything else: not .text, not .rodata.
+*  The strings live in the user page precisely so that the code exception
+*  stays an exception about code. */
 static int user_setup(void)
 {
 	if(user_page_ready) return 1;
@@ -1220,8 +1359,7 @@ static int user_setup(void)
 	user_store(USER_MSG_ISO_OWN,   " -- own values throughout\n");
 	user_store(USER_MSG_ISO_LOST,  " -- CLOBBERED, the page is shared!\n");
 
-	if(!user_open_text((uint32_t)user_demo)) return 0;
-	if(!user_open_text((uint32_t)user_iso_task)) return 0;
+	if(!user_text_map()) return 0;
 
 	user_page_ready = 1;
 	return 1;
@@ -1379,15 +1517,17 @@ static void user_run(void)
 
 	printf("Ring 3 demo:\n");
 	printf("  Entry:   ");
-	page_print_hex((uint32_t)user_demo, 8);
-	printf("  kernel text, opened for ring 3\n");
+	page_print_hex((uint32_t)user_text_entry((void *)user_demo), 8);
+	printf("  a copy of .usertext, %i page(s), no kernel code in them\n",
+	       user_text_pages);
 	printf("  Strings: ");
 	page_print_hex((uint32_t)USER_PAGE_VIRT, 8);
 	printf("  user page, writable here, read only in the task\n");
 
 	before = syscall_count();
 
-	pid = taskmgr_add_user_task(user_demo, "Ring 3 Demo", TASK_PRIORITY_NORMAL);
+	pid = taskmgr_add_user_task(user_text_entry((void *)user_demo),
+	                            "Ring 3 Demo", TASK_PRIORITY_NORMAL);
 	if(pid < 0) return;
 
 	user_watch_arm(0, pid);
@@ -1644,10 +1784,10 @@ static void user_isolation(void)
 	page_b[USER_ISO_ROLE] = 1;
 	page_b[USER_ISO_VALUE] = (uint32_t)USER_ISO_VALUE_B;
 
-	pid_a = taskmgr_add_user_task(user_iso_task, "Ring 3 Isolation A",
-	                              TASK_PRIORITY_NORMAL);
-	pid_b = taskmgr_add_user_task(user_iso_task, "Ring 3 Isolation B",
-	                              TASK_PRIORITY_NORMAL);
+	pid_a = taskmgr_add_user_task(user_text_entry((void *)user_iso_task),
+	                              "Ring 3 Isolation A", TASK_PRIORITY_NORMAL);
+	pid_b = taskmgr_add_user_task(user_text_entry((void *)user_iso_task),
+	                              "Ring 3 Isolation B", TASK_PRIORITY_NORMAL);
 	if(pid_a < 0 || pid_b < 0)
 	{
 		if(pid_a >= 0) taskmgr_task_abort(pid_a, 0, "isolation test not started");
@@ -1800,8 +1940,8 @@ static void user_isolation(void)
 	printf("  One page was tested, the quarter above ");
 	page_print_hex((uint32_t)KERNEL_VIRTUAL_BASE, 8);
 	printf(" is shared by\n");
-	printf("  design, and both tasks are kernel routines opened for ring 3\n");
-	printf("  rather than programs loaded from anywhere.\n");
+	printf("  design, and both tasks run a copy of .usertext rather than a\n");
+	printf("  program loaded from anywhere.\n");
 }
 
 void usermode(char *cmd)

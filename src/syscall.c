@@ -61,19 +61,38 @@ typedef int (*syscall_fn)(struct regs *r);
 *  is what makes the question well posed at all now that tasks no longer
 *  share one directory.
 *
-*  Three rules, and each of them exists because of a concrete attack:
+*  Three rules. The first and the last are the ones that decide the answer
+*  today; the middle one is the one that no longer has to, and says below why
+*  it is kept regardless:
 *    - address zero and the rest of the first page are rejected outright.
 *      Page zero is deliberately never mapped (see vmm.h), so a null pointer
 *      would fault anyway -- but faulting inside the kernel with a user
 *      pointer is precisely what we are trying not to do.
-*    - anything at or above KERNEL_VIRTUAL_BASE belongs to the kernel. This
-*      is not redundant with the permission test below, tempting as that
-*      sounds: the upper quarter of the directory is shared by every address
-*      space and it is not entirely free of PAGE_USER, because user_setup()
-*      in main.c opens the kernel text pages around user_demo() to ring 3 so
-*      that the demo can be executed where it was linked. Those pages pass a
-*      PAGE_USER test. Without this line, a pointer into one of them would
-*      let ring 3 have SYS_WRITE read kernel memory out loud.
+*    - anything at or above KERNEL_VIRTUAL_BASE belongs to the kernel and is
+*      turned down on sight. This used to be load bearing in the plainest
+*      possible way: the kernel half is shared by every address space, and it
+*      was not free of PAGE_USER, because main.c opened the kernel text pages
+*      around the ring 3 demo so the demo could be executed where it was
+*      linked. Those pages passed a PAGE_USER test, and without this line a
+*      pointer into one of them would have let ring 3 have SYS_WRITE read
+*      kernel memory out loud. That is over: the ring 3 code lives in its own
+*      section now and is copied into a user page below the line before it is
+*      entered, so no page above KERNEL_VIRTUAL_BASE carries PAGE_USER any
+*      more and the permission test below would already reject a kernel
+*      pointer at the directory entry.
+*
+*      The line stays anyway, and not out of sentiment. vmm_is_user_mapped()
+*      answers what the page tables happen to say; this line states what the
+*      kernel means -- an argument from ring 3 lives in the user half, full
+*      stop. That is a property this file can hold on its own, whereas the
+*      other one is a promise made in main.c and in every future line that
+*      calls vmm_map(). The history above is exactly the case of that promise
+*      being broken, and the cost of not trusting it is one compare on a path
+*      that is about to walk two levels of page tables anyway. It also keeps
+*      the pointer arithmetic honest: with addr below 0xC0000000, addr plus a
+*      length of at most SYS_WRITE_MAX cannot wrap around the end of the
+*      address space, so user_string_len() may walk a string upwards without
+*      a separate overflow check.
 *    - the page must be present *and* carry PAGE_USER in both the directory
 *      entry and the table entry, which is exactly what vmm_is_user_mapped()
 *      reports. Mere presence is the weaker question and no longer the
@@ -331,13 +350,15 @@ uint32_t syscall_count(void)
 	return syscall_calls;
 }
 
-/* Installs the gate for vector 0x80. The flags byte is 0xEE, not the 0x8E
-*  every other vector uses: bits 6-5 are the DPL, and 0xEE sets them to 3.
-*  Without that, "int 0x80" from ring 3 raises a general protection fault
-*  instead of entering the kernel, because the CPU compares the caller's CPL
-*  against the gate's DPL.
+/* Installs the gate for vector 0x80. The flags byte is 0xEF where every other
+*  vector uses 0x8E, and the two differences are worth reading separately.
 *
-*  It is a *trap* gate (type 0xF), not an interrupt gate. An interrupt gate
+*  Bits 6-5 are the DPL, and 0xEF sets them to 3. Without that, "int 0x80"
+*  from ring 3 raises a general protection fault instead of entering the
+*  kernel, because the CPU compares the caller's CPL against the gate's DPL.
+*
+*  The low nibble makes it a *trap* gate (type 0xF), not an interrupt gate
+*  (type 0xE) as every other vector installs. An interrupt gate
 *  clears IF on entry, which would break SYS_SLEEP outright: timer_wait()
 *  waits for timer_ticks to advance, but the timer IRQ that advances it can
 *  never be delivered while interrupts are masked, and ring 3 cannot sti
@@ -350,9 +371,10 @@ uint32_t syscall_count(void)
 *  are worth keeping apart.
 *
 *  The mapping itself does not. Everything user_byte_ok() lets through lies
-*  below KERNEL_VIRTUAL_BASE, i.e. in the private three quarters of the
-*  caller's own directory, and the only ring 3 code that edits that half is
-*  the caller -- which is parked inside this system call and not running. A
+*  below KERNEL_VIRTUAL_BASE -- its range check says so outright, without
+*  having to know what anyone mapped -- i.e. in the private three quarters of
+*  the caller's own directory, and the only ring 3 code that edits that half
+*  is the caller, which is parked inside this system call and not running. A
 *  task that preempts us edits its own space. While all tasks shared one
 *  directory this was a genuine race; per-task spaces closed it, and that,
 *  not the pointer checks by themselves, is where the isolation comes from.

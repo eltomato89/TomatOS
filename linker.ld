@@ -68,6 +68,36 @@ SECTIONS
         text_end = .;
     }
 
+    /* Ring 3 code.
+     *
+     * Everything that executes with CPL 3 is put here by
+     * __attribute__((section(".usertext"))) in the C source, so that the
+     * whole set of such routines forms ONE contiguous, whole-page range that
+     * can be handed to ring 3 on its own. The kernel copies this range into
+     * frames of its own at boot-up of the demo and maps only the copy with
+     * PAGE_USER -- no page of kernel .text is ever opened to ring 3, and no
+     * unrelated code shares a page with the ring 3 routines.
+     *
+     * Two properties matter and both are produced here:
+     *
+     *   - the range is page aligned at BOTH ends, so a whole number of pages
+     *     covers it exactly. ALIGN(4K) on the output section only fixes the
+     *     start; the explicit ". = ALIGN(4K)" before usertext_end pads the
+     *     tail, the same trap that .text above documents.
+     *
+     *   - the routines end up next to each other, so a call between two of
+     *     them is a relative one and survives being copied elsewhere. What
+     *     must not appear in here is an absolute reference to anything
+     *     outside the section; "objdump -r" over the object file is the
+     *     check, and it has to come back empty for .usertext. */
+    .usertext ALIGN(4K) : AT(ADDR(.usertext) - KERNEL_VIRTUAL_BASE)
+    {
+        usertext_start = .;
+        *(.usertext .usertext.*)
+        . = ALIGN(4K);
+        usertext_end = .;
+    }
+
     /* Read-only data. Same padding rule as .text: the range is a candidate
      * for a read-only mapping of its own. */
     .rodata ALIGN(4K) : AT(ADDR(.rodata) - KERNEL_VIRTUAL_BASE)
@@ -124,6 +154,8 @@ SECTIONS
     kernel_end_phys   = kernel_end   - KERNEL_VIRTUAL_BASE;
     text_start_phys   = text_start   - KERNEL_VIRTUAL_BASE;
     text_end_phys     = text_end     - KERNEL_VIRTUAL_BASE;
+    usertext_start_phys = usertext_start - KERNEL_VIRTUAL_BASE;
+    usertext_end_phys   = usertext_end   - KERNEL_VIRTUAL_BASE;
     rodata_start_phys = rodata_start - KERNEL_VIRTUAL_BASE;
     rodata_end_phys   = rodata_end   - KERNEL_VIRTUAL_BASE;
     data_start_phys   = data_start   - KERNEL_VIRTUAL_BASE;
