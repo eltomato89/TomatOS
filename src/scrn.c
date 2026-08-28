@@ -19,6 +19,46 @@ volatile unsigned short *textmemptr;
 int attrib = 0x0F;
 int csr_x = 0, csr_y = 0;
 
+/* --- The console lock -----------------------------------------------------
+*
+*  The screen is shared: the console task writes through putch(), the status
+*  bar task writes into row 0 directly, and any ring 3 task can reach it
+*  through SYS_WRITE. All of them touch the same csr_x/csr_y/attrib and the
+*  same VGA buffer, and none of that is atomic.
+*
+*  The visible symptom was duplicated lines. scroll() moves 24 rows with a
+*  memcpy; a timer tick landing inside it lets the status bar task write row
+*  0, and when the memcpy resumes it copies over a screen that has changed
+*  underneath it. The same race scrambles the cursor when two tasks print at
+*  once, which became reachable the moment two ring 3 tasks could each call
+*  SYS_WRITE.
+*
+*  On a single processor, masking interrupts is the lock: nothing else can
+*  run while they are off. Saving EFLAGS rather than ending with sti makes
+*  it safe to nest -- printf() takes it, calls puts(), which calls putch(),
+*  and each inner release restores "still masked" instead of switching
+*  interrupts back on halfway through a line.
+*
+*  Held only for the length of one output call, which is microseconds; long
+*  enough to matter would mean a single printf() of many hundreds of
+*  characters, and there is none.
+*
+*  It protects the static scratch buffers on the way, too: itoa() and
+*  hextoa() in str.c hand back pointers into one static array each, so two
+*  tasks formatting a number at once would otherwise read each other's
+*  digits. */
+static unsigned int console_lock(void)
+{
+	unsigned int flags;
+	__asm__ __volatile__ ("pushfl; popl %0; cli" : "=r" (flags) : : "memory");
+	return flags;
+}
+
+static void console_unlock(unsigned int flags)
+{
+	__asm__ __volatile__ ("pushl %0; popfl" : : "r" (flags) : "memory", "cc");
+}
+
 /* Scrolls the screen */
 void scroll(void)
 {
@@ -75,7 +115,10 @@ void cls(void)
 {
     unsigned blank;
     int i;
+    unsigned int flags;
     int printf(char * string, ...);
+
+    flags = console_lock();
 
     /* Again, we need the 'short' that will be used to
     *  represent a space with color */
@@ -91,14 +134,19 @@ void cls(void)
     csr_x = 0;
     csr_y = 0;
     move_csr();
-    
+
+    console_unlock(flags);
 }
 
 /* Puts a single character on the screen */
 void putch(unsigned char c)
 {
     volatile unsigned short *where;
-    unsigned att = attrib << 8;
+    unsigned att;
+    unsigned int flags;
+
+    flags = console_lock();
+    att = attrib << 8;
 
     /* Handle a backspace, by moving the cursor back one space */
     if(c == 0x08)
@@ -147,18 +195,28 @@ void putch(unsigned char c)
     /* Scroll the screen if needed, and finally move the cursor */
     scroll();
     move_csr();
-	
+
+    console_unlock(flags);
 }
 
 /* Uses the above routine to output a string... */
 void puts(char *text)
 {
     int i;
+    int len;
+    unsigned int flags;
 
-    for (i = 0; i < strlen(text); i++)
+    /* Taken around the whole string, not just each character: otherwise a
+    *  second task can slip its own output between two letters of this one.
+    *  putch() takes the lock again inside, which is why saving EFLAGS
+    *  rather than ending with sti matters. */
+    flags = console_lock();
+    len = (int)strlen(text);
+    for (i = 0; i < len; i++)
     {
         putch(text[i]);
     }
+    console_unlock(flags);
 }
 
 /* Sets the forecolor and backcolor that we will use */
@@ -187,8 +245,15 @@ int printf(char * string, ...)
   int tmp;
   unsigned char uc;
   unsigned char uc2;
+  unsigned int flags;
 
 	va_list argptr;
+
+	/* One printf() is one unit of output. Without this, a timer tick between
+	*  two conversions lets another task print into the middle of the line -
+	*  and the static buffers itoa() and hextoa() return would be shared
+	*  while both are mid-format. */
+	flags = console_lock();
 	va_start(argptr, string);
 		
 	stringlen = (int)strlen(string);
@@ -293,8 +358,8 @@ int printf(char * string, ...)
   }
 
 	va_end(argptr);
-	
-	
+
+	console_unlock(flags);
 	return 0;
 }
 
