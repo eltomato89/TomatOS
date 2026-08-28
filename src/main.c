@@ -36,7 +36,7 @@ void main()
 	
 	int i;
     printf("eltomato's TomatOS 0.31 [Version 0.31 Build 2011/27/09]\n");
-    printf("(c) Copyright 2006-2011 Jens Köhler\n\n");
+    printf("(c) Copyright 2006-2011 Jens KÃ¶hler\n\n");
 	
 	taskmgr_task_start(taskmgr_add_task( update_infobar, "Statusbar Update Task", TASK_PRIORITY_HIGH ));
 	//taskmgr_task_start(taskmgr_add_task( task, "Test Task", TASK_PRIORITY_LOW ));
@@ -58,7 +58,7 @@ void main()
 	//taskmgr_killall();
 	
 	cls();
-	printf("Sie können den Computer jetzt ausschalten!");
+	printf("Sie kÃ¶nnen den Computer jetzt ausschalten!");
 }
 /*
 void network_test(char *cmd)
@@ -81,7 +81,7 @@ void taskmanager(char *cmd)
 		printf("\t-l        Tasks auflisten\n");
 		printf("\t-k PID    Task beenden\n");
 		printf("\t-s PID    Task anhalten\n");
-		printf("\t-r PID    Task fortführen\n");
+		printf("\t-r PID    Task fortfÃ¼hren\n");
 	}
 	
 	if(strcmp(prmv(1, cmd), "-l")) //List tasks
@@ -123,5 +123,5 @@ void taskmanager(char *cmd)
 void help(char *cmd)
 {
 	printf("TomatOS Help\n");
-	printf("Verfügbare Befehle: taskmgr");
+	printf("VerfÃ¼gbare Befehle: taskmgr");
 }

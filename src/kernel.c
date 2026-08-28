@@ -1,5 +1,5 @@
 /* TomatOS - v0.1 pre Alpha
-*  By:   Jens Köhler (eltomato@googlemail.com)
+*  By:   Jens KÃ¶hler (eltomato@googlemail.com)
 *  Desc: C Code entry
 *
 *  Notes: No warranty expressed or implied. Use at own risk.

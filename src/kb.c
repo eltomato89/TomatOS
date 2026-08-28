@@ -1,5 +1,5 @@
 /* TomatOS - v0.1 pre Alpha
-*  By:   Jens Köhler (eltomato@googlemail.com)
+*  By:   Jens KÃ¶hler (eltomato@googlemail.com)
 *  Desc: Keyboard driver
 *
 *  Notes: No warranty expressed or implied. Use at own risk.
@@ -13,13 +13,13 @@
 unsigned char kbdde_s[128] =
 {
     0,  27, '1', '2', '3', '4', '5', '6', '7', '8',	/* 9 */
-  '9', '0', 223 /* ß */, '´', '\b',	/* Backspace */
+  '9', '0', 223 /* ÃŸ */, 'Â´', '\b',	/* Backspace */
   '\t',			/* Tab */
   'q', 'w', 'e', 'r',	/* 19 */
-  't', 'z', 'u', 'i', 'o', 'p', 252 /* ü */, '+', '\n',		/* Enter key */
+  't', 'z', 'u', 'i', 'o', 'p', 252 /* Ã¼ */, '+', '\n',		/* Enter key */
     0,			/* 29   - Control */
-  'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', 246 /* ö */,	/* 39 */
- 228/* ä */, '^',   0,		/* Left shift */
+  'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', 246 /* Ã¶ */,	/* 39 */
+ 228/* Ã¤ */, '^',   0,		/* Left shift */
  '#', 'y', 'x', 'c', 'v', 'b', 'n',			/* 49 */
   'm', ',', '.', '-',   0,					/* Right shift */
   '*',
@@ -51,14 +51,14 @@ unsigned char kbdde_s[128] =
 };
 unsigned char kbdde_b[128] =
 {
-    0,  27, '!', '\"', '§', '$', '%', '&', '/', '(',	/* 9 */
-  ')', '=', 223 /* ß */, '`', '\b',	/* Backspace */
+    0,  27, '!', '\"', 'Â§', '$', '%', '&', '/', '(',	/* 9 */
+  ')', '=', 223 /* ÃŸ */, '`', '\b',	/* Backspace */
   '\t',			/* Tab */
   'Q', 'W', 'E', 'R',	/* 19 */
-  'T', 'Z', 'U', 'I', 'O', 'P', 252 /* ü */, '*', '\n',		/* Enter key */
+  'T', 'Z', 'U', 'I', 'O', 'P', 252 /* Ã¼ */, '*', '\n',		/* Enter key */
     0,			/* 29   - Control */
-  'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', 246 /* ö */,	/* 39 */
- 228/* ä */, '°',   0,		/* Left shift */
+  'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', 246 /* Ã¶ */,	/* 39 */
+ 228/* Ã¤ */, 'Â°',   0,		/* Left shift */
  0x27, 'Y', 'X', 'C', 'V', 'B', 'N',			/* 49 */
   'M', ';', ':', '_',   0,					/* Right shift */
   '*',

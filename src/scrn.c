@@ -229,27 +229,27 @@ int printf(char * string, ...)
       {
         switch(string[i])
         {
-          case 'Ä':
+          case 'Ã„':
             printf("\x8E");
             break;
-          case 'ä':
+          case 'Ã¤':
             printf("\x84");
             break;
-          case 'Ö':
+          case 'Ã–':
             printf("\x99");
             break;
-          case 'ö':
+          case 'Ã¶':
             printf("\x94");
             break;
             
-          case 'Ü':
+          case 'Ãœ':
             printf("\x9A");
             break;
-          case 'ü':
+          case 'Ã¼':
             printf("\x81");
             break;
             
-          case 'ß':
+          case 'ÃŸ':
             printf("\xE1");
             break;
           
@@ -298,7 +298,7 @@ void display_update_statusbar()
 	pos = textmemptr + (i++);
 	*pos = '[' | (attrib << 8);
 	
-	settextcolor(15,back); //Weiß
+	settextcolor(15,back); //WeiÃŸ
 	
 	pos = textmemptr + (i++);
 	*pos = 'c' | (attrib << 8);
@@ -324,7 +324,7 @@ void display_update_statusbar()
 	pos = textmemptr + (i++);
 	*pos = '[' | (attrib << 8);
 	
-	settextcolor(15,back); //Weiß
+	settextcolor(15,back); //WeiÃŸ
 	
 	pos = textmemptr + (i++);
 	*pos = 'm' | (attrib << 8);
@@ -354,7 +354,7 @@ void display_update_statusbar()
 	pos = textmemptr + (i++);
 	*pos = '[' | (attrib << 8);
 	
-	settextcolor(15,back); //Weiß
+	settextcolor(15,back); //WeiÃŸ
 	
 	pos = textmemptr + (i++);
 	*pos = 't' | (attrib << 8);

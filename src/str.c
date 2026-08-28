@@ -1,5 +1,5 @@
 /* TomatOS - v0.1 pre Alpha
-*  By:   Jens Köhler (eltomato@googlemail.com)
+*  By:   Jens KÃ¶hler (eltomato@googlemail.com)
 *  Desc: str.c string handling
 *
 *  Notes: No warranty expressed or implied. Use at own risk. */
@@ -214,7 +214,7 @@ int strleft(char *str, char *search)
 int strcharcount(char *str, char character)
 {	
 	//gibt die Anzahl bestimmter Buchstaben
-	//in einem String zurück
+	//in einem String zurÃ¼ck
 	int i;
 	int cnt=0;
 	for(i=0; i <= strlen(str); i++)

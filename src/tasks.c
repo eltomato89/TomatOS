@@ -69,7 +69,7 @@ struct regs* schedule(struct regs* cpu)
 		tasks[current_task].cpu_time = tasks[current_task].priority;
 		
 	
-		//nächsten auszuführenden Task suchen
+		//nÃ¤chsten auszufÃ¼hrenden Task suchen
 		int i;
 		for(i=current_task+1; i <= MAX_TASKS-1; i++)
 		{
@@ -120,7 +120,7 @@ int taskmgr_add_task( void* tfunct, const char *bezeichnung, int prio)
 		}
 	}
 	
-	//Abgebrochene Tasks nur überschreiben, wenn keine freien Tasks-Slots mehr verfügbar sind
+	//Abgebrochene Tasks nur Ã¼berschreiben, wenn keine freien Tasks-Slots mehr verfÃ¼gbar sind
 	for(i=0; i <= MAX_TASKS-1; i++)
 	{
 		if(tasks[i].state == TASK_STATE_ABORTED)
