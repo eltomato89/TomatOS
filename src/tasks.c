@@ -260,7 +260,13 @@ struct regs* init_task(uint8_t* stack, void* entry)
 *  The frame itself still sits on the KERNEL stack, not on the user one: it is
 *  consumed by an iret that executes in ring 0, and once that iret has popped
 *  all 19 words the kernel stack is empty again, with esp back at exactly the
-*  esp0 the TSS hands out. */
+*  esp0 the TSS hands out.
+*
+*  entry may be 0, meaning "not known yet": the caller is about to load a
+*  program into the task's address space and will only then know where it
+*  begins. Everything else about the frame is complete, eip alone stays open
+*  until taskmgr_task_set_entry() fills it in. Nothing can run in that state -
+*  the task is suspended, and taskmgr_task_start() refuses it. */
 static struct regs* init_user_task(uint8_t* kstack, void* entry, uint32_t user_esp)
 {
     struct regs new_state = {
@@ -472,6 +478,14 @@ int taskmgr_add_task( void* tfunct, const char *name, int prio)
 //priorities as taskmgr_add_task(), it only differs in what the task gets: an
 //address space of its own, a user stack inside it, and an initial context
 //that iret drops into ring 3.
+//
+//tfunct may be 0. That is the case of a program that is not in memory yet:
+//there is no entry point to name before the image has been parsed, and the
+//image cannot be placed before the address space it goes into exists. The
+//task is therefore built complete except for eip, the caller asks for the
+//space with taskmgr_task_space(), maps the program into it, and hands over
+//the entry point with taskmgr_task_set_entry(). Since every task is created
+//suspended, none of this is observable from outside.
 int taskmgr_add_user_task( void* tfunct, const char *name, int prio)
 {
 	uint32_t    user_esp;
@@ -562,6 +576,59 @@ int taskmgr_get_currpid()
 	return current_task;
 }
 
+//The address space a task runs in, or 0 when there is none to hand out: an
+//invalid pid, or a task that runs in the kernel space. Both cases collapse
+//into the same answer on purpose, because task_space[] already uses 0 for
+//"the kernel space" and 0 is never a valid directory - the pmm does not hand
+//out frame zero.
+//
+//This is the read side of the split that lets a program be placed into a task
+//before the task runs: taskmgr_add_user_task() builds the space, the caller
+//maps into it through vmm_map_in(), and taskmgr_task_set_entry() closes the
+//context afterwards. The space stays owned by the task manager; it is
+//released with the slot in task_space_release() and must not be destroyed by
+//the caller.
+addrspace_t taskmgr_task_space(int pid)
+{
+	if(pid < 0 || pid > MAX_TASKS-1) return 0;
+
+	return task_space[pid];
+}
+
+//Fills in the entry point of a task that has not started yet, i.e. the eip of
+//its saved context. Returns 0 on success and a negative value otherwise.
+//
+//Writing into a saved struct regs from the outside is only ever safe while the
+//task is standing still, so the conditions are deliberately narrow:
+//
+//  - the pid names a slot and that slot has a context at all. task_states[] is
+//    0 for a slot that was never used, and dereferencing it would write into
+//    whatever lies at address 0 - which is not mapped, so it would fault, but
+//    a refusal says more than a page fault does.
+//  - the task is suspended. That is the state every task is created in and the
+//    one it stays in until taskmgr_task_start(), so it is exactly the window
+//    in which no CPU is looking at the frame. A running task would have its
+//    context overwritten from the kernel stack on the next interrupt anyway,
+//    and an aborted one is on its way out.
+//  - entry is not 0. Zero is the "not known yet" marker itself, so accepting
+//    it would only re-arm the very trap taskmgr_task_start() guards against.
+//
+//This does not check that entry is actually mapped in the task's space. It
+//cannot, in general: the caller may well map the image only afterwards, and
+//the mapping lives in a foreign directory. An unmapped entry ends in a page
+//fault at that address in ring 3, which the fault handler reports with CR2.
+int taskmgr_task_set_entry(int pid, uint32_t entry)
+{
+	if(pid < 0 || pid > MAX_TASKS-1) return -1;
+	if(task_states[pid] == 0) return -1;
+	if(tasks[pid].state != TASK_STATE_SUSPENDED) return -1;
+	if(entry == 0) return -1;
+
+	task_states[pid]->eip = entry;
+
+	return 0;
+}
+
 void taskmgr_task_abort(int pid, int error_number, const char *error_descr)
 {
 	if(pid < 0 || pid > MAX_TASKS-1)
@@ -583,11 +650,36 @@ void taskmgr_task_abort(int pid, int error_number, const char *error_descr)
 	}
 }
 
+//Makes a task eligible for the scheduler. This is the one place where the
+//"entry point not known yet" state of taskmgr_add_user_task() is caught: a
+//task whose saved eip is still 0 would be dispatched into a jump to virtual
+//address 0, an address that is deliberately never mapped in any space. The
+//page fault handler would name it, but a refusal here is both earlier and
+//clearer - it says which task was never given an entry point, instead of
+//reporting a fault after the fact.
+//
+//The check belongs here rather than in schedule(): this runs in task context
+//where printf() is allowed, it is the moment the decision is actually made,
+//and the scheduler stays free of anything it does not strictly need. A task
+//that is refused simply stays suspended, so nothing is left half started.
+//
+//task_states[pid] is checked on the way, because a slot that was never used
+//has none and reading eip through a null pointer would fault. That also makes
+//the existing shell path - "start <number>" with a number typed by the user -
+//safe against a pid that names an empty slot.
 void taskmgr_task_start(int pid)
 {
 	if(pid < 0 || pid > MAX_TASKS-1)
 	{
 		printf("ERR: Task %i could not be found!\n", pid);
+	} else
+	if(task_states[pid] == 0)
+	{
+		printf("ERR: Task %i has no saved context and can not be started!\n", pid);
+	} else
+	if(task_states[pid]->eip == 0)
+	{
+		printf("ERR: Task %i has no entry point and can not be started!\n", pid);
 	} else {
 		tasks[pid].state = TASK_STATE_RUNNING;
 	}

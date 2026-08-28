@@ -41,6 +41,16 @@ typedef struct
     uint32_t type;
 } __attribute__((packed)) multiboot_mmap_entry;
 
+/* A module the bootloader loaded alongside the kernel. GRUB puts one of
+*  these per "module" line in grub.cfg. Addresses are PHYSICAL. */
+typedef struct
+{
+    uint32_t mod_start;
+    uint32_t mod_end;
+    uint32_t cmdline;      /* physical address of a NUL terminated string */
+    uint32_t reserved;
+} __attribute__((packed)) multiboot_module;
+
 typedef struct
 {
     uint32_t flags;

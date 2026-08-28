@@ -9,6 +9,7 @@
 #include <mm.h>
 #include <vmm.h>
 #include <syscall.h>
+#include <exec.h>
 //#include <wmessages.h>
 
 #define NULL 0
@@ -198,6 +199,23 @@ extern char usertext_end[];
 *  begins this wait at most 300 ms into that. */
 #define USER_ISO_WAIT    1200
 
+/* --- programs ----------------------------------------------------------- */
+
+/* Column widths of the tables "ps" prints. printf() has no field widths, so
+*  every column is padded by hand -- see mem_print_right() for the numbers and
+*  ps_print_left() for the names. A name column of 20 leaves room for the
+*  module names a "module" line in grub.cfg realistically carries and still
+*  keeps the whole row inside 80 columns. */
+#define PS_NAME_WIDTH    20
+#define PS_SIZE_WIDTH    10
+#define PS_PID_WIDTH     3
+
+/* How many program starts the shell remembers. The list exists for one
+*  question only -- which pid and which address space every instance got --
+*  and that question is about the recent ones, so the oldest entry drops out
+*  when the table is full rather than the table growing without end. */
+#define PS_INSTANCES     8
+
 void update_infobar() {
 	while(1)
 	{
@@ -217,6 +235,8 @@ void taskmanager(char *cmd);
 void memory(char *cmd);
 void paging(char *cmd);
 void usermode(char *cmd);
+void processes(char *cmd);
+void execute(char *cmd);
 void help(void);
 //void network_test(char *cmd);
 
@@ -238,6 +258,11 @@ static void user_run(void);
 static void user_selftest(void);
 static void user_isolation(void);
 static void user_check(int ok);
+
+static void ps_print_left(const char *text, int width);
+static void ps_modules(void);
+static void ps_instances(void);
+static void exec_remember(int pid, addrspace_t space, const char *name);
 
 /* Self-test counters, maintained by mem_check(). */
 static int mem_tests_run = 0;
@@ -277,6 +302,8 @@ void main()
 		else if(strcmp(word, "mem") == 0) memory(cmd);
 		else if(strcmp(word, "page") == 0) paging(cmd);
 		else if(strcmp(word, "user") == 0) usermode(cmd);
+		else if(strcmp(word, "ps") == 0) processes(cmd);
+		else if(strcmp(word, "exec") == 0) execute(cmd);
 		else if(strcmp(word, "reboot") == 0) reboot();
 		else if(strcmp(word, "help") == 0) help();
 		else if(strcmp(word, "start") == 0) taskmgr_task_start(taskmgr_add_task( task, "Test Task", TASK_PRIORITY_LOW ));
@@ -1972,6 +1999,273 @@ void usermode(char *cmd)
 	}
 }
 
+/* --- ps and exec --------------------------------------------------------- */
+
+/* Prints text left-aligned in a field of the given width, the counterpart to
+*  mem_print_right() for the name columns. At most width - 1 characters are
+*  put out, so a long name is cut short instead of pushing the column behind
+*  it out of line, and there is always at least one space to the next
+*  column. */
+static void ps_print_left(const char *text, int width)
+{
+	int i;
+
+	for(i = 0; i < width - 1 && text[i] != EOS; i++)
+	{
+		putch((unsigned char)text[i]);
+	}
+
+	while(i < width)
+	{
+		putch(' ');
+		i++;
+	}
+}
+
+/* What "exec" has started, in the order it started it. Only the shell writes
+*  this, and only from the command it is running, so no locking is involved.
+*
+*  The address space is recorded rather than only looked up later, because it
+*  is the answer to "did this instance get one of its own": two rows naming
+*  the same program with two different directories say that outright. It is
+*  also what tells a slot that has been reused from the task that is still in
+*  it -- see ps_instances(). */
+static int      exec_inst_pid[PS_INSTANCES];
+static uint32_t exec_inst_space[PS_INSTANCES];
+static char     exec_inst_name[PS_INSTANCES][PS_NAME_WIDTH];
+static int      exec_inst_used = 0;
+
+static void exec_remember(int pid, addrspace_t space, const char *name)
+{
+	int i;
+	int j;
+
+	if(exec_inst_used == PS_INSTANCES)
+	{
+		/* The oldest entry drops out and the rest keeps its order, so the
+		   list still reads from top to bottom in the order things started. */
+		for(i = 1; i < PS_INSTANCES; i++)
+		{
+			exec_inst_pid[i - 1] = exec_inst_pid[i];
+			exec_inst_space[i - 1] = exec_inst_space[i];
+
+			for(j = 0; j < PS_NAME_WIDTH; j++)
+			{
+				exec_inst_name[i - 1][j] = exec_inst_name[i][j];
+			}
+		}
+
+		exec_inst_used--;
+	}
+
+	i = exec_inst_used;
+	exec_inst_pid[i] = pid;
+	exec_inst_space[i] = (uint32_t)space;
+
+	/* Bounded copy -- there is no strncpy() here, and a module name is not
+	   under this file's control. */
+	for(j = 0; j < PS_NAME_WIDTH - 1 && name[j] != EOS; j++)
+	{
+		exec_inst_name[i][j] = name[j];
+	}
+	exec_inst_name[i][j] = EOS;
+
+	exec_inst_used++;
+}
+
+/* The modules the bootloader handed over, i.e. what "exec" can be asked for.
+*  No modules is a normal state, not an error: "make run" boots the kernel on
+*  its own, and so does an ISO built before programs existed. exec_init() then
+*  simply recorded nothing and the table is empty. */
+static void ps_modules(void)
+{
+	int count;
+	int i;
+
+	count = exec_module_count();
+
+	printf("Modules the bootloader passed:\n");
+
+	if(count == 0)
+	{
+		printf("  None -- this kernel was booted without any, so there is\n");
+		printf("  nothing for \"exec\" to load.\n");
+		return;
+	}
+
+	/* The header is padded to the same widths as the rows below: two leading
+	   spaces, the number, two spaces, the name field, and the size field --
+	   the five spaces before "Bytes" are what right-aligns it over the
+	   numbers. */
+	printf("  Nr  ");
+	ps_print_left("Name", PS_NAME_WIDTH);
+	printf("     Bytes\n");
+
+	for(i = 0; i < count; i++)
+	{
+		printf("  ");
+		mem_print_right((uint32_t)i, 2);
+		printf("  ");
+		ps_print_left(exec_module_name(i), PS_NAME_WIDTH);
+		mem_print_right(exec_module_size(i), PS_SIZE_WIDTH);
+		printf("\n");
+	}
+}
+
+/* The instances "exec" has started, with the address space each one was given.
+*
+*  Whether an instance is still there is asked of the task manager rather than
+*  assumed: taskmgr_task_space() returns 0 once a task is gone and its
+*  directory has been reaped. Comparing the answer with what was recorded also
+*  covers the case that matters for a pid -- pids are slot numbers here, so a
+*  later task can inherit the number, and it will not inherit the directory. */
+static void ps_instances(void)
+{
+	addrspace_t space;
+	int i;
+
+	if(exec_inst_used == 0) return;
+
+	printf("Started with \"exec\":\n");
+	printf("  Pid  ");
+	ps_print_left("Program", PS_NAME_WIDTH);
+	printf("Address space\n");
+
+	for(i = 0; i < exec_inst_used; i++)
+	{
+		printf("  ");
+		mem_print_right((uint32_t)exec_inst_pid[i], PS_PID_WIDTH);
+		printf("  ");
+		ps_print_left(exec_inst_name[i], PS_NAME_WIDTH);
+		page_print_hex(exec_inst_space[i], 8);
+
+		space = taskmgr_task_space(exec_inst_pid[i]);
+		if(space == exec_inst_space[i])
+		{
+			printf("  live\n");
+		} else {
+			printf("  ended\n");
+		}
+	}
+}
+
+/* "ps": what is loaded, what has been started from it, and what is running.
+*
+*  The last of those three is left to taskmgr_list_tasks() instead of being
+*  printed here, and that is a deliberate choice rather than laziness. The task
+*  table lives in tasks.c and nothing exports it -- there is no call that hands
+*  out a pid, a name or a state for a slot, only the one that prints them. A
+*  listing written here could therefore not show anything that listing does not
+*  already show; it could only duplicate the walk over a table it cannot see,
+*  and drift from it the day a state is added.
+*
+*  What this file can add is the part tasks.c knows nothing about: which
+*  program a task came from, and which of the modules is which. Hence the two
+*  tables above and the task manager's own below. */
+void processes(char *cmd)
+{
+	if(prmc(cmd) != 0)
+	{
+		printf("Syntax: ps\n");
+		printf("\t          List the loaded modules, the programs started\n");
+		printf("\t          from them and the running tasks\n");
+		return;
+	}
+
+	ps_modules();
+	printf("\n");
+	ps_instances();
+	if(exec_inst_used != 0) printf("\n");
+
+	taskmgr_list_tasks();
+}
+
+/* "exec NAME": load the module of that name into an address space of its own
+*  and run it.
+*
+*  Nothing here is shared with a previous run of the same program. exec_spawn()
+*  builds a fresh space, loads the segments into it and returns a task that is
+*  suspended -- so the same name can be started as often as there are free task
+*  slots and free frames, and every instance gets its own directory, its own
+*  copy of the segments and its own .bss. "ps" shows that as two rows with the
+*  same program name and two different address spaces.
+*
+*  The window between exec_spawn() and taskmgr_task_start() is what makes the
+*  space printable at all: the task exists, it has its directory, and it has
+*  not executed an instruction yet, so taskmgr_task_space() can simply be asked
+*  instead of sampling CR3 from the timer the way the ring 3 demo has to. */
+void execute(char *cmd)
+{
+	char name[100];
+	addrspace_t space;
+	int index;
+	int pid;
+
+	if(prmc(cmd) == 0)
+	{
+		printf("Syntax: exec NAME\n");
+		printf("\t          Load the module NAME and run it as a ring 3 task\n");
+		printf("\t          \"ps\" lists the names there are\n");
+		return;
+	}
+
+	/* prmv() hands back a pointer into one static buffer, so the name is
+	   copied out before anything else calls prmv() again. */
+	strcpy(name, prmv(1, cmd));
+
+	if(exec_module_count() == 0)
+	{
+		printf("exec: the bootloader passed no modules -- there is nothing\n");
+		printf("      to run. \"ps\" says the same.\n");
+		return;
+	}
+
+	index = exec_module_find(name);
+	if(index < 0)
+	{
+		printf("exec: no module called \"%s\" -- \"ps\" lists what there is.\n",
+		       name);
+		return;
+	}
+
+	/* A program that cannot be loaded says why: exec_last_error() carries the
+	   reason the loader refused it -- not an ELF, wrong machine, no free
+	   frame -- which is a good deal more use than a bare failure. */
+	pid = exec_spawn(index, TASK_PRIORITY_NORMAL);
+	if(pid < 0)
+	{
+		printf("exec: %s could not be loaded: %s\n", name, exec_last_error());
+		return;
+	}
+
+	space = taskmgr_task_space(pid);
+
+	printf("Loaded %s:\n", name);
+	printf("  Module:  %i, %u bytes\n", index, (int)exec_module_size(index));
+	printf("  Task:    pid %i, priority %i, suspended so far\n",
+	       pid, TASK_PRIORITY_NORMAL);
+	printf("  Space:   ");
+	page_print_hex((uint32_t)space, 8);
+
+	/* A user task without a directory of its own is a contradiction -- the
+	   loader wrote the segments into one, so there has to be one. If the task
+	   manager says otherwise, the task is taken back down rather than started
+	   into whatever it would be running in. */
+	if(space == 0)
+	{
+		printf("  no address space of its own -- not started\n");
+		taskmgr_task_abort(pid, 0, "no address space");
+		return;
+	}
+
+	printf("  private to pid %i, the program is loaded in it\n", pid);
+
+	exec_remember(pid, space, name);
+	taskmgr_task_start(pid);
+
+	printf("  Started. \"ps\" shows it for as long as it runs.\n");
+}
+
 void help(void)
 {
 	printf("TomatOS Help\n");
@@ -1983,6 +2277,8 @@ void help(void)
 	printf("\tpage      Show paging state, page -t tests paging\n");
 	printf("\tuser      Ring 3 demo, user -t tests the system calls,\n");
 	printf("\t          user -i tests the address space isolation\n");
+	printf("\tps        List the loaded modules and the running tasks\n");
+	printf("\texec      exec NAME runs the module NAME as a ring 3 task\n");
 	printf("\treboot    Restart the computer\n");
 	printf("\texit      Exit the shell\n");
 }

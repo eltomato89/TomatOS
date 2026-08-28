@@ -273,6 +273,7 @@ void pmm_init(multiboot_info *mbi)
 	uint32_t bmp_virt;	/* where the bitmap is written        */
 	uint32_t bmp_phys;	/* which frames it occupies           */
 	int src;
+	uint32_t bmp_after;
 
 	pmm_bitmap       = 0;
 	pmm_bitmap_bytes = 0;
@@ -335,10 +336,47 @@ void pmm_init(multiboot_info *mbi)
 	*  virtual value it would be off by KERNEL_VIRTUAL_BASE and always fail.
 	*  Since pmm_top_incl is capped at DIRECT_MAP_LIMIT, that same test also
 	*  proves the whole bitmap is reachable through the direct mapping. */
-	bmp_virt = ((uint32_t)kernel_end + 3) & ~(uint32_t)3;
+	/* ...and behind the bootloader's modules, if it put any there. QEMU's
+	*  multiboot loader places its module buffer at the page-aligned end of
+	*  the kernel image - exactly where the bitmap would otherwise go. The
+	*  bitmap is written before anything reads the modules, so the module
+	*  list and the programs would be gone by the time exec_init() looks.
+	*  (GRUB places modules elsewhere, which is why only the -kernel path
+	*  showed this.) Start behind whichever ends last. */
+	bmp_after = V2P((uint32_t)kernel_end);
+	if (mbi != 0 && (mbi->flags & MULTIBOOT_INFO_MODS) &&
+	    mbi->mods_count > 0 && mbi->mods_addr != 0 &&
+	    mbi->mods_addr <= DIRECT_MAP_LIMIT)
+	{
+		multiboot_module *mods;
+		uint32_t i;
+		uint32_t list_end;
+
+		list_end = mbi->mods_addr +
+		           mbi->mods_count * (uint32_t)sizeof(multiboot_module);
+		if (list_end > bmp_after && list_end <= DIRECT_MAP_LIMIT)
+			bmp_after = list_end;
+
+		mods = (multiboot_module *)P2V(mbi->mods_addr);
+		for (i = 0; i < mbi->mods_count; i++)
+		{
+			if (mods[i].mod_end <= mods[i].mod_start) continue;
+			if (mods[i].mod_end > DIRECT_MAP_LIMIT) continue;
+			if (mods[i].mod_end > bmp_after) bmp_after = mods[i].mod_end;
+
+			/* The command line strings live in that buffer too, and
+			*  the descriptor does not say how long they are. Leave a
+			*  page of slack rather than guess. */
+			if (mods[i].cmdline > bmp_after &&
+			    mods[i].cmdline <= DIRECT_MAP_LIMIT - PMM_FRAME_SIZE)
+				bmp_after = mods[i].cmdline + PMM_FRAME_SIZE;
+		}
+	}
+
+	bmp_virt = ((uint32_t)P2V(bmp_after) + 3) & ~(uint32_t)3;
 	bmp_phys = V2P(bmp_virt);
 
-	if (bmp_virt < (uint32_t)kernel_end || pmm_bitmap_bytes == 0 ||
+	if (bmp_virt < (uint32_t)P2V(bmp_after) || pmm_bitmap_bytes == 0 ||
 	    bmp_phys < kend ||
 	    bmp_phys > 0xFFFFFFFFUL - pmm_bitmap_bytes ||
 	    bmp_phys + pmm_bitmap_bytes - 1 > pmm_top_incl)
@@ -377,6 +415,44 @@ void pmm_init(multiboot_info *mbi)
 		region_mark_used(V2P((uint32_t)mbi), (uint32_t)sizeof(multiboot_info));
 		if (src == PMM_SRC_MMAP && mbi->mmap_length <= 0x10000UL)
 			region_mark_used(mbi->mmap_addr, mbi->mmap_length);
+
+		/* Modules the bootloader loaded next to the kernel - programs, in
+		*  practice. GRUB places them in memory the map reports as
+		*  AVAILABLE, so the loop above has just handed those very frames
+		*  to the allocator. Without locking them here, the first heap
+		*  growth or the first task page directory overwrites a program
+		*  before anything ever reads it, and the symptom looks like a
+		*  corrupt ELF header rather than an allocator bug.
+		*
+		*  Locked: the descriptor array itself, and every module's
+		*  contents. region_mark_used() rounds outward, so a module
+		*  sharing a page with something else keeps that whole page. */
+		if ((mbi->flags & MULTIBOOT_INFO_MODS) && mbi->mods_count > 0 &&
+		    mbi->mods_addr != 0 && mbi->mods_addr <= DIRECT_MAP_LIMIT)
+		{
+			uint32_t list_bytes;
+			multiboot_module *mods;
+			uint32_t i;
+
+			list_bytes = mbi->mods_count * (uint32_t)sizeof(multiboot_module);
+			region_mark_used(mbi->mods_addr, list_bytes);
+
+			mods = (multiboot_module *)P2V(mbi->mods_addr);
+			for (i = 0; i < mbi->mods_count; i++)
+			{
+				/* A descriptor from outside the kernel: only trust it
+				*  once it describes a non-empty range we can address. */
+				if (mods[i].mod_end <= mods[i].mod_start) continue;
+				if (mods[i].mod_end > DIRECT_MAP_LIMIT) continue;
+
+				region_mark_used(mods[i].mod_start,
+				                 mods[i].mod_end - mods[i].mod_start);
+
+				if (mods[i].cmdline != 0 &&
+				    mods[i].cmdline <= DIRECT_MAP_LIMIT)
+					region_mark_used(mods[i].cmdline, 1);
+			}
+		}
 	}
 
 	if (pmm_capped)

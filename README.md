@@ -2,8 +2,8 @@
 
 A 32-bit x86 hobby kernel (Multiboot 1) — preemptive scheduler, VGA text
 console, PS/2 keyboard with German layout, PIT timer, CMOS clock, physical
-frame allocator, kernel heap, paging, ring 3 with system calls, and a small
-shell. Originally written between
+frame allocator, kernel heap, paging, ring 3 with system calls, per-task
+address spaces, loadable programs and a small shell. Originally written between
 2006 and 2011, ported to a current Linux toolchain in 2026.
 
 ## Requirements
@@ -37,8 +37,8 @@ QEMU loads the Multiboot ELF directly via `-kernel`, with no bootloader
 involved — the fastest way to try a change. Quit with `Ctrl-C` in the
 terminal.
 
-The shell offers `help`, `taskmgr`, `start`, `mem`, `page`, `user`, `reboot`
-and `exit`. `taskmgr` without an argument prints its own syntax, `mem` and `page`
+The shell offers `help`, `taskmgr`, `start`, `mem`, `page`, `user`, `ps`,
+`exec`, `reboot` and `exit`. `taskmgr` without an argument prints its own syntax, `mem` and `page`
 show the memory and paging state, and `mem -t` / `page -t` run self-tests.
 
 ### Memory layout
@@ -161,6 +161,32 @@ the load address from the ELF program header's *virtual* address, and
 `0xC0100000` read as a signed value looks like it is below 1 MiB. GRUB 2 on
 the ISO uses the physical address and loads the kernel correctly, as does
 QEMU's `-kernel`.
+
+### Programs
+
+There is no filesystem yet, so programs arrive as **multiboot modules**: the
+bootloader loads them next to the kernel, and the kernel records them at
+boot. `ps` lists them, `exec <name>` loads one into a fresh address space
+and runs it. Starting the same program twice gives two independent
+instances, each with its own directory and its own copy of the data.
+
+Programs are ordinary static ELF32 executables built separately from the
+kernel — see `user/`. They link against nothing but `user/syscall.h`, which
+is the entire libc a TomatOS program gets: inline `int 0x80` wrappers. Entry
+point is `_start`, there is no C runtime and nothing to return to, so a
+program ends by calling `SYS_EXIT`.
+
+```sh
+make user      # builds build/hello.elf
+make run       # QEMU passes it via -initrd
+make run-iso   # GRUB passes it via a module line
+```
+
+The loader walks the `PT_LOAD` program headers page by page rather than
+segment by segment, because segments are not page aligned: the tail of one
+and the head of the next can share a page. It maps a segment read-only
+unless `PF_W` is set, zeroes the `.bss` part beyond `p_filesz`, and refuses
+anything that would land at or above `KERNEL_VIRTUAL_BASE`.
 
 ## On real hardware
 

@@ -8,10 +8,12 @@
 
 #include <system.h>
 #include <stdio.h>
+#include <string.h>
 #include <hardware.h>
 #include <mm.h>
 #include <syscall.h>
 #include <vmm.h>
+#include <exec.h>
 #define cpuid(in, a, b, c, d) __asm__("cpuid": "=a" (a), "=b" (b), "=c" (c), "=d" (d) : "a" (in));
 
 void *memcpy(void *dest, const void *src, size_t count)
@@ -151,6 +153,58 @@ static void print_memory_map(multiboot_info *mbi)
 		total_kib, (total_kib / 1024u), shown);
 }
 
+/* Reports the modules the bootloader loaded alongside the kernel, in exactly
+*  one line - the boot output has to fit into 25 rows, and the names are the
+*  only thing one cannot look up again later with the shell.
+*
+*  Without modules nothing is printed at all: a kernel booted without a
+*  single program is the normal case while there is no filesystem, and a
+*  line saying "none" would cost a row for saying nothing. The shell reports
+*  an empty list itself when someone actually asks for one.
+*
+*  The names are cut off once the line gets close to the 80 column width,
+*  because a wrapped line costs a second row - exactly what we are avoiding. */
+static void print_modules(void)
+{
+	int count;
+	int i;
+	int len;
+	int used;
+	const char *name;
+
+	count = exec_module_count();
+	if(count <= 0) return;
+
+	printf("Modules: %i (", count);
+
+	used = 0;
+	for(i = 0; i < count; i++)
+	{
+		name = exec_module_name(i);
+		if(name == 0) name = "?";
+		len = (int)strlen(name);
+
+		/* The first name is always printed, however long it is - a line
+		*  that only says "(...)" would be worse than a long one. */
+		if(i > 0 && used + 2 + len > 48)
+		{
+			printf(", ...");
+			break;
+		}
+
+		if(i > 0)
+		{
+			printf(", ");
+			used += 2;
+		}
+
+		printf("%s", name);
+		used += len;
+	}
+
+	printf(")\n");
+}
+
 /* Entry point from start.asm. mbi_phys is the pointer the bootloader left in
 *  ebx: a PHYSICAL address. The kernel runs in the higher half, so that value
 *  is not a usable pointer - it is converted once, right here, and everything
@@ -232,6 +286,32 @@ int kernel(uint32_t magic, multiboot_info *mbi_phys)
 	*  itself needs nothing but a ready pmm and the direct mapping, both of
 	*  which are in place well before the first task exists.
 	*
+	*  The programs hang off the end of that same chain. exec_init() reads the
+	*  module list out of the multiboot info, so it needs the converted mbi
+	*  just like pmm_init() does, and it reads the module command lines
+	*  through P2V() - which means the direct mapping vmm_init() built has to
+	*  be live. It only writes down addresses, names and sizes; the ELF
+	*  parsing, the frames and the address space all come later, in
+	*  exec_spawn(), on demand from the shell. Hence its place: behind
+	*  heap_init(), where memory management is complete and nothing moves
+	*  around any more, and in front of mt_install(), because from the console
+	*  task onwards someone may ask for the list at any time. It adds no
+	*  kernel mapping of its own, so the rule above about page tables and
+	*  task spaces does not concern it.
+	*
+	*  One thing exec_init() cannot do, and this is a real hole: protect the
+	*  modules from the frame allocator. pmm_init() locks the multiboot info
+	*  structure and the memory map, but neither the module list at mods_addr
+	*  nor the module contents between mod_start and mod_end. Those frames sit
+	*  inside a region the memory map reports as available, so pmm_init()
+	*  releases them and pmm_alloc_frame() will hand them out - the first heap
+	*  growth or the first task page directory can overwrite a program long
+	*  before anybody tries to load it, and the failure then looks like a
+	*  broken ELF header rather than what it is. The fix belongs in
+	*  pmm_init(), next to the existing region_mark_used() calls, one per
+	*  module plus the list itself; recording addresses here does not make
+	*  the memory behind them any safer.
+	*
 	*  The kernel is linked for 0xC0100000 but loaded at 0x00100000, and by
 	*  the time this function runs it already executes from the higher half:
 	*  start.asm puts up a provisional mapping and jumps up there before
@@ -275,6 +355,8 @@ int kernel(uint32_t magic, multiboot_info *mbi_phys)
 		(pmm_total_bytes() / (1024u * 1024u)),
 		(pmm_total_bytes() / 1024u),
 		pmm_total_frames());
+	exec_init(mbi);
+	print_modules();
 
 	printf("\n\nLoading TomatOS/x86\n");
 	printf("Loading Driver Components.\n");

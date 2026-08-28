@@ -15,6 +15,13 @@ INC_DIR     := $(SRC_DIR)/include
 BUILD_DIR   := build
 ISO_DIR     := $(BUILD_DIR)/iso
 
+# User space lives entirely outside src/. Its programs are separate ELF
+# executables that share nothing with the kernel but the "int 0x80" ABI, so
+# they get their own sources, their own headers and their own object
+# directory -- see the "User space" block further down.
+USER_DIR    := user
+USER_OBJ_DIR := $(BUILD_DIR)/user
+
 KERNEL      := $(BUILD_DIR)/kernel.elf
 ISO         := $(BUILD_DIR)/tomatos.iso
 
@@ -23,7 +30,8 @@ ISO         := $(BUILD_DIR)/tomatos.iso
 FLOPPY_TMPL := bin/dev_kernel_grub.img
 FLOPPY      := $(BUILD_DIR)/tomatos_floppy.img
 
-LINKER_SCRIPT := linker.ld
+LINKER_SCRIPT      := linker.ld
+USER_LINKER_SCRIPT := $(USER_DIR)/user.ld
 
 # ---------------------------------------------------------------------------
 #  Tools
@@ -83,6 +91,63 @@ LIBGCC    = $(shell $(CC) -m32 -print-libgcc-file-name)
 
 LDFLAGS  := -m elf_i386 -T $(LINKER_SCRIPT) -nostdlib -no-pie
 
+# ---------------------------------------------------------------------------
+#  User space
+#
+#  One entry per program; user/<name>.c becomes $(BUILD_DIR)/<name>.elf.
+#  Programs are single translation units on purpose -- there is no libc to
+#  link against, so anything shared between them belongs in a header.
+# ---------------------------------------------------------------------------
+USER_PROGS := hello
+
+USER_ELFS  := $(patsubst %,$(BUILD_DIR)/%.elf,$(USER_PROGS))
+USER_OBJS  := $(patsubst %,$(USER_OBJ_DIR)/%.o,$(USER_PROGS))
+USER_DEPS  := $(USER_OBJS:.o=.d)
+
+# The objects deliberately land in a directory of their own. Nothing forces
+# the separation otherwise: both sides are -m32 freestanding ELF objects, and
+# a stray $(BUILD_DIR)/*.o in the user link line would happily pull kernel
+# code into a ring 3 binary that would then fault on its first privileged
+# instruction -- or worse, not fault at all and quietly work.
+#
+# The flags are the kernel's, minus what does not apply:
+#
+#   -mgeneral-regs-only   Same reason as for the kernel, and it matters even
+#                         more here: CR4.OSFXSR is never set, so an SSE
+#                         instruction in ring 3 is an immediate #UD, and the
+#                         kernel would report a fault in a program that looks
+#                         perfectly innocent in its source.
+#   -fno-pic -fno-pie     The loader maps an ET_EXEC at fixed addresses and
+#                         performs no relocations at all. Position
+#                         independent code would need a GOT and someone to
+#                         fill it in; there is nobody.
+#   -nostdinc -I $(USER_DIR)
+#                         No system headers, and NOT $(INC_DIR): a user
+#                         program must not be able to reach kernel internals
+#                         even by accident. user/syscall.h is the whole of
+#                         its world.
+USER_CFLAGS := \
+	-m32 \
+	-std=gnu89 \
+	-mgeneral-regs-only \
+	-fno-pic -fno-pie \
+	-ffreestanding -fno-builtin -nostdinc \
+	-I $(USER_DIR) \
+	-fno-strict-aliasing \
+	-fno-stack-protector \
+	-fno-asynchronous-unwind-tables \
+	-O1 \
+	-fno-omit-frame-pointer \
+	-Wall
+
+# --no-warn-rwx-segments: user.ld puts text, rodata and bss into a single
+# read-write-execute PT_LOAD, which newer ld warns about by default. The
+# warning is sound advice on a system with an NX bit; 32-bit x86 without PAE
+# has none, so the split would cost the loader a second segment and buy
+# nothing. See the comment in user/user.ld.
+USER_LDFLAGS := -m elf_i386 -T $(USER_LINKER_SCRIPT) -nostdlib -no-pie -static \
+                --no-warn-rwx-segments
+
 # Keyboard layout. The kernel carries a German keymap (src/kb.c), so QEMU has
 # to deliver German scancodes. Under Wayland QEMU does not pass raw scancodes
 # through but translates via the keysym -- without -k the guest ends up with
@@ -91,6 +156,42 @@ LDFLAGS  := -m elf_i386 -T $(LINKER_SCRIPT) -nostdlib -no-pie
 QEMU_KEYMAP ?= de
 
 QEMUFLAGS := -m 32 -k $(QEMU_KEYMAP)
+
+# ---------------------------------------------------------------------------
+#  Multiboot modules under "-kernel"
+#
+#  QEMU's own Multiboot loader takes modules through -initrd: a comma
+#  separated list, and within one entry the first space separates the file
+#  name from the command line. So this is a two module invocation with a
+#  command line on each:
+#
+#      -initrd "hello a b,shell"
+#
+#  There is one wrinkle, and it decides how the rest of this block looks.
+#  GRUB and QEMU do NOT agree on what a module's command line is:
+#
+#      grub.cfg   module /boot/hello.elf hello      ->  cmdline "hello"
+#      qemu       -initrd "build/hello.elf hello"   ->  cmdline
+#                                                       "build/hello.elf hello"
+#
+#  GRUB drops the file name and passes only what follows it; QEMU passes the
+#  entry verbatim, path and all. Since the kernel takes the first word of the
+#  command line as the module's name, the same program would be called
+#  "hello" after booting the ISO and "build/hello.elf" after "make run".
+#
+#  The fix is to give QEMU an entry that is nothing but the name. QEMU
+#  resolves it relative to its working directory, so the run targets start
+#  QEMU inside $(BUILD_DIR) -- where every file it opens lives anyway -- and
+#  $(USER_MODULES) provides, next to each <name>.elf, a symlink called plainly
+#  <name> for it to open. Both boot paths then report the same module name.
+QEMU_RUNDIR  := $(BUILD_DIR)
+USER_MODULES := $(patsubst %,$(BUILD_DIR)/%,$(USER_PROGS))
+
+# "hello shell" -> "hello,shell"; empty if there are no programs at all.
+comma := ,
+space := $(subst ,, )
+QEMU_INITRD := $(if $(USER_PROGS), \
+                   -initrd $(subst $(space),$(comma),$(strip $(USER_PROGS))))
 
 # ---------------------------------------------------------------------------
 #  Display via VNC
@@ -131,6 +232,11 @@ endif
 # QEMU stays in the foreground and therefore keeps stdio for the serial
 # output; Ctrl-C quits as usual. The client waits in a subshell until the
 # port is open, and is taken down when QEMU exits.
+#
+# QEMU itself is started in $(QEMU_RUNDIR), i.e. $(BUILD_DIR): everything it
+# opens is in there, and the module names in -initrd have to be bare (see the
+# Multiboot module block above). All file arguments in $(1) are therefore
+# plain file names, not paths.
 #   $(1) = QEMU arguments for the respective boot medium
 define run_qemu
 	$(call need,$(QEMU),qemu-system-x86)
@@ -159,7 +265,7 @@ define run_qemu
 	   CLIENT_PID=$$!; \
 	   trap 'kill $$CLIENT_PID 2>/dev/null; pkill -P $$CLIENT_PID 2>/dev/null; true' EXIT INT TERM; \
 	 fi; \
-	 $(QEMU) $(1) -serial stdio $(QEMU_DISPLAY_FLAGS) $(QEMUFLAGS) \
+	 cd $(QEMU_RUNDIR) && $(QEMU) $(1) -serial stdio $(QEMU_DISPLAY_FLAGS) $(QEMUFLAGS) \
 	   || { rc=$$?; \
 	        [ $$rc -eq 130 ] || [ $$rc -eq 143 ] || exit $$rc; }
 endef
@@ -179,7 +285,7 @@ ASM_OBJS := $(patsubst $(SRC_DIR)/%.asm,$(BUILD_DIR)/%.o,$(ASM_SRCS))
 # start.o first: the Multiboot header must end up at the front of the image.
 OBJS := $(BUILD_DIR)/start.o $(filter-out $(BUILD_DIR)/start.o,$(ASM_OBJS) $(C_OBJS))
 
-DEPS := $(C_OBJS:.o=.d)
+DEPS := $(C_OBJS:.o=.d) $(USER_DEPS)
 
 # ---------------------------------------------------------------------------
 #  Helper: check that an external tool exists.
@@ -198,9 +304,9 @@ endef
 # ===========================================================================
 #  Targets
 # ===========================================================================
-.PHONY: all run iso run-iso floppy run-floppy debug usb clean help
+.PHONY: all user run iso run-iso floppy run-floppy debug usb clean help
 
-all: $(KERNEL)
+all: $(KERNEL) user
 
 # --- link ------------------------------------------------------------------
 $(KERNEL): $(OBJS) $(LINKER_SCRIPT) | $(BUILD_DIR)
@@ -221,35 +327,70 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.asm | $(BUILD_DIR)
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
 
+$(USER_OBJ_DIR):
+	@mkdir -p $(USER_OBJ_DIR)
+
+# --- user space programs ---------------------------------------------------
+user: $(USER_ELFS) $(USER_MODULES)
+
+$(USER_OBJS): $(USER_OBJ_DIR)/%.o: $(USER_DIR)/%.c | $(USER_OBJ_DIR)
+	@echo "  CC/U    $<"
+	$(CC) $(USER_CFLAGS) $(DEPFLAGS) -c $< -o $@
+
+# One object per program, and nothing else on the link line: no kernel
+# objects, no libgcc, no crt files. What comes out is a static ET_EXEC with a
+# single PT_LOAD segment and not one relocation -- verify with
+# "readelf -l" and "readelf -r".
+$(USER_ELFS): $(BUILD_DIR)/%.elf: $(USER_OBJ_DIR)/%.o $(USER_LINKER_SCRIPT) | $(BUILD_DIR)
+	@echo "  LD/U    $@"
+	$(LD) $(USER_LDFLAGS) -o $@ $<
+
+# The bare-name alias QEMU loads (see the Multiboot module block at the top).
+# Relative symlink, so moving $(BUILD_DIR) does not break it.
+$(USER_MODULES): $(BUILD_DIR)/%: $(BUILD_DIR)/%.elf
+	@ln -sfn $(notdir $<) $@
+
 # --- run directly (fastest test cycle) -------------------------------------
-# QEMU understands Multiboot ELF kernels, so no bootloader is involved.
-run: $(KERNEL)
-	$(call run_qemu,-kernel $(KERNEL))
+# QEMU understands Multiboot ELF kernels, so no bootloader is involved. It
+# loads no modules on its own though -- that is what -initrd is for.
+run: $(KERNEL) user
+	$(call run_qemu,-kernel $(notdir $(KERNEL)) $(QEMU_INITRD))
 
 # --- bootable ISO ----------------------------------------------------------
 iso: $(ISO)
 
-$(ISO): $(KERNEL)
+$(ISO): $(KERNEL) $(USER_ELFS)
 	$(call need,$(GRUB_MKRESCUE),grub)
 	$(call need,xorriso,libisoburn)
 	@echo "  ISO     $@"
 	@rm -rf $(ISO_DIR)
 	@mkdir -p $(ISO_DIR)/boot/grub
 	@cp $(KERNEL) $(ISO_DIR)/boot/kernel.elf
-	@printf '%s\n' \
-		'set default=0' \
-		'set timeout=3' \
-		'' \
-		'menuentry "TomatOS" {' \
-		'    multiboot /boot/kernel.elf' \
-		'    boot' \
-		'}' \
-		> $(ISO_DIR)/boot/grub/grub.cfg
+	@for p in $(USER_PROGS); do \
+		echo "  MOD     /boot/$$p.elf  (module name: $$p)"; \
+		cp $(BUILD_DIR)/$$p.elf $(ISO_DIR)/boot/$$p.elf; \
+	done
+	@# One "module" line per program. GRUB passes everything AFTER the file
+	@# name as the module command line, so "/boot/hello.elf hello" arrives in
+	@# the kernel as the command line "hello" -- and the kernel takes the
+	@# first word of that as the module's name.
+	@{ \
+		echo 'set default=0'; \
+		echo 'set timeout=3'; \
+		echo ''; \
+		echo 'menuentry "TomatOS" {'; \
+		echo '    multiboot /boot/kernel.elf'; \
+		for p in $(USER_PROGS); do \
+			echo "    module /boot/$$p.elf $$p"; \
+		done; \
+		echo '    boot'; \
+		echo '}'; \
+	} > $(ISO_DIR)/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $@ $(ISO_DIR) 2>/dev/null
 	@echo "  ISO ready: $@"
 
 run-iso: $(ISO)
-	$(call run_qemu,-cdrom $(ISO))
+	$(call run_qemu,-cdrom $(notdir $(ISO)))
 
 # --- GRUB Legacy floppy image ----------------------------------------------
 # The image in bin/ already contains stage1/stage2/menu.lst; menu.lst loads
@@ -265,10 +406,10 @@ $(FLOPPY): $(KERNEL) $(FLOPPY_TMPL) | $(BUILD_DIR)
 	@echo "  Floppy ready: $@"
 
 run-floppy: $(FLOPPY)
-	$(call run_qemu,-fda $(FLOPPY))
+	$(call run_qemu,-fda $(notdir $(FLOPPY)))
 
 # --- debugging -------------------------------------------------------------
-debug: $(KERNEL)
+debug: $(KERNEL) user
 	@echo ""
 	@echo "  QEMU is starting halted with a GDB stub on tcp:1234."
 	@echo "  In a second terminal:"
@@ -278,7 +419,7 @@ debug: $(KERNEL)
 	@echo "      (gdb) break kernel"
 	@echo "      (gdb) continue"
 	@echo ""
-	$(call run_qemu,-s -S -kernel $(KERNEL))
+	$(call run_qemu,-s -S -kernel $(notdir $(KERNEL)) $(QEMU_INITRD))
 
 # --- write the ISO to a USB stick ------------------------------------------
 # Usage: make usb DEV=/dev/sdX
@@ -315,8 +456,10 @@ clean:
 help:
 	@echo "TomatOS build targets:"
 	@echo ""
-	@echo "  all         Build $(KERNEL)  (default)"
-	@echo "  run         Boot the kernel directly in QEMU (-kernel, fastest)"
+	@echo "  all         Build $(KERNEL) and the user programs  (default)"
+	@echo "  user        Build the ring 3 programs only: $(USER_ELFS)"
+	@echo "  run         Boot the kernel directly in QEMU (-kernel, fastest),"
+	@echo "              user programs handed over via -initrd"
 	@echo "  iso         Build a BIOS-bootable $(ISO) via grub-mkrescue"
 	@echo "  run-iso     Boot that ISO in QEMU (-cdrom)"
 	@echo "  floppy      Copy the kernel into a copy of $(FLOPPY_TMPL)"
@@ -331,6 +474,11 @@ help:
 	@echo "  VNC_CLIENT=<prog>     use a different VNC client"
 	@echo "  VNC_DISPLAY=<n>       different display number (port 5900+n)"
 	@echo "  QEMU_KEYMAP=<layout>  keyboard layout, default: de"
+	@echo ""
+	@echo "User programs (user/<name>.c -> $(BUILD_DIR)/<name>.elf):"
+	@echo "  $(USER_PROGS)"
+	@echo "  Add one by dropping the source in $(USER_DIR)/ and appending its"
+	@echo "  name to USER_PROGS in this Makefile - iso and run pick it up."
 	@echo ""
 
 # Header dependencies generated by -MMD -MP (kept last on purpose).

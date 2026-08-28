@@ -8,6 +8,15 @@
 
 #include "typedefs.h"
 
+/* For addrspace_t, which taskmgr_task_space() hands out below. vmm.h pulls in
+*  nothing but typedefs.h and carries its own inclusion guard, and it does not
+*  refer back to system.h - so this cannot loop, and a file that includes
+*  system.h alone still compiles. Including the header is preferable to
+*  repeating the typedef here: a second "typedef uint32_t addrspace_t" would
+*  be a redefinition in every translation unit that has both headers, and it
+*  would silently drift the day vmm.h changes the underlying type. */
+#include "vmm.h"
+
 #define TASK_PRIORITY_REALTIME 20
 #define TASK_PRIORITY_HIGH 10
 #define TASK_PRIORITY_NORMAL 5
@@ -143,6 +152,23 @@ extern void mt_install();
 extern void taskmgr_list_tasks();
 extern int taskmgr_add_task( void* tfunct, const char *name, int cpu_time);
 extern int taskmgr_add_user_task(void *tfunct, const char *name, int prio);
+
+/* The address space a task runs in, or 0 for an invalid pid and for a task
+*  that runs in the kernel space (every ring 0 task does).
+*
+*  This is what makes it possible to furnish a task before it runs: create it
+*  with taskmgr_add_user_task(), ask for its space here, map the program into
+*  that space, then hand over the entry point with taskmgr_task_set_entry().
+*  The returned value is a page directory the task manager still owns - map
+*  into it, but never destroy it. */
+extern addrspace_t taskmgr_task_space(int pid);
+
+/* Sets the entry point of a task that has not started yet, i.e. writes eip in
+*  its saved context. Returns 0 on success, a negative value if the pid is
+*  invalid, the task has no saved context, it is not suspended (so it may
+*  already have run), or entry is 0. */
+extern int taskmgr_task_set_entry(int pid, uint32_t entry);
+
 extern int taskmgr_get_currpid();
 extern void taskmgr_task_abort(int pid, int error_number, const char *error_descr);
 extern void taskmgr_task_start(int pid);
