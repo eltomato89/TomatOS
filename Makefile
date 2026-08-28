@@ -83,7 +83,14 @@ LIBGCC    = $(shell $(CC) -m32 -print-libgcc-file-name)
 
 LDFLAGS  := -m elf_i386 -T $(LINKER_SCRIPT) -nostdlib -no-pie
 
-QEMUFLAGS := -m 32
+# Tastaturlayout. Der Kernel bringt eine deutsche Keymap mit (src/kb.c), QEMU
+# muss also deutsche Scancodes liefern. Unter Wayland reicht QEMU keine rohen
+# Scancodes durch, sondern uebersetzt ueber das Keysym -- ohne -k landet dabei
+# die US-Belegung im Gast, und die Minus-Taste kommt als "ss" an.
+# Ueberschreibbar:  make run QEMU_KEYMAP=en-us
+QEMU_KEYMAP ?= de
+
+QEMUFLAGS := -m 32 -k $(QEMU_KEYMAP)
 
 # ---------------------------------------------------------------------------
 #  Sources / objects

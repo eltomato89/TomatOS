@@ -40,6 +40,17 @@ Terminal oder `Strg-Alt-Q` im QEMU-Fenster.
 An der Shell stehen `help`, `taskmgr`, `start`, `reboot` und `exit` zur
 Verfügung. `taskmgr` ohne Argument zeigt seine eigene Syntax.
 
+### Tastaturlayout
+
+Der Kernel bringt eine deutsche Keymap mit, deshalb startet `make run` QEMU
+mit `-k de`. Ohne das übersetzt QEMU unter Wayland über das Keysym und legt
+die US-Belegung zugrunde — das Minus käme dann als `ß` an. Für ein anderes
+Layout:
+
+```sh
+make run QEMU_KEYMAP=en-us
+```
+
 ## Alle Targets
 
 | Befehl | Wirkung |
