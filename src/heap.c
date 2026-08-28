@@ -11,6 +11,14 @@
 *  consists of several, not necessarily contiguous frame blocks from the
 *  pmm.
 *
+*  Address domain: the pmm hands out PHYSICAL addresses, the kernel runs in
+*  the higher half. Everything in this file -- headers, the address ordering
+*  of the list, the adjacency test, the pointers handed to the caller -- is
+*  therefore expressed in VIRTUAL addresses. The single point of conversion
+*  is heap_grow(), which puts a fresh pmm block through P2V() before anyone
+*  else ever sees it. Mixing the two views anywhere else would break the
+*  adjacency test and merge regions that do not touch.
+*
 *  A buddy or slab allocator would be overkill for a kernel of this size;
 *  the free list is entirely sufficient.
 *
@@ -20,6 +28,7 @@
 #include <system.h>
 #include <stdio.h>
 #include <mm.h>
+#include <vmm.h>
 
 /* Alignment of every returned pointer. 8 bytes, so that later structures
 *  with 64-bit fields (uint64, double) sit properly and the processor does
@@ -78,7 +87,15 @@ static int heap_ready = 0;
 
 /* Does b lie immediately behind the payload of a? Only then may the two be
 *  merged -- being neighbours in the list alone is not enough, because two
-*  separate pmm requests can leave a gap between them. */
+*  separate pmm requests can leave a gap between them.
+*
+*  Both addresses are virtual, and that is exactly what makes the test still
+*  work after the move into the higher half: P2V() adds one and the same
+*  constant to every physical address, so two blocks that touch physically
+*  (p2 == p1 + n) also touch virtually (p2 + K == p1 + K + n) and two blocks
+*  with a gap keep the very same gap. The comparison is therefore just as
+*  valid in the virtual view -- as long as no physical address ever sneaks
+*  into the list. */
 static int heap_adjacent(struct heap_block *a, struct heap_block *b)
 {
     if(a == 0 || b == 0)
@@ -140,6 +157,7 @@ static void heap_split(struct heap_block *blk, uint32_t need)
 
 /* Links a region freshly obtained from the pmm into the address list as a
 *  free block and immediately tries to merge it with its neighbours.
+*  base is already a VIRTUAL address (see heap_grow()).
 *  The pmm may give us frames below as well as above the existing heap,
 *  which is why it is inserted at the right place and not merely appended. */
 static void heap_add_region(void *base, uint32_t bytes)
@@ -189,13 +207,18 @@ static void heap_add_region(void *base, uint32_t bytes)
 }
 
 /* Asks the pmm for as many frames as it takes for need bytes of payload to
-*  fit in -- but at least HEAP_GROW_FRAMES. Returns 1 on success. */
+*  fit in -- but at least HEAP_GROW_FRAMES. Returns 1 on success.
+*
+*  This is the only place in the file where the physical view appears: the
+*  block from the pmm is translated with P2V() once and enters the list as a
+*  virtual address. */
 static int heap_grow(uint32_t need)
 {
     uint32_t bytes;
     uint32_t frames;
     uint32_t minimum;
-    void *base;
+    uint32_t phys;
+    uint32_t span;
 
     if(need > HEAP_MAX_ALLOC)
         return 0;
@@ -207,18 +230,32 @@ static int heap_grow(uint32_t need)
     if(frames < (uint32_t)HEAP_GROW_FRAMES)
         frames = (uint32_t)HEAP_GROW_FRAMES;
 
-    base = pmm_alloc_frames(frames);
-    if(base == 0 && frames != minimum)
+    phys = (uint32_t)pmm_alloc_frames(frames);
+    if(phys == 0 && frames != minimum)
     {
         /* There was no contiguous block left for the generous wish --
         *  second attempt with what is really needed. */
         frames = minimum;
-        base = pmm_alloc_frames(frames);
+        phys = (uint32_t)pmm_alloc_frames(frames);
     }
-    if(base == 0)
+    if(phys == 0)
         return 0;
 
-    heap_add_region(base, frames * (uint32_t)PMM_FRAME_SIZE);
+    span = frames * (uint32_t)PMM_FRAME_SIZE;
+
+    /* P2V() is only defined inside the directly mapped window. Frames above
+    *  it have no fixed virtual address and are of no use to the heap, so
+    *  they go straight back -- and pmm_free_frames() wants the physical
+    *  address again, which is precisely the one we still hold here.
+    *  Phrased so that the subtraction cannot wrap: span is at most
+    *  DIRECT_MAP_LIMIT + 1 bytes, because need is capped at HEAP_MAX_ALLOC. */
+    if(phys > (uint32_t)DIRECT_MAP_LIMIT - (span - 1))
+    {
+        pmm_free_frames((void *)phys, frames);
+        return 0;
+    }
+
+    heap_add_region(P2V(phys), span);
     return 1;
 }
 

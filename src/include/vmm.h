@@ -16,6 +16,33 @@
 
 #include "typedefs.h"
 
+/* The kernel lives in the top quarter of the address space. It is linked for
+*  0xC0100000 but loaded at physical 0x00100000, and all usable RAM is mapped
+*  as a contiguous block starting at KERNEL_VIRTUAL_BASE. That fixed offset is
+*  what makes the two macros below valid.
+*
+*  V2P / P2V convert between the two views and are the only sanctioned way to
+*  do so. Use them wherever a physical address meets a pointer:
+*    - page directory and table entries hold PHYSICAL addresses (the MMU reads
+*      them), but the kernel dereferences the tables through VIRTUAL ones
+*    - pmm_alloc_frame() returns a PHYSICAL address; touching that memory
+*      requires P2V()
+*    - the multiboot info from the bootloader holds PHYSICAL addresses
+*    - memory mapped hardware such as the VGA text buffer at 0xB8000
+*
+*  The macros only hold for addresses inside the directly mapped window, i.e.
+*  physical memory below (4 GiB - KERNEL_VIRTUAL_BASE) = 1 GiB. Anything the
+*  vmm maps elsewhere on request has no such relation and must be tracked. */
+#define KERNEL_VIRTUAL_BASE  0xC0000000u
+#define KERNEL_PHYSICAL_BASE 0x00100000u
+#define KERNEL_VIRTUAL_START (KERNEL_VIRTUAL_BASE + KERNEL_PHYSICAL_BASE)
+
+#define V2P(a)  ((uint32_t)(a) - KERNEL_VIRTUAL_BASE)
+#define P2V(a)  ((void *)((uint32_t)(a) + KERNEL_VIRTUAL_BASE))
+
+/* Highest physical address the direct mapping can reach. */
+#define DIRECT_MAP_LIMIT     (0xFFFFFFFFu - KERNEL_VIRTUAL_BASE)
+
 #define PAGE_SIZE          4096
 #define PAGE_ENTRIES       1024        /* entries per directory and per table */
 #define PAGE_TABLE_SPAN    (PAGE_ENTRIES * PAGE_SIZE)   /* 4 MiB per table */

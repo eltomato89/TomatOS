@@ -7,6 +7,12 @@
 #include <stdarg.h>
 #include <string.h>
 #include <mm.h>
+#include <vmm.h>
+
+/* Physical address of the VGA text mode buffer. Memory mapped hardware, not
+*  RAM -- the kernel reaches it through the direct mapping at P2V(). */
+#define VGA_TEXT_PHYS   0xB8000
+
 /* These define our textpointer, our background and foreground
 *  colors (attributes), and x and y cursor coordinates */
 volatile unsigned short *textmemptr;
@@ -163,10 +169,14 @@ void settextcolor(unsigned char forecolor, unsigned char backcolor)
     attrib = (backcolor << 4) | (forecolor & 0x0F);
 }
 
-/* Sets our text-mode VGA pointer, then clears the screen for us */
+/* Sets our text-mode VGA pointer, then clears the screen for us.
+*  The kernel is linked for the higher half, so the buffer is not addressed
+*  by its physical address any more but through the direct mapping. Every
+*  other function in this file works through textmemptr and follows along
+*  by itself. */
 void init_video(void)
 {
-    textmemptr = (volatile unsigned short *)0xB8000;
+    textmemptr = (volatile unsigned short *)P2V(VGA_TEXT_PHYS);
     cls();
 }
 

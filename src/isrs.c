@@ -204,6 +204,7 @@ void fault_handler(struct regs *r)
 	int i;
 	struct regs *next;
 	uint32_t cr2;
+	char eipbuf[11];
 
 	pid = taskmgr_get_currpid();
 
@@ -220,10 +221,14 @@ void fault_handler(struct regs *r)
 	{
 		taskmgr_task_abort(pid, r->err_code, exception_messages[r->int_no]);
 
-		/* Short, visible feedback - a crash should not happen silently. */
+		/* Short, visible feedback - a crash should not happen silently.
+		*  eip is printed in hex: since the kernel moved into the higher
+		*  half its addresses have the top bit set, and %i would render
+		*  them as a negative number. */
 		settextcolor(4,0);
-		printf("Task %i aborted: %s (error code %i, eip %i)\n",
-		       pid, exception_messages[r->int_no], r->err_code, r->eip);
+		hex32(r->eip, eipbuf);
+		printf("Task %i aborted: %s (error code %i, eip %s)\n",
+		       pid, exception_messages[r->int_no], r->err_code, eipbuf);
 
 		/* "Page Fault" alone says nothing about what went wrong, so the
 		*  decoded details follow directly below it. */

@@ -87,10 +87,15 @@ int checkCPUID(void)
 /* Prints the usable regions of the multiboot memory map. Deliberately compact:
 *  text mode only has 25 lines, and the boot messages have to fit into them.
 *  Reserved regions are of no interest here, pmm_init() evaluates those.
+*
+*  mbi is already a virtual pointer (kernel() converted it). Its mmap_addr
+*  field, however, is still a raw PHYSICAL address from the bootloader and
+*  gets its own P2V() below - once, into mmap, not per entry.
 */
 static void print_memory_map(multiboot_info *mbi)
 {
 	multiboot_mmap_entry *entry;
+	uint8_t *mmap;
 	uint32_t offset;
 	uint32_t len_kib;
 	uint32_t total_kib;
@@ -102,6 +107,16 @@ static void print_memory_map(multiboot_info *mbi)
 		return;
 	}
 
+	/* The map itself has to lie in the directly mapped window, otherwise
+	*  P2V() would produce an address that is not backed by anything. */
+	if(mbi->mmap_addr == 0 || mbi->mmap_addr > DIRECT_MAP_LIMIT)
+	{
+		printf("Memory map: address 0x%X out of the direct mapping\n",
+			mbi->mmap_addr);
+		return;
+	}
+
+	mmap = (uint8_t *)P2V(mbi->mmap_addr);
 	total_kib = 0;
 	shown = 0;
 	offset = 0;
@@ -109,7 +124,7 @@ static void print_memory_map(multiboot_info *mbi)
 	printf("Memory map (usable):\n");
 	while(offset < mbi->mmap_length)
 	{
-		entry = (multiboot_mmap_entry *)(mbi->mmap_addr + offset);
+		entry = (multiboot_mmap_entry *)(mmap + offset);
 		/* size only counts from the field after it, hence the extra 4 */
 		offset += entry->size + 4;
 
@@ -135,16 +150,27 @@ static void print_memory_map(multiboot_info *mbi)
 		total_kib, (total_kib / 1024u), shown);
 }
 
-int kernel(uint32_t magic, multiboot_info *mbi)
+/* Entry point from start.asm. mbi_phys is the pointer the bootloader left in
+*  ebx: a PHYSICAL address. The kernel runs in the higher half, so that value
+*  is not a usable pointer - it is converted once, right here, and everything
+*  below (print_memory_map(), pmm_init()) sees only the virtual mbi. */
+int kernel(uint32_t magic, multiboot_info *mbi_phys)
 {
 	extern void main();
+	multiboot_info *mbi;
 	int task_console;
 
     init_video();
     printf("\n\nTomatOS/x86 boot v0.2\n");
 
+	/* One line on the split, because it is exactly what one wants to see
+	*  first when a higher half mapping goes wrong. */
+	printf("Higher half: kernel 0x%X virt = 0x%X phys\n",
+		KERNEL_VIRTUAL_START, V2P(KERNEL_VIRTUAL_START));
+
 	/* Without the magic we do not know whether ebx points at a multiboot
-	*  info structure at all. Everything beyond this would be guesswork. */
+	*  info structure at all. Everything beyond this would be guesswork.
+	*  Checked before the conversion: P2V() on garbage yields garbage. */
 	if(magic != MULTIBOOT_BOOTLOADER_MAGIC)
 	{
 		printf("Multiboot magic: expected %X, got %X\n",
@@ -152,6 +178,21 @@ int kernel(uint32_t magic, multiboot_info *mbi)
 		panic("No multiboot compliant bootloader.\nTomatOS needs the memory information from the bootloader.");
 		return 0;
 	}
+
+	/* The magic only vouches for the register, not for the pointer. P2V()
+	*  is defined for physical addresses inside the direct mapping alone, so
+	*  anything above DIRECT_MAP_LIMIT (or a null pointer) cannot be turned
+	*  into something dereferenceable - better to say so than to fault in
+	*  print_memory_map() with no handler installed yet. */
+	if((uint32_t)mbi_phys == 0 || (uint32_t)mbi_phys > DIRECT_MAP_LIMIT)
+	{
+		printf("Multiboot info at 0x%X, outside the direct mapping\n",
+			(uint32_t)mbi_phys);
+		panic("Multiboot info pointer out of range.\nTomatOS cannot reach the memory information.");
+		return 0;
+	}
+
+	mbi = (multiboot_info *)P2V(mbi_phys);
 
 	detect_cpu();
 	if(checkCPUID()==1)
@@ -170,19 +211,33 @@ int kernel(uint32_t magic, multiboot_info *mbi)
 	*  mapped range, and all three must come before mt_install() so that
 	*  tasks can request memory as well.
 	*
-	*  Paging goes on here, before idt_install()/isrs_install(), i.e. without
-	*  a page fault handler. That is deliberate:
+	*  The kernel is linked for 0xC0100000 but loaded at 0x00100000, and by
+	*  the time this function runs it already executes from the higher half:
+	*  start.asm puts up a provisional mapping and jumps up there before
+	*  calling us. Two consequences run through the whole boot path:
+	*    - Every address that comes from outside the kernel is PHYSICAL and
+	*      has to pass P2V() before it is dereferenced. That is the multiboot
+	*      pointer above, the mmap_addr inside it, and later everything
+	*      pmm_alloc_frame() hands out. The other direction, V2P(), is for
+	*      what the MMU reads: page directory and table entries.
+	*    - The two views differ by the constant KERNEL_VIRTUAL_BASE, and only
+	*      for physical memory below DIRECT_MAP_LIMIT. Outside that window
+	*      the macros mean nothing, hence the range checks.
+	*
+	*  Paging is reloaded here, before idt_install()/isrs_install(), i.e.
+	*  without a page fault handler. That is deliberate:
 	*    - The IDT gates reference a GDT selector, so pulling idt_install()
 	*      forward would mean pulling gdt_install() forward as well and
 	*      rearranging the whole driver block for no real gain.
-	*    - vmm_init() identity maps the kernel and all usable RAM, so every
-	*      pointer keeps its value across the write to CR0.PG. There is no
-	*      access in this window that could legitimately fault.
+	*    - vmm_init() builds the real directory over the same higher half
+	*      window start.asm already provides and maps all usable RAM into it,
+	*      so every pointer keeps its value across the write to CR3. There is
+	*      no access in this window that could legitimately fault.
 	*    - Should it fault anyway, it happens on the very first instruction
-	*      after paging is switched on: a reproducible triple fault right
-	*      after this message, not a subtle bug. A handler would not help
-	*      either, because a broken mapping would just as likely swallow the
-	*      handler itself.
+	*      after the new directory is loaded: a reproducible triple fault
+	*      right after this message, not a subtle bug. A handler would not
+	*      help either, because a broken mapping would just as likely swallow
+	*      the handler itself.
 	*  The page fault handler is for the faults that come later - null
 	*  pointer dereferences, writes into the read-only kernel text - and
 	*  those all happen well after isrs_install(). */

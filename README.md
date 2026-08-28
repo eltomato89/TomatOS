@@ -42,12 +42,21 @@ show the memory and paging state, and `mem -t` / `page -t` run self-tests.
 
 ### Memory layout
 
-The kernel is **identity mapped**: virtual address equals physical address.
-Paging is on, with two useful consequences. Page zero is deliberately left
-unmapped, so a null pointer dereference raises a page fault naming the
-offending address instead of quietly reading the real-mode interrupt vector
-table. And the kernel's own code is mapped read-only, enforced by `CR0.WP`
-— without that bit the CPU ignores read-only page table entries in ring 0.
+The kernel is a **higher-half kernel**: linked for virtual `0xC0100000`,
+loaded at physical `0x00100000`. All usable RAM is mapped as one contiguous
+block from `KERNEL_VIRTUAL_BASE` (`0xC0000000`) upward, so physical and
+virtual addresses differ by a constant offset. `V2P()` and `P2V()` in
+`src/include/vmm.h` convert between the two, and every place where a
+physical address meets a pointer goes through them — page table entries,
+frames from the allocator, the multiboot info from the bootloader, and
+memory mapped hardware such as the VGA buffer.
+
+The lower 3 GiB are unmapped, which is where user space will live once
+there is any. Two consequences today: a null pointer dereference raises a
+page fault naming the offending address, instead of quietly reading the
+real-mode interrupt vector table; and the kernel's own code is mapped
+read-only, enforced by `CR0.WP` — without that bit the CPU ignores
+read-only page table entries in ring 0.
 
 `page -f` triggers a null pointer write on purpose to demonstrate the fault
 handler; it kills the calling task, and the system carries on.
@@ -91,12 +100,22 @@ make run QEMU_KEYMAP=en-us
 | `make run` | Boot directly in QEMU (fastest test cycle) |
 | `make iso` | BIOS-bootable `build/tomatos.iso` via GRUB 2 |
 | `make run-iso` | Boot that ISO in QEMU |
-| `make floppy` | Place the kernel into a copy of the GRUB Legacy floppy image |
-| `make run-floppy` | Boot that floppy image in QEMU |
+| `make floppy` | Place the kernel into a copy of the GRUB Legacy floppy image (see note) |
+| `make run-floppy` | Boot that floppy image in QEMU (see note) |
 | `make debug` | Start QEMU halted with a GDB stub on port 1234 |
 | `make usb DEV=/dev/sdX` | Write the ISO to a USB stick (asks first) |
 | `make clean` | Remove `build/` |
 | `make help` | This list |
+
+### The GRUB Legacy floppy
+
+The floppy image in `bin/` carries GRUB Legacy 0.97 from 2011 and **no
+longer boots the kernel** since the move to the higher half. It fails with
+`Error 7: Loading below 1MB is not supported`, because that version derives
+the load address from the ELF program header's *virtual* address, and
+`0xC0100000` read as a signed value looks like it is below 1 MiB. GRUB 2 on
+the ISO uses the physical address and loads the kernel correctly, as does
+QEMU's `-kernel`.
 
 ## On real hardware
 

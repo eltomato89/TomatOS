@@ -18,20 +18,27 @@
 #define MEM_TEST_SMALL  32
 #define MEM_TEST_LARGE  128
 
-/* Text mode video memory -- identity mapped like everything else, and the
-   one address in the system whose physical location is common knowledge. */
-#define PAGE_VGA_TEXT   0xB8000
+/* Text mode video memory: the one address in the system whose physical
+   location is common knowledge -- and, since the kernel moved into the
+   higher half, no longer the address one writes to. It is reached through
+   the direct mapping like every other piece of physical memory. */
+#define PAGE_VGA_PHYS   0xB8000
+#define PAGE_VGA_TEXT   ((uint32_t)P2V(PAGE_VGA_PHYS))
 
 /* Offset inside a page for the test that vmm_get_phys() does not just
    translate the frame but keeps the offset. Deliberately not aligned. */
 #define PAGE_TEST_OFFSET 0x123
 
 /* Where "page -t" starts looking for a free virtual address for its
-   map/unmap test: far above any physical RAM this kernel will see, and far
-   below the top 4 MiB, which a recursive directory mapping would occupy.
+   map/unmap test. The kernel now owns everything from KERNEL_VIRTUAL_BASE
+   upwards -- the direct mapping of all usable RAM lives there, and so would
+   a recursive directory mapping in the top 4 MiB -- so the probe has to stay
+   below 0xC0000000. 2 GiB is far above any physical RAM this kernel will
+   see (and above anything start.asm might still have identity mapped low
+   down), and still a whole gigabyte clear of the kernel window.
    The address is not used as is -- it is only the starting point of a probe
    with vmm_is_mapped(), see page_find_free_virt(). */
-#define PAGE_TEST_VIRT   0xE0000000
+#define PAGE_TEST_VIRT   0x80000000
 #define PAGE_TEST_PROBES 1024
 
 /* Pattern written through the freshly created mapping. */
@@ -449,7 +456,10 @@ static void page_print_hex(uint32_t value, int digits)
 
 /* One row of the translation table: label, virtual address, physical
    address behind it and whether the page is mapped at all. The label
-   carries its own padding so the columns line up. */
+   carries its own padding so the columns line up.
+   In the higher half layout the two columns differ by KERNEL_VIRTUAL_BASE,
+   which is the whole point of printing them side by side: kernel code shows
+   up as 0xC01xxxxx -> 0x001xxxxx. */
 static void page_print_translation(char *label, uint32_t virt)
 {
 	printf("%s", label);
@@ -494,13 +504,17 @@ static void page_show_status(void)
 	mem_print_right(pages / (1024 * 1024 / PAGE_SIZE), 5);
 	printf(" MiB)\n");
 
-	/* A few translations that make the identity mapping tangible. The heap
-	   block is only borrowed for the duration of the printout. */
+	/* A few translations that make the higher half split tangible: all of
+	   them drop by KERNEL_VIRTUAL_BASE, page zero has no physical address at
+	   all. The heap block is only borrowed for the duration of the
+	   printout. */
 	block = (unsigned char *)malloc(MEM_TEST_SIZE);
 
-	printf("  Translations:\n");
+	printf("  Translations (virtual -> physical, offset ");
+	page_print_hex((uint32_t)KERNEL_VIRTUAL_BASE, 8);
+	printf("):\n");
 	page_print_translation("    Kernel code  ", (uint32_t)main);
-	page_print_translation("    VGA text     ", (uint32_t)PAGE_VGA_TEXT);
+	page_print_translation("    VGA text     ", PAGE_VGA_TEXT);
 	if(block != 0)
 	{
 		page_print_translation("    Heap block   ", (uint32_t)block);
@@ -526,19 +540,25 @@ static void page_check(int ok)
 	}
 }
 
-/* Identity mapping for one address: the physical address must be the
-   virtual one. */
-static void page_check_identity(char *label, uint32_t virt)
+/* Direct mapping for one address: the physical address must be exactly
+   KERNEL_VIRTUAL_BASE below the virtual one. This replaces the old identity
+   check -- with the kernel in the higher half the relation is no longer
+   "equal" but "constant offset", and V2P() is what states it. Only valid for
+   addresses inside the direct mapping window, i.e. at or above
+   KERNEL_VIRTUAL_BASE. */
+static void page_check_offset(char *label, uint32_t virt)
 {
 	uint32_t phys;
+	uint32_t want;
 
 	phys = vmm_get_phys(virt);
-	page_check(virt != 0 && phys == virt);
+	want = (uint32_t)V2P(virt);
+	page_check(virt >= KERNEL_VIRTUAL_BASE && phys == want);
 	printf("%s", label);
 	page_print_hex(virt, 8);
 	printf(" -> ");
 	page_print_hex(phys, 8);
-	printf(" identity\n");
+	printf(" = V2P\n");
 }
 
 /* First virtual address from PAGE_TEST_VIRT upwards whose page is not
@@ -562,8 +582,9 @@ static uint32_t page_find_free_virt(void)
 static void page_selftest(void)
 {
 	unsigned char *block;
-	uint32_t *frame;
+	uint32_t frame_phys;
 	volatile uint32_t *window;
+	volatile uint32_t *direct;
 	uint32_t virt;
 	uint32_t base;
 	uint32_t base_phys;
@@ -589,15 +610,16 @@ static void page_selftest(void)
 	printf(", %u tables, %u pages mapped\n",
 	       (int)vmm_table_count(), (int)vmm_mapped_pages());
 
-	/* 1.-3. The identity mapping must hold everywhere, not just where the
+	/* 1.-3. The direct mapping must hold everywhere, not just where the
 	         kernel happens to live -- code, heap and the VGA buffer sit in
-	         three different regions. */
+	         three different regions, and all three have to come out exactly
+	         KERNEL_VIRTUAL_BASE lower. */
 	block = (unsigned char *)malloc(MEM_TEST_SIZE);
 	heap_addr = (uint32_t)block;
 
-	page_check_identity("Kernel   ", (uint32_t)main);
-	page_check_identity("VGA text ", (uint32_t)PAGE_VGA_TEXT);
-	page_check_identity("Heap     ", heap_addr);
+	page_check_offset("Kernel   ", (uint32_t)main);
+	page_check_offset("VGA text ", PAGE_VGA_TEXT);
+	page_check_offset("Heap     ", heap_addr);
 
 	/* 4. A translation must keep the offset within the page. An address in
 	      the middle of a page therefore has to come out that much behind
@@ -629,14 +651,19 @@ static void page_selftest(void)
 
 	/* 7. Map a fresh frame at a virtual address that is provably free,
 	      write to it and read it back. This is the one check that exercises
-	      vmm_map() rather than just inspecting what vmm_init() built. */
-	frame = (uint32_t *)pmm_alloc_frame();
+	      vmm_map() rather than just inspecting what vmm_init() built.
+	      pmm_alloc_frame() returns a PHYSICAL address -- it goes into
+	      vmm_map() as is, and is never dereferenced without P2V(). The
+	      virtual address comes from below the kernel window, see
+	      PAGE_TEST_VIRT, so the new mapping is one the direct mapping does
+	      not already provide. */
+	frame_phys = (uint32_t)pmm_alloc_frame();
 	virt = page_find_free_virt();
 	mapped = 0;
 	ok = 0;
 
-	if(frame != 0 && virt != 0 &&
-	   vmm_map(virt, (uint32_t)frame, PAGE_PRESENT | PAGE_WRITE) == 0)
+	if(frame_phys != 0 && virt != 0 &&
+	   vmm_map(virt, frame_phys, PAGE_PRESENT | PAGE_WRITE) == 0)
 	{
 		mapped = 1;
 		window = (volatile uint32_t *)virt;
@@ -647,29 +674,32 @@ static void page_selftest(void)
 		ok = (window[0] == (uint32_t)PAGE_TEST_PATTERN &&
 		      window[1] == ~(uint32_t)PAGE_TEST_PATTERN &&
 		      window[PAGE_SIZE / 4 - 1] == (uint32_t)PAGE_TEST_PATTERN &&
-		      vmm_get_phys(virt) == (uint32_t)frame &&
+		      vmm_get_phys(virt) == frame_phys &&
 		      vmm_is_mapped(virt));
 	}
 	page_check(ok);
 	printf("Mapped ");
 	page_print_hex(virt, 8);
 	printf(" -> ");
-	page_print_hex((uint32_t)frame, 8);
+	page_print_hex(frame_phys, 8);
 	printf(", pattern read back\n");
 
-	/* 8. The new mapping must point at the very same physical page, so the
-	      frame's own identity address has to show the pattern too. */
+	/* 8. The new mapping must point at the very same physical page. The
+	      second way to that page is the direct mapping, so P2V() of the
+	      frame has to show the pattern too -- written through a virtual
+	      address below the kernel, read back through one above it. */
 	ok = 0;
 	seen = 0;
-	if(mapped && vmm_is_mapped((uint32_t)frame))
+	if(mapped && vmm_is_mapped((uint32_t)P2V(frame_phys)))
 	{
-		seen = frame[0];
+		direct = (volatile uint32_t *)P2V(frame_phys);
+		seen = direct[0];
 		ok = (seen == (uint32_t)PAGE_TEST_PATTERN);
 	}
 	page_check(ok);
 	printf("Frame ");
-	page_print_hex((uint32_t)frame, 8);
-	printf(" via identity reads ");
+	page_print_hex(frame_phys, 8);
+	printf(" via P2V reads ");
 	page_print_hex(seen, 8);
 	printf("\n");
 
@@ -680,7 +710,7 @@ static void page_selftest(void)
 	page_print_hex(virt, 8);
 	printf(": is_mapped = %i\n", vmm_is_mapped(virt));
 
-	pmm_free_frame(frame);
+	pmm_free_frame((void *)frame_phys);
 
 	printf("  Result: %i of %i checks passed\n",
 	       page_tests_ok, page_tests_run);

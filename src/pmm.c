@@ -7,16 +7,28 @@
 *  directly behind the kernel image, because at this point there is no
 *  malloc() yet.
 *
+*  Two views of memory meet in this file, and mixing them up is fatal:
+*    - everything the bitmap describes is PHYSICAL. Frame indices, the
+*      addresses out of the multiboot memory map, and the return values of
+*      pmm_alloc_frame() are physical addresses and stay that way.
+*    - every dereference goes through a VIRTUAL address. The kernel is
+*      linked for the higher half, so the linker symbols and the bitmap
+*      pointer are virtual and differ from the physical view by
+*      KERNEL_VIRTUAL_BASE.
+*  V2P() / P2V() from vmm.h are the only sanctioned way across that line.
+*
 *  Notes: No warranty expressed or implied. Use at own risk.
 */
 
 #include <system.h>
 #include <stdio.h>
 #include <mm.h>
+#include <vmm.h>
 
 /* Symbols provided by the linker script. Declared as arrays so that the
 *  name itself already is the address - an "extern uint32_t kernel_end;"
-*  would read the memory contents at that location instead of the address. */
+*  would read the memory contents at that location instead of the address.
+*  Both are VIRTUAL addresses in the higher half. */
 extern char kernel_start[];
 extern char kernel_end[];
 
@@ -43,6 +55,7 @@ static uint32_t  pmm_avail_bytes = 0;   /* usable memory according to the map */
 static uint32_t  pmm_top_incl = 0;      /* highest usable byte address        */
 static int       pmm_have_top = 0;      /* was anything found at all?         */
 static uint32_t  pmm_hint = 0;          /* word index to start searching at   */
+static int       pmm_capped = 0;        /* RAM dropped above the direct map   */
 
 /* --- Bit level ------------------------------------------------------------ */
 
@@ -139,13 +152,28 @@ static void region_mark_free(uint32_t base, uint32_t len)
 		frame_mark_free(i);
 }
 
-/* First pass: remember the highest address and the total amount. */
+/* First pass: remember the highest address and the total amount.
+*  Physical memory the direct mapping cannot reach is dropped right here.
+*  P2V() is only valid below DIRECT_MAP_LIMIT, so a frame above it could
+*  never be touched by the kernel - it must not enter the bitmap either,
+*  which is why the cap happens on the measuring pass and not later. */
 static void region_note(uint32_t base, uint32_t len)
 {
 	uint32_t end_incl;
 	uint32_t clen;
 
 	if (!region_bounds(base, len, &end_incl)) return;
+
+	if (base > DIRECT_MAP_LIMIT)
+	{
+		pmm_capped = 1;
+		return;
+	}
+	if (end_incl > DIRECT_MAP_LIMIT)
+	{
+		end_incl = DIRECT_MAP_LIMIT;
+		pmm_capped = 1;
+	}
 
 	if (!pmm_have_top || end_incl > pmm_top_incl)
 	{
@@ -160,15 +188,26 @@ static void region_note(uint32_t base, uint32_t len)
 
 /* --- Multiboot memory map ------------------------------------------------- */
 
-/* pass == 0: only measure, pass != 0: release the available regions. */
+/* pass == 0: only measure, pass != 0: release the available regions.
+*  mbi->mmap_addr is a PHYSICAL address from the bootloader; walking the
+*  entries means reading them, so the cursor runs through P2V(). The
+*  addresses inside the entries stay physical - they describe frames. */
 static void pmm_walk_mmap(multiboot_info *mbi, int pass)
 {
 	multiboot_mmap_entry *ent;
+	uint32_t phys;
 	uint32_t addr;
 	uint32_t end;
 	uint32_t next;
 
-	addr = mbi->mmap_addr;
+	phys = mbi->mmap_addr;
+
+	/* The map has to lie inside the directly mapped window, otherwise
+	*  there is no pointer with which to read it. */
+	if (phys > DIRECT_MAP_LIMIT) return;
+	if (mbi->mmap_length > DIRECT_MAP_LIMIT - phys + 1) return;
+
+	addr = (uint32_t)P2V(phys);
 	end  = addr + mbi->mmap_length;
 	if (end < addr) return;		/* nonsensical length given */
 
@@ -229,9 +268,10 @@ static void pmm_walk_meminfo(multiboot_info *mbi, int pass)
 
 void pmm_init(multiboot_info *mbi)
 {
-	uint32_t kstart;
-	uint32_t kend;
-	uint32_t bmp;
+	uint32_t kstart;	/* physical start of the kernel image */
+	uint32_t kend;		/* physical end of the kernel image   */
+	uint32_t bmp_virt;	/* where the bitmap is written        */
+	uint32_t bmp_phys;	/* which frames it occupies           */
 	int src;
 
 	pmm_bitmap       = 0;
@@ -242,9 +282,12 @@ void pmm_init(multiboot_info *mbi)
 	pmm_top_incl     = 0;
 	pmm_have_top     = 0;
 	pmm_hint         = 0;
+	pmm_capped       = 0;
 
-	kstart = (uint32_t)kernel_start;
-	kend   = (uint32_t)kernel_end;
+	/* The linker symbols are virtual. Everything from here on is compared
+	*  against and written into the bitmap, and the bitmap speaks physical. */
+	kstart = V2P((uint32_t)kernel_start);
+	kend   = V2P((uint32_t)kernel_end);
 
 	/* 1st pass: how do we know how much memory is there? */
 	src = PMM_SRC_GUESS;
@@ -281,19 +324,31 @@ void pmm_init(multiboot_info *mbi)
 	pmm_bitmap_bytes = ((pmm_frames + 31) >> 5) * 4;
 
 	/* The bitmap goes directly behind the kernel image (4 byte aligned,
-	*  because we scan it word by word). */
-	bmp = ((uint32_t)kernel_end + 3) & ~(uint32_t)3;
+	*  because we scan it word by word). The rounding happens on the
+	*  virtual address, because that is the one we will dereference; the
+	*  frames it covers are named by the physical one.
+	*
+	*  Both checks live in the world they belong to: the alignment must not
+	*  have wrapped around the end of the virtual address space, and the
+	*  bitmap must fit below the top of physical RAM. pmm_top_incl is a
+	*  physical byte address, so the comparison needs bmp_phys - with the
+	*  virtual value it would be off by KERNEL_VIRTUAL_BASE and always fail.
+	*  Since pmm_top_incl is capped at DIRECT_MAP_LIMIT, that same test also
+	*  proves the whole bitmap is reachable through the direct mapping. */
+	bmp_virt = ((uint32_t)kernel_end + 3) & ~(uint32_t)3;
+	bmp_phys = V2P(bmp_virt);
 
-	if (bmp < kend || pmm_bitmap_bytes == 0 ||
-	    bmp > 0xFFFFFFFFUL - pmm_bitmap_bytes ||
-	    bmp + pmm_bitmap_bytes - 1 > pmm_top_incl)
+	if (bmp_virt < (uint32_t)kernel_end || pmm_bitmap_bytes == 0 ||
+	    bmp_phys < kend ||
+	    bmp_phys > 0xFFFFFFFFUL - pmm_bitmap_bytes ||
+	    bmp_phys + pmm_bitmap_bytes - 1 > pmm_top_incl)
 	{
 		pmm_frames = 0;
 		panic("PMM: no room for the frame bitmap");
 		return;
 	}
 
-	pmm_bitmap = (uint32_t *)bmp;
+	pmm_bitmap = (uint32_t *)bmp_virt;
 
 	/* At first everything counts as used. The padding bits in the last word
 	*  above pmm_frames thereby stay 1 permanently and can never be handed
@@ -310,22 +365,29 @@ void pmm_init(multiboot_info *mbi)
 	frame_mark_used(0);				/* address 0 stays invalid  */
 	region_mark_used(0, PMM_LOW_LIMIT);		/* BIOS, EBDA, VGA at 0xB8000 */
 	region_mark_used(kstart, kend - kstart);	/* the kernel image itself  */
-	region_mark_used(bmp, pmm_bitmap_bytes);	/* the bitmap itself        */
+	region_mark_used(bmp_phys, pmm_bitmap_bytes);	/* the bitmap itself        */
 
 	/* The bootloader puts the multiboot structures somewhere in RAM -
 	*  usually below 1 MiB, but that is not guaranteed. Lock them, so they
-	*  are not later overwritten out from under the kernel. */
+	*  are not later overwritten out from under the kernel.
+	*  mbi itself already arrives as a virtual pointer, so it goes back
+	*  through V2P(); mmap_addr never left the physical world. */
 	if (mbi != 0)
 	{
-		region_mark_used((uint32_t)mbi, (uint32_t)sizeof(multiboot_info));
+		region_mark_used(V2P((uint32_t)mbi), (uint32_t)sizeof(multiboot_info));
 		if (src == PMM_SRC_MMAP && mbi->mmap_length <= 0x10000UL)
 			region_mark_used(mbi->mmap_addr, mbi->mmap_length);
 	}
 
+	if (pmm_capped)
+		printf("PMM: RAM above %d MiB ignored, outside the direct mapping\n",
+		       (int)((DIRECT_MAP_LIMIT >> 20) + 1));
+
 	printf("PMM: %d KiB usable, %d frames of 4 KiB, %d free\n",
 	       (int)(pmm_avail_bytes >> 10), (int)pmm_frames,
 	       (int)(pmm_frames - pmm_used));
-	printf("PMM: bitmap at 0x%X, %d bytes\n", (int)bmp, (int)pmm_bitmap_bytes);
+	printf("PMM: bitmap at 0x%X (phys 0x%X), %d bytes\n",
+	       (int)bmp_virt, (int)bmp_phys, (int)pmm_bitmap_bytes);
 }
 
 /* --- Search --------------------------------------------------------------- */

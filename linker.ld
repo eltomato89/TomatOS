@@ -2,10 +2,20 @@
  *
  * 32-bit x86, Multiboot 1, ELF32 output.
  *
- * The kernel is loaded at the classic 1 MiB mark. The Multiboot header must
- * appear within the first 8 KiB of the image, so anything that could carry it
- * (an explicit .multiboot section, otherwise start.o's own .text) is placed
- * at the very front of the first output section.
+ * Higher half layout. The kernel is LINKED for virtual 0xC0100000 but still
+ * LOADED at physical 0x00100000, the classic 1 MiB mark. The two views are
+ * separated by exactly KERNEL_VIRTUAL_BASE, which is the same constant the C
+ * side uses in src/include/vmm.h (V2P / P2V).
+ *
+ * The split is expressed with the AT() operator: every output section gets a
+ * virtual address (VMA) at 0xC01xxxxx and a load address (LMA) at 0x001xxxxx.
+ * ld writes the LMA into p_paddr of the program header, which is the field the
+ * Multiboot ELF loader in GRUB uses to place the image in physical memory.
+ *
+ * The Multiboot header must appear within the first 8 KiB of the image FILE,
+ * so anything that could carry it (an explicit .multiboot section, otherwise
+ * start.o's own .text) is placed at the very front of the first output
+ * section, and that section is the first thing in the file.
  *
  * Replaces the old flat-binary script in bin/link.ld: GRUB / QEMU load the
  * ELF via its program headers, no OUTPUT_FORMAT("binary") tricks needed.
@@ -15,11 +25,14 @@ OUTPUT_FORMAT("elf32-i386")
 OUTPUT_ARCH(i386)
 ENTRY(start)
 
-KERNEL_LOAD_ADDR = 0x00100000;   /* 1 MiB */
+KERNEL_VIRTUAL_BASE = 0xC0000000;   /* must match vmm.h */
+KERNEL_LOAD_ADDR    = 0x00100000;   /* 1 MiB, physical */
+KERNEL_VIRTUAL_ADDR = KERNEL_VIRTUAL_BASE + KERNEL_LOAD_ADDR;   /* 0xC0100000 */
 
 SECTIONS
 {
-    . = KERNEL_LOAD_ADDR;
+    /* The location counter tracks VIRTUAL addresses from here on. */
+    . = KERNEL_VIRTUAL_ADDR;
 
     kernel_start = .;
     _kernel_start = .;
@@ -33,7 +46,7 @@ SECTIONS
      * Without that padding the last page of .text would also hold the first
      * bytes of the following section, and marking it read-only would fault
      * on the first write to a variable living there. */
-    .text ALIGN(4K) :
+    .text ALIGN(4K) : AT(ADDR(.text) - KERNEL_VIRTUAL_BASE)
     {
         text_start = .;
 
@@ -57,7 +70,7 @@ SECTIONS
 
     /* Read-only data. Same padding rule as .text: the range is a candidate
      * for a read-only mapping of its own. */
-    .rodata ALIGN(4K) :
+    .rodata ALIGN(4K) : AT(ADDR(.rodata) - KERNEL_VIRTUAL_BASE)
     {
         rodata_start = .;
         *(.rodata .rodata.*)
@@ -68,7 +81,7 @@ SECTIONS
 
     /* Initialised data. Writable, so the padding here is only for symmetry
      * and to keep .bss starting on its own page. */
-    .data ALIGN(4K) :
+    .data ALIGN(4K) : AT(ADDR(.data) - KERNEL_VIRTUAL_BASE)
     {
         data_start = .;
         *(.data .data.*)
@@ -77,8 +90,10 @@ SECTIONS
         data_end = .;
     }
 
-    /* Zero-initialised data (incl. the kernel stack from start.asm). */
-    .bss ALIGN(4K) :
+    /* Zero-initialised data (incl. the kernel stack and the boot page
+     * directory from start.asm). start.asm touches parts of this section
+     * BEFORE paging is on, through their physical aliases. */
+    .bss ALIGN(4K) : AT(ADDR(.bss) - KERNEL_VIRTUAL_BASE)
     {
         bss_start = .;
         *(COMMON)
@@ -90,10 +105,31 @@ SECTIONS
     . = ALIGN(4K);
 
     /* End of the kernel image -- the memory manager will start allocating
-     * from here. Both spellings are provided for convenience. */
+     * from here. Both spellings are provided for convenience.
+     * These are VIRTUAL addresses now. */
     kernel_end = .;
     _kernel_end = .;
     end = .;
+
+    /* Physical counterparts of the boundary symbols. The boot code in
+     * start.asm and any early code that runs with paging off (or that has to
+     * hand a physical address to the MMU / to the pmm) needs the load view.
+     * Derived here rather than open coded as "sym - 0xC0000000" all over the
+     * place, so the offset lives in exactly one file.
+     *
+     * The C side has V2P() / P2V() from vmm.h for the same job; these exist
+     * for assembly and for anything that wants the value as a link time
+     * constant. */
+    kernel_start_phys = kernel_start - KERNEL_VIRTUAL_BASE;
+    kernel_end_phys   = kernel_end   - KERNEL_VIRTUAL_BASE;
+    text_start_phys   = text_start   - KERNEL_VIRTUAL_BASE;
+    text_end_phys     = text_end     - KERNEL_VIRTUAL_BASE;
+    rodata_start_phys = rodata_start - KERNEL_VIRTUAL_BASE;
+    rodata_end_phys   = rodata_end   - KERNEL_VIRTUAL_BASE;
+    data_start_phys   = data_start   - KERNEL_VIRTUAL_BASE;
+    data_end_phys     = data_end     - KERNEL_VIRTUAL_BASE;
+    bss_start_phys    = bss_start    - KERNEL_VIRTUAL_BASE;
+    bss_end_phys      = bss_end      - KERNEL_VIRTUAL_BASE;
 
     /* Toolchain leftovers we do not want in a freestanding kernel. */
     /DISCARD/ :

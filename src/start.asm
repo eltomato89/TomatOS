@@ -10,17 +10,124 @@
 ; are disabled at this point: More on interrupts later!
 [BITS 32]
 
+; ---------------------------------------------------------------------------
+; Higher half constants. These MUST agree with src/include/vmm.h.
+;
+; The kernel is linked for virtual 0xC0100000 but the bootloader loads and
+; enters it at physical 0x00100000. Until paging is on, every linker supplied
+; symbol therefore has to be corrected by hand:
+;
+;     physical address = symbol - KERNEL_VIRTUAL_BASE
+;
+; which is exactly what the V2P() macro does on the C side.
+; ---------------------------------------------------------------------------
+KERNEL_VIRTUAL_BASE equ 0xC0000000
+KERNEL_PDE_INDEX    equ (KERNEL_VIRTUAL_BASE >> 22)   ; 768
+
+; Page directory entry for a 4 MiB page at physical 0:
+;   bit 0 P (present), bit 1 RW (writable), bit 7 PS (4 MiB page)
+PDE_PRESENT         equ 0x001
+PDE_WRITE           equ 0x002
+PDE_PAGE_SIZE       equ 0x080
+PDE_BOOT_FLAGS      equ (PDE_PRESENT | PDE_WRITE | PDE_PAGE_SIZE)
+
+CR4_PSE             equ 0x00000010   ; page size extensions -> 4 MiB pages
+CR0_PG              equ 0x80000000   ; paging enable
+
 global start
 start:
+    ; ---------------------------------------------------------------------
+    ; Physical world. eip is somewhere around 0x00100000, paging is off, the
+    ; GDT is the flat one GRUB left behind (base 0, limit 4 GiB), so linear
+    ; address == physical address for the moment.
+    ; ---------------------------------------------------------------------
+
     ; Per the Multiboot specification the bootloader hands us the magic
     ; 0x2BADB002 in eax and the physical address of the info structure in ebx.
     ; Both are saved away first thing: we do not have a stack of our own yet
     ; (esp still points into the bootloader), so pushing them is not an
     ; option. From here on eax/ebx may be overwritten freely.
-    mov [mboot_magic], eax
-    mov [mboot_info], ebx
+    ;
+    ; The two slots live in .bss and are therefore linked at 0xC0xxxxxx, an
+    ; address that does not exist yet. Store through their physical aliases.
+    mov [mboot_magic - KERNEL_VIRTUAL_BASE], eax
+    mov [mboot_info  - KERNEL_VIRTUAL_BASE], ebx
 
-    mov esp, sys_stack     ; This points the stack to our new stack area
+    ; ---------------------------------------------------------------------
+    ; Build the boot page directory.
+    ;
+    ; It lives in .bss, so nothing guarantees its contents: the Multiboot
+    ; spec asks the bootloader to zero the bss, but we do not want the boot
+    ; path to depend on that, and a stray present bit here would be a triple
+    ; fault with no output at all. Zero all 1024 entries by hand first.
+    ;
+    ; 4 MiB pages (CR4.PSE) are used deliberately: two directory entries and
+    ; no second level table at all, which means no extra 4 KiB of aligned
+    ; scratch memory to find and no pointer chasing while paging is still
+    ; off. A 4 KiB boot table would need 1024 entries filled in a loop for
+    ; no benefit -- these mappings are throwaway, vmm_init() replaces them.
+    ; ---------------------------------------------------------------------
+    cld
+    mov edi, boot_page_directory - KERNEL_VIRTUAL_BASE
+    xor eax, eax
+    mov ecx, 1024
+    rep stosd
+
+    ; edi has advanced past the end of the directory, reload it.
+    mov edi, boot_page_directory - KERNEL_VIRTUAL_BASE
+
+    ; PDE 0: identity map the first 4 MiB (virtual 0x00000000 -> physical 0).
+    ; This is what keeps the instruction right after "mov cr0, eax" fetchable,
+    ; because eip is still a low physical address at that point.
+    mov dword [edi], PDE_BOOT_FLAGS
+
+    ; PDE 768: map 0xC0000000..0xC03FFFFF onto the same first 4 MiB, so the
+    ; kernel image at physical 0x00100000 also appears at 0xC0100000, exactly
+    ; where it was linked.
+    mov dword [edi + KERNEL_PDE_INDEX * 4], PDE_BOOT_FLAGS
+
+    ; ---------------------------------------------------------------------
+    ; Turn paging on. CR4.PSE must be set BEFORE CR0.PG, otherwise the PS bit
+    ; in our entries is a reserved bit and the first translation faults.
+    ; ---------------------------------------------------------------------
+    mov eax, cr4
+    or  eax, CR4_PSE
+    mov cr4, eax
+
+    mov eax, boot_page_directory - KERNEL_VIRTUAL_BASE   ; CR3 wants physical
+    mov cr3, eax
+
+    mov eax, cr0
+    or  eax, CR0_PG
+    mov cr0, eax
+    ; Paging is live. eip is still in the low range and resolves through the
+    ; identity mapping, so the next fetch succeeds.
+
+    ; A near jump is relative to eip and would keep us down in the low range
+    ; forever. Load the LINKED (virtual) address of the target into a register
+    ; and jump indirectly: the immediate is the absolute value 0xC01xxxxx that
+    ; the linker resolved, so this write to eip is what actually moves
+    ; execution into the higher half.
+    mov eax, higher_half
+    jmp eax
+
+higher_half:
+    ; ---------------------------------------------------------------------
+    ; From here on eip is above 0xC0000000 and every linker symbol may be
+    ; used as written -- no more manual "- KERNEL_VIRTUAL_BASE".
+    ; ---------------------------------------------------------------------
+
+    ; The stack only becomes valid at this instruction: sys_stack is a virtual
+    ; address in .bss and until now there was no mapping for it. Everything
+    ; above this point ran without a usable stack, which is why nothing above
+    ; pushes, calls or uses ebp.
+    mov esp, sys_stack
+
+    ; The low identity mapping (PDE 0) is deliberately LEFT IN PLACE. It is
+    ; still needed by anything that has not been converted to the higher half
+    ; view yet, and vmm_init() is the one that rebuilds the page tables from
+    ; scratch and drops it once nothing depends on it any more.
+
     jmp stublet
 
 ; This part MUST be 4byte aligned, so we solve that issue using 'ALIGN 4'
@@ -606,15 +713,29 @@ EnableA20Gate:
 	pop		ebp
 	ret
 
-SECTION .bss
+; The whole section needs 4 KiB alignment because the boot page directory
+; lives in it; CR3 only keeps bits 31..12 of the address.
+SECTION .bss align=4096
+
 ; Copies of the multiboot registers saved in 'start'. They deliberately sit
 ; BEFORE the stack area: the stack grows downwards from sys_stack, so values
 ; placed behind sys_stack would be destroyed by the very first push.
+; Written through their physical aliases before paging is on, read through
+; their virtual ones afterwards.
 mboot_magic: resd 1
 mboot_info:  resd 1
 
     resb 8192               ; This reserves 8KBytes of memory here
 sys_stack:
+
+; The page directory used to get into the higher half. Placed ABOVE the top of
+; the stack on purpose, so a stack overflow (which grows downwards away from
+; sys_stack) cannot scribble over the live paging structures.
+; Zeroed and filled in by 'start'; thrown away again by vmm_init().
+alignb 4096
+global boot_page_directory
+boot_page_directory:
+    resd 1024               ; 1024 entries * 4 bytes = one 4 KiB page
 
 ; Tell the linker that this object does not require an executable stack.
 section .note.GNU-stack noalloc noexec nowrite progbits
