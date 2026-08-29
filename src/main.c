@@ -15,6 +15,9 @@
 #include <vga.h>
 #include <fbcon.h>
 #include <multiboot.h>
+#include <pci.h>
+#include <rtl8139.h>
+#include <net.h>
 //#include <wmessages.h>
 
 #define NULL 0
@@ -353,6 +356,80 @@ extern char usertext_end[];
 *  column actually is. */
 #define GFX_INFO_LABEL   17
 
+/* --- network -------------------------------------------------------------
+*
+*  Byte order, once, because everything below depends on it: the addresses
+*  that cross this interface -- net_ip(), net_configure(), ip_send(),
+*  icmp_send_echo(), arp_cache_get() -- are HOST order 32 bit values, with
+*  a.b.c.d stored as (a << 24) | (b << 16) | (c << 8) | d. Network order
+*  belongs to the packed headers in net.h and nowhere else; net.c converts at
+*  the edge with htonl(). net_parse_ip() and net_ip_text() are the two
+*  directions of that host order form, and they are the only two places in
+*  this file that know what a dotted quad looks like.
+*
+*  Text buffer sizes. There is no sprintf() here, so a value that has to be
+*  padded into a column is written into a buffer of its own first and then
+*  handed to ps_print_left() or fs_print_right_text() like any other string. */
+#define NET_IP_TEXT      16   /* "255.255.255.255" and the terminator     */
+#define NET_MAC_TEXT     18   /* "00:11:22:33:44:55" and the terminator   */
+#define NET_HEX_TEXT      9   /* eight hex digits and the terminator      */
+#define NET_CLASS_TEXT    6   /* "06:00" and the terminator               */
+
+/* Width of the label column of "ifconfig", counted from the start of the
+*  line including the two leading spaces -- the same idea as GFX_INFO_LABEL,
+*  and for the same reason: printf() has no "%-15s". */
+#define NET_INFO_LABEL   17
+
+/* Which card the driver drives. rtl8139.c owns these two numbers; they are
+*  repeated here for one purpose only, namely to point at the line in the
+*  "lspci" table that is the network card. */
+#define NET_RTL_VENDOR   0x10EC
+#define NET_RTL_DEVICE   0x8139
+
+/* PCI class codes "lspci" names in words. Only the ones a machine this
+*  kernel boots on actually shows are listed; anything else prints its
+*  number and no name. */
+#define PCI_CLASS_STORAGE  0x01
+#define PCI_CLASS_NETWORK  0x02
+#define PCI_CLASS_DISPLAY  0x03
+#define PCI_CLASS_MULTIMEDIA 0x04
+#define PCI_CLASS_MEMORY   0x05
+#define PCI_CLASS_BRIDGE   0x06
+#define PCI_CLASS_SERIAL   0x0C
+
+/* --- ping ----------------------------------------------------------------
+*
+*  How long it waits, and why each of these numbers is what it is.
+*
+*  The ARP figures are the important ones. The first packet to an address
+*  nobody has talked to yet cannot go out at all: ip_send() needs the
+*  destination's MAC, the cache is cold, so all it can do is put a query on
+*  the wire and return an error. Retrying is not papering over a bug -- it IS
+*  how resolution works, because the answer comes back in an interrupt while
+*  this task sleeps. 50 attempts 20 ms apart give the other end a full second
+*  to answer, and cost only 20 ms when it answers at once, which on a virtual
+*  network it does. */
+#define NET_ARP_TRIES    50
+#define NET_ARP_WAIT     20   /* ms between two attempts -> 1000 ms total */
+
+/* One request, and how long its reply may take. Polled in 10 ms steps
+*  because icmp_last_reply() is a mailbox the interrupt writes into, not
+*  something that can be waited on. */
+#define NET_PING_COUNT    4   /* echo requests per run                    */
+#define NET_PING_WAIT  1000   /* ms to wait for one reply                 */
+#define NET_PING_POLL    10   /* ms between two looks at the mailbox      */
+#define NET_PING_GAP    300   /* ms between two requests, as ping does    */
+
+/* The identifier carried in every echo this shell sends, so a reply meant
+*  for somebody else's ping is not counted as ours. 0x546F is 'T','o'. */
+#define NET_PING_ID    0x546F
+
+/* What net_ping_once() returns instead of a round trip time. Zero is a
+*  perfectly good time -- a virtual network answers inside one tick -- so the
+*  failures have to be negative rather than falsy. */
+#define NET_PING_UNRESOLVED (-1)
+#define NET_PING_LOST       (-2)
+
 /* --- what the bootloader reported ----------------------------------------
 *
 *  kernel.c owns this record: it reads the framebuffer fields out of the
@@ -396,8 +473,11 @@ void listdir(char *cmd);
 void printfile(char *cmd);
 void diskfree(char *cmd);
 void graphics(char *cmd);
+void listpci(char *cmd);
+void netconfig(char *cmd);
+void arptable(char *cmd);
+void pinghost(char *cmd);
 void help(void);
-//void network_test(char *cmd);
 
 static void mem_print_right(uint32_t value, int width);
 static void mem_show_status(void);
@@ -449,6 +529,23 @@ static void gfx_check(int ok);
 static const char *gfx_mode_kind(void);
 static void gfx_info_label(const char *label);
 static void gfx_show_mode(void);
+
+static char *net_put_byte(char *p, uint32_t value);
+static void net_ip_text(uint32_t ip, char *text);
+static void net_mac_text(const uint8_t *mac, char *text);
+static void net_hex_text(uint32_t value, int digits, char *text);
+static void net_print_ip(uint32_t ip);
+static int  net_parse_ip(const char *text, uint32_t *out);
+static void net_info_label(const char *label);
+static void net_explain_down(void);
+static int  net_interface_ready(const char *what, int need_address);
+static const char *net_class_name(uint8_t class_code, uint8_t subclass);
+static uint16_t net_pci_io_base(const pci_device *dev);
+static void net_show_pci(void);
+static void net_show_interface(void);
+static void net_show_arp(void);
+static int  net_ping_once(uint32_t dst, uint16_t sequence, uint32_t *from);
+static void net_ping(uint32_t dst);
 
 /* Self-test counters, maintained by mem_check(). */
 static int mem_tests_run = 0;
@@ -513,14 +610,16 @@ void main()
 		else if(strcmp(word, "cat") == 0) printfile(cmd);
 		else if(strcmp(word, "df") == 0) diskfree(cmd);
 		else if(strcmp(word, "gfx") == 0) graphics(cmd);
+		else if(strcmp(word, "lspci") == 0) listpci(cmd);
+		else if(strcmp(word, "ifconfig") == 0) netconfig(cmd);
+		else if(strcmp(word, "arp") == 0) arptable(cmd);
+		else if(strcmp(word, "ping") == 0) pinghost(cmd);
 		else if(strcmp(word, "reboot") == 0) reboot();
 		else if(strcmp(word, "help") == 0) help();
 		else if(strcmp(word, "start") == 0) taskmgr_task_start(taskmgr_add_task( task, "Test Task", TASK_PRIORITY_LOW ));
 		else if(strcmp(word, "exit") == 0) ; /* handled by the loop condition */
 		/* Only an empty input silently brings up a new prompt. */
 		else if(word[0] != EOS) printf("Unknown command: %s\n", word);
-
-		//if(strcmp(word, "test") == 0) network_test(cmd);
 
 	} while(strcmp(cmd, "exit") != 0);
 
@@ -532,19 +631,7 @@ void main()
 	/* main() runs as a task and must not return. */
 	for(;;);
 }
-/*
-void network_test(char *cmd)
-{
-	char mac_address[7];
-	char i;
-	for (i = 0; i < 6; i++)
-	{
-		mac_address[i] = inportb(ioaddr + i); // ioaddr is the base address obtainable from the PCI device configuration space.
-	}
 
-	printf("MAC ADDRESS: %s", mac_address);
-}
-*/
 void taskmanager(char *cmd)
 {
 	if(prmc(cmd)==0)
@@ -3641,6 +3728,873 @@ void graphics(char *cmd)
 	}
 }
 
+/* --- lspci, ifconfig, arp and ping ---------------------------------------
+*
+*  Four commands and one thing they have in common: on a machine that booted
+*  without a network device -- which is what "make run" gives you -- every one
+*  of them has to say why there is nothing rather than print a row of zeroes.
+*  net_explain_down() is that answer, in one place, and the three states it
+*  tells apart are no card on the bus, a card the stack was never brought up
+*  on, and a stack that has no address yet.
+*
+*  These are the shell's commands, not the stack's: everything below asks
+*  net.h, pci.h and rtl8139.h questions and formats the answers. No packet is
+*  built here.
+*
+*  The formatting helpers exist because printf() has neither field widths nor
+*  a way to print an address or a MAC. A value that has to line up in a column
+*  is written into a small buffer first and then padded by ps_print_left() or
+*  fs_print_right_text(), the same two routines the "ps" and "df" tables use.
+*/
+
+/* One decimal byte, 0..255, without leading zeroes. Returns the position
+*  after the digits it wrote so the callers can chain. */
+static char *net_put_byte(char *p, uint32_t value)
+{
+	if(value >= 100)
+	{
+		*p = (char)('0' + (value / 100));
+		p++;
+	}
+
+	if(value >= 10)
+	{
+		*p = (char)('0' + ((value / 10) % 10));
+		p++;
+	}
+
+	*p = (char)('0' + (value % 10));
+	p++;
+	return p;
+}
+
+/* Writes a host order address as a dotted quad. text holds NET_IP_TEXT
+*  bytes. This and net_parse_ip() are the two directions of the same format
+*  and are kept next to each other for that reason -- there is no inet_aton()
+*  here to borrow, and this printf() cannot print an address either. */
+static void net_ip_text(uint32_t ip, char *text)
+{
+	char *p;
+	int i;
+
+	p = text;
+	for(i = 3; i >= 0; i--)
+	{
+		p = net_put_byte(p, (ip >> (i * 8)) & 0xFF);
+		if(i > 0)
+		{
+			*p = '.';
+			p++;
+		}
+	}
+
+	*p = EOS;
+}
+
+/* Writes a MAC as six colon separated hex pairs. text holds NET_MAC_TEXT
+*  bytes. A null pointer -- which is what net_mac() hands back when there is
+*  no card -- is spelled out rather than dereferenced. */
+static void net_mac_text(const uint8_t *mac, char *text)
+{
+	const char *hexdigit = "0123456789ABCDEF";
+	char *p;
+	int i;
+
+	if(mac == 0)
+	{
+		strcpy(text, "(none)");
+		return;
+	}
+
+	p = text;
+	for(i = 0; i < ETH_ALEN; i++)
+	{
+		*p = hexdigit[(mac[i] >> 4) & 0xF];
+		p++;
+		*p = hexdigit[mac[i] & 0xF];
+		p++;
+		if(i < ETH_ALEN - 1)
+		{
+			*p = ':';
+			p++;
+		}
+	}
+
+	*p = EOS;
+}
+
+/* Writes value as exactly the given number of upper case hex digits, with
+*  leading zeroes and no "0x" in front -- a vendor id is written 10EC and
+*  8139, never 0x10EC and 0x8139, so that the two columns line up under each
+*  other. page_print_hex() prints the other form, for addresses.
+*  text holds NET_HEX_TEXT bytes and digits is at most 8. */
+static void net_hex_text(uint32_t value, int digits, char *text)
+{
+	const char *hexdigit = "0123456789ABCDEF";
+	int i;
+
+	for(i = 0; i < digits; i++)
+	{
+		text[i] = hexdigit[(value >> ((digits - 1 - i) * 4)) & 0xF];
+	}
+
+	text[digits] = EOS;
+}
+
+static void net_print_ip(uint32_t ip)
+{
+	char text[NET_IP_TEXT];
+
+	net_ip_text(ip, text);
+	printf("%s", text);
+}
+
+/* Reads a dotted quad into a host order address. Returns 1 when the whole
+*  string was one, 0 otherwise -- deliberately strict, because a typed
+*  address that is silently taken to mean something else is worse than a
+*  refusal: exactly four parts, one to three digits each, every part 0..255,
+*  and nothing at all after the last one. */
+static int net_parse_ip(const char *text, uint32_t *out)
+{
+	uint32_t address;
+	int part;
+	int value;
+	int digits;
+	int i;
+
+	address = 0;
+	i = 0;
+
+	for(part = 0; part < 4; part++)
+	{
+		value = 0;
+		digits = 0;
+
+		while(text[i] >= '0' && text[i] <= '9')
+		{
+			value = value * 10 + (text[i] - '0');
+			if(value > 255) return 0;
+			digits++;
+			i++;
+		}
+
+		if(digits == 0 || digits > 3) return 0;
+
+		address = (address << 8) | (uint32_t)value;
+
+		if(part < 3)
+		{
+			if(text[i] != '.') return 0;
+			i++;
+		}
+	}
+
+	if(text[i] != EOS) return 0;
+
+	*out = address;
+	return 1;
+}
+
+/* The label column of "ifconfig", padded the way gfx_info_label() pads the
+*  one of "gfx -i". */
+static void net_info_label(const char *label)
+{
+	int used;
+
+	printf("  %s", label);
+
+	used = 2 + (int)strlen(label);
+	while(used < NET_INFO_LABEL)
+	{
+		putch(' ');
+		used++;
+	}
+}
+
+/* Why there is no network. The one place that knows, so that all four
+*  commands give the same account of the same machine.
+*
+*  Having no network device is a normal state here, not a failure -- "make
+*  run" boots without one -- so the reasons that lead to it are told apart.
+*  A bus that answered with nothing at all is a different situation from a
+*  bus full of devices none of which is a network card, and only the first
+*  points at the kernel rather than at the machine. */
+static void net_explain_down(void)
+{
+	if(!rtl8139_present())
+	{
+		if(pci_count() == 0)
+		{
+			printf("  The PCI bus was not enumerated at all, so no card was ever\n");
+			printf("  looked for. Every PC answers with at least a host bridge,\n");
+			printf("  so an empty bus means the enumeration has not run.\n");
+		} else {
+			printf("  %i PCI device(s) answered, none of them an RTL8139.\n",
+			       pci_count());
+			printf("  Booting without a network device is a normal case here --\n");
+			printf("  \"make run\" does exactly that. \"lspci\" shows what the bus\n");
+			printf("  did answer with.\n");
+		}
+		return;
+	}
+
+	if(!net_up())
+	{
+		printf("  The card was found, but the stack was not brought up on it,\n");
+		printf("  so nothing can be sent or received.\n");
+		return;
+	}
+
+	if(net_ip() == 0)
+	{
+		printf("  The interface is up but has no address yet. Set one with\n");
+		printf("  \"ifconfig 10.0.2.15 255.255.255.0 10.0.2.2\", which is what\n");
+		printf("  QEMU's user network expects.\n");
+	}
+}
+
+/* Guard in front of a command that needs to put a packet on the wire.
+*  Returns 1 when it may go ahead. */
+static int net_interface_ready(const char *what, int need_address)
+{
+	if(!rtl8139_present())
+	{
+		printf("%s: no network card is present.\n", what);
+		net_explain_down();
+		return 0;
+	}
+
+	if(!net_up())
+	{
+		printf("%s: the network stack is not up.\n", what);
+		net_explain_down();
+		return 0;
+	}
+
+	if(need_address && net_ip() == 0)
+	{
+		printf("%s: no address is configured.\n", what);
+		net_explain_down();
+		return 0;
+	}
+
+	return 1;
+}
+
+/* --- lspci --------------------------------------------------------------- */
+
+/* What a class code means, in the words one would use out loud. The subclass
+*  is only consulted where it changes the answer usefully -- a bridge is worth
+*  distinguishing from a host bridge, an IDE controller from a disk controller
+*  in general. Everything unrecognised keeps its number and loses its name. */
+static const char *net_class_name(uint8_t class_code, uint8_t subclass)
+{
+	switch(class_code)
+	{
+		case PCI_CLASS_STORAGE:
+			if(subclass == 0x01) return "IDE controller";
+			if(subclass == 0x06) return "SATA controller";
+			return "Mass storage";
+		case PCI_CLASS_NETWORK:
+			if(subclass == 0x00) return "Ethernet controller";
+			return "Network controller";
+		case PCI_CLASS_DISPLAY:
+			if(subclass == 0x00) return "VGA controller";
+			return "Display controller";
+		case PCI_CLASS_MULTIMEDIA:
+			return "Multimedia device";
+		case PCI_CLASS_MEMORY:
+			return "Memory controller";
+		case PCI_CLASS_BRIDGE:
+			if(subclass == 0x00) return "Host bridge";
+			if(subclass == 0x01) return "ISA bridge";
+			if(subclass == 0x04) return "PCI-to-PCI bridge";
+			return "Bridge";
+		case PCI_CLASS_SERIAL:
+			if(subclass == 0x03) return "USB controller";
+			return "Serial bus controller";
+		default:
+			break;
+	}
+
+	return "Device";
+}
+
+/* The first of the six base address registers that describes an I/O region,
+*  or 0 when the device is memory mapped only. That port number is what a
+*  driver needs and therefore what this table is really for. */
+static uint16_t net_pci_io_base(const pci_device *dev)
+{
+	uint16_t base;
+	int bar;
+
+	for(bar = 0; bar < 6; bar++)
+	{
+		base = pci_io_base(dev, bar);
+		if(base != 0) return base;
+	}
+
+	return 0;
+}
+
+/* "lspci": one row per device, and underneath it the answer to the question
+*  this command is normally run to ask -- is the network card there.
+*
+*  The columns are the ones a driver needs: where the device sits, what it
+*  says it is, which interrupt line it was given, and the I/O base it answers
+*  on. Everything is built into a small text buffer first and padded into the
+*  column afterwards, because printf() has no field widths. */
+static void net_show_pci(void)
+{
+	const pci_device *dev;
+	const pci_device *card;
+	char text[NET_HEX_TEXT];
+	char class_text[NET_CLASS_TEXT];
+	char io_text[NET_HEX_TEXT + 2];
+	uint16_t io;
+	int count;
+	int network;
+	int i;
+
+	count = pci_count();
+
+	printf("PCI devices:\n");
+
+	if(count == 0)
+	{
+		printf("  None. The bus was not enumerated, or nothing answered on it.\n");
+		printf("  Every PC has at least a host bridge, so an empty list here\n");
+		printf("  almost always means the enumeration has not run rather than\n");
+		printf("  that the machine is empty.\n");
+		return;
+	}
+
+	printf("  ");
+	fs_print_right_text("Bus", 3);
+	fs_print_right_text("Slot", 6);
+	fs_print_right_text("Fn", 4);
+	fs_print_right_text("Vendor", 8);
+	fs_print_right_text("Device", 8);
+	fs_print_right_text("Class", 7);
+	fs_print_right_text("IRQ", 5);
+	fs_print_right_text("I/O base", 10);
+	printf("  Description\n");
+
+	network = 0;
+
+	for(i = 0; i < count; i++)
+	{
+		dev = pci_get(i);
+		if(dev == 0) continue;
+
+		if(dev->class_code == PCI_CLASS_NETWORK) network++;
+
+		printf("  ");
+		net_hex_text((uint32_t)dev->bus, 2, text);
+		fs_print_right_text(text, 3);
+		net_hex_text((uint32_t)dev->slot, 2, text);
+		fs_print_right_text(text, 6);
+		mem_print_right((uint32_t)dev->func, 4);
+		net_hex_text((uint32_t)dev->vendor, 4, text);
+		fs_print_right_text(text, 8);
+		net_hex_text((uint32_t)dev->device, 4, text);
+		fs_print_right_text(text, 8);
+
+		/* Class and subclass as one cell, "06:00", the way the pair is
+		   always written -- they are only meaningful together. */
+		net_hex_text((uint32_t)dev->class_code, 2, class_text);
+		class_text[2] = ':';
+		net_hex_text((uint32_t)dev->subclass, 2, class_text + 3);
+		fs_print_right_text(class_text, 7);
+
+		mem_print_right((uint32_t)dev->irq, 5);
+
+		io = net_pci_io_base(dev);
+		if(io == 0)
+		{
+			/* Not a failure: a device can be memory mapped only. */
+			fs_print_right_text("-", 10);
+		} else {
+			io_text[0] = '0';
+			io_text[1] = 'x';
+			net_hex_text((uint32_t)io, 4, io_text + 2);
+			fs_print_right_text(io_text, 10);
+		}
+
+		printf("  %s\n", net_class_name(dev->class_code, dev->subclass));
+	}
+
+	printf("  %i device(s) found, %i of them a network controller.\n",
+	       count, network);
+
+	/* And the line this command is usually run for. */
+	card = pci_find(NET_RTL_VENDOR, NET_RTL_DEVICE);
+	if(card == 0)
+	{
+		printf("  No RTL8139 (10EC:8139) is on this bus, so the network stack\n");
+		printf("  has no card to drive. That is the normal state of \"make run\"\n");
+		printf("  without a network device.\n");
+		return;
+	}
+
+	net_hex_text((uint32_t)card->bus, 2, text);
+	printf("  RTL8139 at %s:", text);
+	net_hex_text((uint32_t)card->slot, 2, text);
+	printf("%s.%i, ", text, (int)card->func);
+	io_text[0] = '0';
+	io_text[1] = 'x';
+	net_hex_text((uint32_t)net_pci_io_base(card), 4, io_text + 2);
+	printf("I/O base %s, IRQ %i -- ", io_text, (int)card->irq);
+
+	if(rtl8139_present())
+	{
+		printf("the driver is using it.\n");
+	} else {
+		printf("the driver did not take it.\n");
+	}
+}
+
+/* --- ifconfig ------------------------------------------------------------ */
+
+/* "ifconfig": the interface, its addresses and what has actually moved.
+*
+*  The counters are the honest part of this: net_rx_packets() counts what the
+*  card's interrupt handed up, net_rx_dropped() what the stack threw away
+*  again, and the two together say a great deal more about a network that is
+*  not working than any status word does. */
+static void net_show_interface(void)
+{
+	char text[NET_MAC_TEXT];
+	int configured;
+
+	configured = (net_ip() != 0);
+
+	printf("Interface eth0:\n");
+
+	net_info_label("Status:");
+	if(!rtl8139_present())
+	{
+		printf("down -- no network card was found\n");
+	}
+	else if(!net_up())
+	{
+		printf("down -- card present, stack not up\n");
+	}
+	else if(!configured)
+	{
+		printf("up -- no address configured\n");
+	} else {
+		printf("up\n");
+	}
+
+	net_info_label("Card:");
+	if(rtl8139_present())
+	{
+		printf("%s\n", rtl8139_info());
+	} else {
+		printf("none on the PCI bus\n");
+	}
+
+	/* Asked of the card rather than of net_mac(): with no card the stack
+	   holds an all zero address, and six zero bytes printed as a MAC look
+	   like an answer instead of the absence of one. */
+	net_mac_text(rtl8139_present() ? net_mac() : 0, text);
+	net_info_label("Hardware:");
+	printf("%s\n", text);
+
+	net_info_label("Address:");
+	net_print_ip(net_ip());
+	if(!configured) printf("  (not configured)");
+	printf("\n");
+
+	net_info_label("Netmask:");
+	net_print_ip(net_netmask());
+	printf("\n");
+
+	net_info_label("Gateway:");
+	net_print_ip(net_gateway());
+	printf("\n");
+
+	printf("  RX packets: ");
+	mem_print_right(net_rx_packets(), 8);
+	printf("   dropped: ");
+	mem_print_right(net_rx_dropped(), 8);
+	printf("\n");
+
+	printf("  TX packets: ");
+	mem_print_right(net_tx_packets(), 8);
+	printf("\n");
+
+	/* A row of zeroes explains nothing by itself, so when the interface
+	   cannot carry a packet it says why underneath. */
+	if(!rtl8139_present() || !net_up() || !configured)
+	{
+		printf("\n");
+		net_explain_down();
+	}
+}
+
+/* --- arp ----------------------------------------------------------------- */
+
+/* "arp": which addresses have been resolved to which cards.
+*
+*  Worth looking at exactly when a ping does not work, because it separates
+*  "the other end never answered who-has" from "it answered and the packets
+*  are getting lost afterwards". */
+static void net_show_arp(void)
+{
+	uint8_t mac[ETH_ALEN];
+	char ip_text[NET_IP_TEXT];
+	char mac_text[NET_MAC_TEXT];
+	uint32_t ip;
+	int entries;
+	int shown;
+	int i;
+
+	entries = arp_cache_entries();
+
+	printf("ARP cache:\n");
+
+	if(entries <= 0)
+	{
+		printf("  Empty -- no address has been resolved yet.\n");
+
+		if(!rtl8139_present() || !net_up())
+		{
+			net_explain_down();
+		} else {
+			printf("  An entry appears as soon as something is sent somewhere:\n");
+			printf("  \"ping\" resolves its destination before the first echo\n");
+			printf("  request can go out.\n");
+		}
+		return;
+	}
+
+	printf("  ");
+	ps_print_left("Address", NET_IP_TEXT);
+	printf("Hardware\n");
+
+	/* arp_cache_get() answers 0 for an index it filled in and a negative
+	   value for one it has nothing for -- 0 is the success, not the failure,
+	   which is the opposite of what the eye expects here. The indices run
+	   over the resolved entries in order, so the first refusal is the end of
+	   the list; the loop is still bounded by the cache size rather than by
+	   the count, so a cache that grows between the two calls cannot run it
+	   off the end. */
+	shown = 0;
+	for(i = 0; i < ARP_CACHE_SIZE; i++)
+	{
+		if(arp_cache_get(i, &ip, mac) != 0) break;
+
+		net_ip_text(ip, ip_text);
+		net_mac_text(mac, mac_text);
+
+		printf("  ");
+		ps_print_left(ip_text, NET_IP_TEXT);
+		printf("%s\n", mac_text);
+		shown++;
+	}
+
+	printf("  %i of %i cache entries in use.\n", shown, ARP_CACHE_SIZE);
+}
+
+/* --- ping ---------------------------------------------------------------- */
+
+/* Sequence numbers are handed out from here and never handed out twice for
+*  as long as the machine runs. That is what makes a reply identifiable.
+*
+*  icmp_last_reply() is a mailbox: it reports the last echo reply that came
+*  in, and it keeps reporting it. A per run counter starting at 1 would mean
+*  the reply to the first request of the previous ping is sitting there
+*  looking exactly like the reply to the first request of this one -- and a
+*  reply that arrives late, after this ping has already written its request
+*  off, would be counted for the next request instead. A number that only
+*  ever goes up makes both impossible. */
+static uint16_t net_next_sequence = 1;
+
+/* Sends one echo request and waits for its reply. Returns the round trip
+*  time in milliseconds, or NET_PING_UNRESOLVED when ARP never answered and
+*  the request could not even be sent, or NET_PING_LOST when it went out and
+*  nothing came back. The address the reply came from is stored through from.
+*
+*  Two things this has to get right, and neither of them is visible in the
+*  return value of icmp_send_echo():
+*
+*  1. The first request to an address cannot go out. ip_send() needs a MAC,
+*     the ARP cache is cold, so it puts a who-has on the wire and fails. The
+*     answer arrives in an interrupt some milliseconds later. Retrying is not
+*     a workaround, it is the resolution: NET_ARP_TRIES attempts NET_ARP_WAIT
+*     milliseconds apart, one second in total, and it usually succeeds on the
+*     second attempt.
+*
+*  2. The reply is not returned by anything. It arrives in interrupt context
+*     while this task sleeps and is left in icmp_last_reply(), which is
+*     therefore polled -- and matched on both the identifier and the sequence
+*     number that were sent, so that neither somebody else's ping nor an old
+*     reply of our own is counted as an answer to this request. */
+static int net_ping_once(uint32_t dst, uint16_t sequence, uint32_t *from)
+{
+	uint32_t reply_from;
+	uint16_t reply_id;
+	uint16_t reply_sequence;
+	int start;
+	int waited;
+	int elapsed;
+	int tries;
+	int rc;
+
+	/* Set before anything can fail, and set again from the reply itself when
+	*  one arrives -- so a reply that came from somewhere other than the
+	*  address that was pinged shows up as exactly that. The three reply
+	*  fields are cleared because icmp_last_reply() leaves them alone when it
+	*  has nothing to report. */
+	*from = dst;
+	reply_from = 0;
+	reply_id = 0;
+	reply_sequence = 0;
+
+	rc = icmp_send_echo(dst, NET_PING_ID, sequence);
+
+	for(tries = 0; rc != 0 && tries < NET_ARP_TRIES; tries++)
+	{
+		if(tries == 0)
+		{
+			printf("resolving ");
+			net_print_ip(dst);
+			printf(" ... ");
+		}
+
+		sleep(NET_ARP_WAIT);
+		rc = icmp_send_echo(dst, NET_PING_ID, sequence);
+	}
+
+	if(rc != 0) return NET_PING_UNRESOLVED;
+
+	start = timer_get_ticks();
+
+	for(waited = 0; waited < NET_PING_WAIT; waited += NET_PING_POLL)
+	{
+		if(icmp_last_reply(&reply_from, &reply_id, &reply_sequence)
+		   && reply_id == (uint16_t)NET_PING_ID
+		   && reply_sequence == sequence)
+		{
+			*from = reply_from;
+
+			/* The clock has a millisecond of resolution, so a reply that
+			   beats it reads as zero. Zero is a time, not a failure -- which
+			   is why the failures above are negative. */
+			elapsed = timer_get_ticks() - start;
+			if(elapsed < 0) elapsed = 0;
+			return elapsed;
+		}
+
+		sleep(NET_PING_POLL);
+	}
+
+	return NET_PING_LOST;
+}
+
+/* "ping ADDRESS": NET_PING_COUNT echo requests, one line each, and the
+*  summary a ping is expected to end with. */
+static void net_ping(uint32_t dst)
+{
+	uint32_t from;
+	uint16_t sequence;
+	int received;
+	int fastest;
+	int slowest;
+	int total;
+	int start;
+	int rtt;
+	int i;
+
+	printf("PING ");
+	net_print_ip(dst);
+	printf(": %i requests, %i ms for a reply, %i ms for ARP.\n",
+	       NET_PING_COUNT, NET_PING_WAIT, NET_ARP_TRIES * NET_ARP_WAIT);
+
+	received = 0;
+	fastest = 0;
+	slowest = 0;
+	total = 0;
+	start = timer_get_ticks();
+
+	for(i = 0; i < NET_PING_COUNT; i++)
+	{
+		sequence = net_next_sequence;
+		net_next_sequence++;
+
+		/* The number printed is the one that goes on the wire, which is why
+		   a second run of "ping" carries on where the first stopped instead
+		   of counting from one again. */
+		printf("  seq %i: ", (int)sequence);
+
+		rtt = net_ping_once(dst, sequence, &from);
+
+		if(rtt == NET_PING_UNRESOLVED)
+		{
+			/* The address is already on this line, in front of the
+			   ellipsis, so it is not repeated -- the line has to stay
+			   inside eighty columns. */
+			printf("no ARP reply in %i ms -- unreachable\n",
+			       NET_ARP_TRIES * NET_ARP_WAIT);
+		}
+		else if(rtt == NET_PING_LOST)
+		{
+			printf("no reply within %i ms\n", NET_PING_WAIT);
+		} else {
+			printf("reply from ");
+			net_print_ip(from);
+			printf(", %i ms\n", rtt);
+
+			if(received == 0 || rtt < fastest) fastest = rtt;
+			if(received == 0 || rtt > slowest) slowest = rtt;
+			total += rtt;
+			received++;
+		}
+
+		/* A real ping paces itself, and the pause is also what lets a late
+		   reply to this request arrive and be discarded before the next one
+		   goes out. Not after the last one -- nothing is waiting on it. */
+		if(i < NET_PING_COUNT - 1) sleep(NET_PING_GAP);
+	}
+
+	printf("  --- ");
+	net_print_ip(dst);
+	printf(" ping statistics ---\n");
+
+	printf("  %i sent, %i received, %i%% loss, %i ms total\n",
+	       NET_PING_COUNT, received,
+	       ((NET_PING_COUNT - received) * 100) / NET_PING_COUNT,
+	       timer_get_ticks() - start);
+
+	if(received > 0)
+	{
+		printf("  round trip min/avg/max = %i/%i/%i ms\n",
+		       fastest, total / received, slowest);
+	}
+}
+
+/* --- the commands themselves --------------------------------------------- */
+
+void listpci(char *cmd)
+{
+	if(prmc(cmd) != 0)
+	{
+		printf("Syntax: lspci\n");
+		printf("\t          List the devices the PCI enumeration found\n");
+		return;
+	}
+
+	net_show_pci();
+}
+
+void netconfig(char *cmd)
+{
+	char address_text[100];
+	char netmask_text[100];
+	char gateway_text[100];
+	uint32_t address;
+	uint32_t netmask;
+	uint32_t gateway;
+
+	if(prmc(cmd) == 0)
+	{
+		net_show_interface();
+		return;
+	}
+
+	if(prmc(cmd) != 3)
+	{
+		printf("Syntax: ifconfig [IP NETMASK GATEWAY]\n");
+		printf("\t          Show the interface, its addresses and counters\n");
+		printf("\tIP ...    Set all three, for example\n");
+		printf("\t          ifconfig 10.0.2.15 255.255.255.0 10.0.2.2\n");
+		printf("\t          which is what QEMU's user network expects\n");
+		return;
+	}
+
+	/* prmv() hands back a pointer into one static buffer, so each argument
+	   is copied out before the next call overwrites it. */
+	strcpy(address_text, prmv(1, cmd));
+	strcpy(netmask_text, prmv(2, cmd));
+	strcpy(gateway_text, prmv(3, cmd));
+
+	if(!net_parse_ip(address_text, &address))
+	{
+		printf("ifconfig: %s is not an address.\n", address_text);
+		return;
+	}
+
+	if(!net_parse_ip(netmask_text, &netmask))
+	{
+		printf("ifconfig: %s is not a netmask.\n", netmask_text);
+		return;
+	}
+
+	if(!net_parse_ip(gateway_text, &gateway))
+	{
+		printf("ifconfig: %s is not an address.\n", gateway_text);
+		return;
+	}
+
+	/* A netmask is a run of ones followed by a run of zeroes, and nothing
+	   else. The check is worth making because a mask like 255.0.255.0 does
+	   not fail loudly later -- it just makes "is this address on my subnet"
+	   answer nonsense, and the packet goes to the wrong next hop. */
+	if((~netmask & (~netmask + (uint32_t)1)) != (uint32_t)0)
+	{
+		printf("ifconfig: %s is not a contiguous netmask.\n", netmask_text);
+		return;
+	}
+
+	net_configure(address, netmask, gateway);
+	net_show_interface();
+}
+
+void arptable(char *cmd)
+{
+	if(prmc(cmd) != 0)
+	{
+		printf("Syntax: arp\n");
+		printf("\t          Show which addresses have been resolved to a MAC\n");
+		return;
+	}
+
+	net_show_arp();
+}
+
+void pinghost(char *cmd)
+{
+	char address_text[100];
+	uint32_t dst;
+
+	if(prmc(cmd) == 0)
+	{
+		printf("Syntax: ping IP\n");
+		printf("\t          Send %i echo requests and time the replies,\n",
+		       NET_PING_COUNT);
+		printf("\t          for example ping 10.0.2.2\n");
+		return;
+	}
+
+	/* prmv() hands back a pointer into one static buffer, so the address is
+	   copied out before anything else can call prmv() again. */
+	strcpy(address_text, prmv(1, cmd));
+
+	if(!net_parse_ip(address_text, &dst))
+	{
+		printf("ping: %s is not an address.\n", address_text);
+		printf("      An address is four numbers 0..255 separated by dots,\n");
+		printf("      for example 10.0.2.2. There is no resolver here.\n");
+		return;
+	}
+
+	if(!net_interface_ready("ping", 1)) return;
+
+	net_ping(dst);
+}
+
 void help(void)
 {
 	printf("TomatOS Help\n");
@@ -3659,6 +4613,11 @@ void help(void)
 	printf("\tdf        Show the mounted filesystem and the drives found\n");
 	printf("\tgfx       Draw the graphics demo, gfx -t tests mode 13h,\n");
 	printf("\t          gfx -i shows the mode the machine booted into\n");
+	printf("\tlspci     List the devices the PCI enumeration found\n");
+	printf("\tifconfig  Show the interface and its counters,\n");
+	printf("\t          ifconfig IP NETMASK GATEWAY sets the addresses\n");
+	printf("\tarp       Show the ARP cache, address to hardware address\n");
+	printf("\tping      ping IP sends echo requests and times the replies\n");
 	printf("\treboot    Restart the computer\n");
 	printf("\texit      Exit the shell\n");
 }

@@ -170,6 +170,36 @@ QEMU_KEYMAP ?= de
 QEMUFLAGS := -m 32 -k $(QEMU_KEYMAP)
 
 # ---------------------------------------------------------------------------
+#  Network
+#
+#  QEMU's user mode network needs neither root nor a TAP device: it emulates a
+#  small network in userspace behind a NAT. The addresses in it are fixed and
+#  the kernel has to be told them, since there is no DHCP client:
+#
+#      10.0.2.15   the guest
+#      10.0.2.2    gateway, answers ARP and ICMP echo -- the ping target
+#      10.0.2.3    DNS forwarder
+#      255.255.255.0
+#
+#  The card is an RTL8139 because that is the one src/rtl8139.c drives.
+#
+#  Turn it off with:   make run NET=0
+#  Record traffic with: make run NETDUMP=1   -> build/net.pcap, readable by
+#  wireshark or "tcpdump -r". That capture is the arbiter when a packet
+#  leaves the kernel but nothing answers: it shows whether the frame reached
+#  the wire at all and whether its byte order is what we think it is.
+NET     ?= 1
+NETDUMP ?= 0
+
+ifeq ($(NET),1)
+NETDEV := -netdev user,id=n0
+ifeq ($(NETDUMP),1)
+NETDEV += -object filter-dump,id=dump0,netdev=n0,file=$(abspath $(BUILD_DIR))/net.pcap
+endif
+QEMUFLAGS += $(NETDEV) -device rtl8139,netdev=n0
+endif
+
+# ---------------------------------------------------------------------------
 #  FAT hard disk image
 #
 #  Geometry is chosen, not defaulted, because the FAT type follows from it and
@@ -1019,6 +1049,12 @@ help:
 	@echo "  VNC_CLIENT=<prog>     use a different VNC client"
 	@echo "  VNC_DISPLAY=<n>       different display number (port 5900+n)"
 	@echo "  QEMU_KEYMAP=<layout>  keyboard layout, default: de"
+	@echo "  NET=0                 run without a network card"
+	@echo "  NETDUMP=1             record traffic to $(BUILD_DIR)/net.pcap"
+	@echo ""
+	@echo "Network (QEMU user mode, no root needed) - set from the shell:"
+	@echo "  ifconfig 10.0.2.15 255.255.255.0 10.0.2.2"
+	@echo "  ping 10.0.2.2         the gateway answers ARP and ICMP echo"
 	@echo ""
 	@echo "User programs (user/<name>.c -> $(BUILD_DIR)/<name>.elf):"
 	@echo "  $(USER_PROGS)"

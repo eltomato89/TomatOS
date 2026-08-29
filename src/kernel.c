@@ -17,6 +17,9 @@
 #include <exec.h>
 #include <ata.h>
 #include <fat.h>
+#include <pci.h>
+#include <rtl8139.h>
+#include <net.h>
 #define cpuid(in, a, b, c, d) __asm__("cpuid": "=a" (a), "=b" (b), "=c" (c), "=d" (d) : "a" (in));
 
 void *memcpy(void *dest, const void *src, size_t count)
@@ -488,6 +491,42 @@ static void disk_init(void)
 		(int)(fat_total_bytes() / 1024u));
 }
 
+/* ---------------------------------------------------------------------------
+*  network_init() - PCI bus, network card, protocol stack
+*
+*  Three layers, and the order between them is not a matter of taste: pci_init()
+*  enumerates the bus, rtl8139_init() looks up its card in what the enumeration
+*  found, and net_init() has a MAC address to work with only once the card
+*  answered. Nothing here probes hardware blindly; without the PCI scan the
+*  kernel has no idea a network card exists at all.
+*
+*  Placed after disk_init() and after sti, and that placement is the point:
+*  the card delivers received frames through an interrupt, so it is only from
+*  here on that anything can arrive. Bringing it up earlier would work too -
+*  irq_install_handler() just fills a table entry - but the frames would pile
+*  up in the receive ring with nobody reading it, for no gain.
+*
+*  No card is the normal case: "make run NET=0", and every machine that has
+*  none. rtl8139_init() then reports nothing found, net_init() marks the stack
+*  down, and the shell comes up with ifconfig able to say why rather than
+*  showing zeros. Nothing below may keep the boot from finishing.
+*
+*  The address is not configured here. QEMU's user network has no DHCP client
+*  on our side, so it has to be set by hand from the shell:
+*
+*      ifconfig 10.0.2.15 255.255.255.0 10.0.2.2
+*      ping 10.0.2.2
+*
+*  Hardcoding those would be wrong the moment the kernel meets a real network,
+*  and a DHCP client is a protocol of its own - deliberately not part of this
+*  step. */
+static void network_init(void)
+{
+	pci_init();
+	rtl8139_init();
+	net_init();
+}
+
 /* Entry point from start.asm. mbi_phys is the pointer the bootloader left in
 *  ebx: a PHYSICAL address. The kernel runs in the higher half, so that value
 *  is not a usable pointer - it is converted once, right here, and everything
@@ -786,6 +825,10 @@ int kernel(uint32_t magic, multiboot_info *mbi_phys)
 	*  driver may wait for hardware with sleep(). See the ordering comment
 	*  above. Says nothing when there is no drive. */
 	disk_init();
+
+	/* Network last: it is the only driver whose work starts by itself, from
+	*  an interrupt, and there is nothing above it that waits on the result. */
+	network_init();
 
 	task_console = taskmgr_add_task( main, "CONSOLE", TASK_PRIORITY_REALTIME );
 	taskmgr_task_start(task_console);
