@@ -1,14 +1,16 @@
-# Build-Ausgaben
+# Build output
 build/
 *.o
 *.elf
 *.iso
 
-# Alte Windows-Toolchain (55 MB Binaries, bleibt lokal unter legacy/tools/)
+# The 2011 Windows toolchain (55 MB of binaries, kept locally under
+# legacy/tools/). The batch files next to it ARE tracked -- they are small and
+# they document how the project used to be built.
 legacy/tools/
 tools/
 
-# Editor-/OS-Muell
+# Editor and OS droppings
 .DS_Store
 *~
 *.swp
