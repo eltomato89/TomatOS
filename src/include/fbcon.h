@@ -112,4 +112,25 @@ extern uint8_t *fbcon_pixels(void);
 *  cards but not all. */
 extern uint32_t fbcon_rgb(uint8_t r, uint8_t g, uint8_t b);
 
+/* The framebuffer's PHYSICAL address, for code that has to map it somewhere
+*  other than where the kernel put it -- which today means handing it to a ring
+*  3 program. 0 when there is none. */
+extern uint32_t fbcon_phys(void);
+
+/* Hands the screen to somebody else, and takes it back.
+*
+*  While suspended the console keeps its shadow buffer up to date and paints
+*  nothing: everything printed meanwhile is remembered and appears at
+*  fbcon_resume(), which repaints the whole screen from it. That is the same
+*  arrangement "gfx" uses to draw over the console and put it back, generalised
+*  so that a ring 3 program can do it -- and it is why the console does not
+*  have to be told anything about what the other program drew.
+*
+*  Nesting is not supported and is refused rather than counted: two owners of
+*  one screen is not a thing that can be made to work, and the caller that
+*  loses would find out by having its drawing overwritten. */
+extern int fbcon_suspend(void);
+extern void fbcon_resume(void);
+extern int fbcon_suspended(void);
+
 #endif

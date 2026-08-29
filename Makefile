@@ -116,7 +116,7 @@ LDFLAGS  := -m elf_i386 -T $(LINKER_SCRIPT) -nostdlib -no-pie
 # command. Keep the names to eight characters: they end up as 8.3 entries on a
 # FAT16 volume, and a longer one would need a VFAT long name entry, which the
 # kernel's directory reader skips.
-USER_PROGS := hello ls cat fetch rm cp
+USER_PROGS := hello ls cat fetch rm cp gui
 
 # The C library every program links against: user/lib.c, holding _start (which
 # calls main), printf, the string routines and the file helpers. It is a plain
@@ -125,6 +125,14 @@ USER_PROGS := hello ls cat fetch rm cp
 # nothing here either way.
 USER_LIB_SRC := $(USER_DIR)/lib.c
 USER_LIB_OBJ := $(USER_OBJ_DIR)/lib.o
+
+# Extra objects for one program only, named per program. gfxlib is NOT in
+# USER_LIB_OBJ and must not be: its back buffer is 3 MiB of .bss, and linking
+# it into every program would give "ls" a three megabyte memory image for a
+# buffer it never touches. The loader allocates a frame per page of memsz, so
+# that is not a number on disk -- it is real RAM at every start.
+USER_GFX_OBJ  := $(USER_OBJ_DIR)/gfxlib.o
+USER_EXTRA_gui := $(USER_GFX_OBJ)
 
 USER_ELFS  := $(patsubst %,$(BUILD_DIR)/%.elf,$(USER_PROGS))
 USER_OBJS  := $(patsubst %,$(USER_OBJ_DIR)/%.o,$(USER_PROGS))
@@ -583,7 +591,7 @@ $(USER_OBJ_DIR):
 # --- user space programs ---------------------------------------------------
 user: $(USER_ELFS) $(USER_MODULES)
 
-$(USER_OBJS) $(USER_LIB_OBJ): $(USER_OBJ_DIR)/%.o: $(USER_DIR)/%.c | $(USER_OBJ_DIR)
+$(USER_OBJS) $(USER_LIB_OBJ) $(USER_GFX_OBJ): $(USER_OBJ_DIR)/%.o: $(USER_DIR)/%.c | $(USER_OBJ_DIR)
 	@echo "  CC/U    $<"
 	$(CC) $(USER_CFLAGS) $(DEPFLAGS) -c $< -o $@
 
@@ -595,9 +603,13 @@ $(USER_OBJS) $(USER_LIB_OBJ): $(USER_OBJ_DIR)/%.o: $(USER_DIR)/%.c | $(USER_OBJ_
 # lib.o carries _start, so it has to be on the line even for a program that
 # never calls anything else in it; ENTRY(_start) in user.ld would otherwise
 # have no symbol to resolve.
-$(USER_ELFS): $(BUILD_DIR)/%.elf: $(USER_OBJ_DIR)/%.o $(USER_LIB_OBJ) $(USER_LINKER_SCRIPT) | $(BUILD_DIR)
+# USER_EXTRA_<name> names objects only that program links. The secondary
+# expansion is what lets the rule read a variable chosen by the target's own
+# stem rather than by a fixed list.
+.SECONDEXPANSION:
+$(USER_ELFS): $(BUILD_DIR)/%.elf: $(USER_OBJ_DIR)/%.o $(USER_LIB_OBJ) $$(USER_EXTRA_$$*) $(USER_LINKER_SCRIPT) | $(BUILD_DIR)
 	@echo "  LD/U    $@"
-	$(LD) $(USER_LDFLAGS) -o $@ $< $(USER_LIB_OBJ)
+	$(LD) $(USER_LDFLAGS) -o $@ $< $(USER_LIB_OBJ) $(USER_EXTRA_$*)
 
 # The bare-name alias QEMU loads (see the Multiboot module block at the top).
 # Relative symlink, so moving $(BUILD_DIR) does not break it.

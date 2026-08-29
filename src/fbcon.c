@@ -63,6 +63,31 @@
 *  The framebuffer is therefore never read, only written -- true for the
 *  scroll, the clear, the cursor and the glyphs alike.
 *
+*  3. HANDING THE SCREEN OVER
+*
+*  There is one screen and more than one thing that wants to draw on it: the
+*  console, "gfx", and now a ring 3 program that has the framebuffer mapped
+*  into its own address space. fbcon_suspend() and fbcon_resume() are how the
+*  console steps aside for one of them.
+*
+*  This costs the file almost nothing, because the shadow buffer already
+*  solves the hard half. Suspension does not stop the console WORKING, it
+*  stops it PAINTING: every entry point still writes its characters into the
+*  shadow buffer exactly as before, and only the pixel half is skipped. So a
+*  boot message, a status line or a whole screen of scrolled output printed
+*  while somebody else owns the screen is not lost -- it is remembered, and
+*  fbcon_resume() paints all of it at once out of the buffer. That is the same
+*  trick fbcon_activate() plays on the output that came before the mapping
+*  existed, and the same one gfx_leave() plays with fbcon_repaint(); it is
+*  merely made available to a caller that is not in the kernel.
+*
+*  Every write to the framebuffer in this file goes through exactly two
+*  functions, fill_rect() and draw_cell(), so that is where the routing is
+*  enforced -- see may_paint(). Gating the entry points alone would leave the
+*  question "did I find all of them?" open forever, and a single path that
+*  kept painting would put console characters on top of the other program's
+*  window.
+*
 *  A note on what is NOT here: no printf(). printf() is routed to this file
 *  once the console has handed over, so a single diagnostic inside a drawing
 *  path would recurse. Everything reports through return values and
@@ -153,10 +178,29 @@ static uint32_t fb_mapped_size;
 
 /* Cursor. drawn says whether the block is currently on the screen, so that
 *  anything which repaints over it can simply clear the flag instead of
-*  having to erase it first. */
+*  having to erase it first.
+*
+*  While the console is suspended the flag is kept exactly as it would have
+*  been had the painting happened -- see the note at fb_suspended. */
 static int csr_col;
 static int csr_row;
 static int csr_drawn;
+
+/* Non-zero while somebody else owns the screen. The console then updates the
+*  shadow buffer as usual and paints nothing; fbcon_resume() puts the whole
+*  console back from the buffer.
+*
+*  A flag and not a counter, because the header refuses nesting rather than
+*  counting it: two owners of one screen cannot both have it, and the one that
+*  lost would find out by having its picture drawn over. A count would hand
+*  out the screen twice and hide it.
+*
+*  It can only ever be set while fb_mem is non-zero -- fbcon_suspend() refuses
+*  otherwise -- which is why fbcon_activate() need not consider it: by the time
+*  anything can suspend, activation has already returned, and it returns early
+*  for a framebuffer that is mapped. fbcon_describe() clears it all the same,
+*  since a new mode invalidates every claim on the old one. */
+static int fb_suspended;
 
 /* --- Colour --------------------------------------------------------------
 *
@@ -228,6 +272,23 @@ static uint8_t ch_size[3];     /* red, green, blue mask size      */
 
 /* --- Small helpers ------------------------------------------------------- */
 
+/* May a pixel be written right now? Two entirely different reasons for no,
+*  and every painting path in this file wants them both:
+*
+*    fb_mem == 0    there is nowhere to write -- text mode boot, or a
+*                   graphics mode described but not yet mapped.
+*    fb_suspended   there is somewhere, but it is not ours at the moment.
+*
+*  The two are deliberately not distinguished at the point of use, because the
+*  handling is identical: write the character into the shadow buffer, draw
+*  nothing, and let whoever paints the buffer next put it on the screen.
+*  fbcon_activate() and fbcon_resume() are those two painters respectively,
+*  and both go through paint_all(), so the outcome is the same either way. */
+static int may_paint(void)
+{
+	return fb_mem != 0 && !fb_suspended;
+}
+
 /* First byte of a pixel row. Always derived from the pitch, never from the
 *  width: hardware pads rows, and a 1024 pixel wide 32 bpp mode may well have
 *  a pitch of 4224 rather than 4096. Computing y * width * bpp/8 is what
@@ -254,6 +315,15 @@ static void fill_rect(int x, int y, int w, int h, uint32_t pixel)
 {
 	uint8_t *dst;
 	int i;
+
+	/* One of the two doors to the framebuffer, and therefore one of the two
+	*  places the suspension is enforced. The callers test as well, where
+	*  testing lets them skip work worth skipping; this test is what makes
+	*  the guarantee hold for a caller that forgot -- including one added
+	*  later. It costs a load and a branch per rectangle, against sixteen
+	*  thousand pixel writes for a single cell sized one. */
+	if(!may_paint())
+		return;
 
 	if(x < 0) { w += x; x = 0; }
 	if(y < 0) { h += y; y = 0; }
@@ -331,6 +401,12 @@ static void draw_cell(int col, int row, unsigned char c, int attrib)
 	int y;
 	int x;
 
+	/* The other door to the framebuffer; see fill_rect(). One test against
+	*  the 128 pixel writes of a cell, so it does not show up in the scroll
+	*  measurement at the top of the file. */
+	if(!may_paint())
+		return;
+
 	glyph = font8x16[c];
 	fg = palette[attrib & 0x0F];
 	bg = palette[(attrib >> 4) & 0x0F];
@@ -405,7 +481,17 @@ static void draw_cell(int col, int row, unsigned char c, int attrib)
 *
 *  Drawing it is a function of its own because there are two callers:
 *  fbcon_cursor(), which moves it, and fbcon_repaint(), which has just painted
-*  over it and has to put it back where it was. */
+*  over it and has to put it back where it was.
+*
+*  While the console is suspended both keep csr_drawn moving exactly as they
+*  would otherwise, and paint nothing. The flag then no longer says "the block
+*  is on the screen" -- nothing of the console's is -- it says "a block belongs
+*  at csr_col/csr_row", which is precisely the question fbcon_resume() has to
+*  answer, and it answers it by handing the flag to fbcon_repaint()'s existing
+*  bookkeeping. Keeping the flag still instead would lose a cursor the user
+*  expects back; a second flag would be a second thing to keep in step with
+*  fbcon_putc(), which clears this one when a character lands on the cursor
+*  cell. */
 static void draw_cursor(void)
 {
 	uint16_t cell;
@@ -413,12 +499,15 @@ static void draw_cursor(void)
 	if(fb_mem == 0)
 		return;
 
+	csr_drawn = 1;
+	if(fb_suspended)
+		return;
+
 	cell = shadow[csr_row][csr_col];
 	fill_rect(csr_col * FBCON_CELL_W,
 		  csr_row * FBCON_CELL_H + FBCON_CELL_H - 2,
 		  FBCON_CELL_W, 2,
 		  palette[(cell >> 8) & 0x0F]);
-	csr_drawn = 1;
 }
 
 static void erase_cursor(void)
@@ -428,8 +517,8 @@ static void erase_cursor(void)
 	if(!csr_drawn)
 		return;
 	csr_drawn = 0;
-	if(fb_mem == 0)
-		return;
+	if(!may_paint())
+		return;         /* nothing of ours is on the screen to erase */
 
 	cell = shadow[csr_row][csr_col];
 	draw_cell(csr_col, csr_row, (unsigned char)(cell & 0xFF), (int)(cell >> 8));
@@ -456,6 +545,12 @@ void fbcon_describe(uint32_t addr, uint32_t pitch, uint32_t width,
 	fb_mem = 0;
 	csr_drawn = 0;
 	fb_owns_console = 0;
+
+	/* And no claim on the old screen survives into the new one. A suspension
+	*  left standing here would silence the console for good: nothing would
+	*  paint, and the only caller that could lift it is holding a mapping of a
+	*  framebuffer that has just stopped being the screen. */
+	fb_suspended = 0;
 
 	if(type == MULTIBOOT_FRAMEBUFFER_EGA_TEXT)
 	{
@@ -685,7 +780,12 @@ void fbcon_repaint(void)
 {
 	int had_cursor;
 
-	if(fb_mem == 0)
+	/* Also a no-op while the screen belongs to somebody else: a repaint is
+	*  the largest piece of painting in the file, and doing it under a
+	*  suspension would replace the other program's picture with the console
+	*  in one stroke. fbcon_resume() lifts the suspension first and then calls
+	*  this, which is the one way the console comes back. */
+	if(!may_paint())
 		return;
 
 	had_cursor = csr_drawn;
@@ -725,7 +825,10 @@ void fbcon_putc(int col, int row, unsigned char c, int attrib)
 	if(csr_drawn && col == csr_col && row == csr_row)
 		csr_drawn = 0;
 
-	if(fb_mem == 0)
+	/* The shadow buffer above is written unconditionally; only the pixels
+	*  below depend on there being a screen of ours to put them on. That
+	*  order is the whole of "suspended output is remembered, not lost". */
+	if(!may_paint())
 		return;
 
 	draw_cell(col, row, c, attrib);
@@ -743,7 +846,7 @@ void fbcon_clear(int attrib)
 
 	csr_drawn = 0;
 
-	if(fb_mem == 0)
+	if(!may_paint())
 		return;
 
 	/* The whole screen, not just the cells: the margin on the right and at
@@ -792,8 +895,26 @@ void fbcon_scroll(int attrib)
 	/* Drawing happens BEFORE the shadow buffer is shifted, because the
 	*  comparison needs both the old and the new content of a cell, and
 	*  after the shift the old one is gone. draw_cell() is handed the value
-	*  explicitly for that reason. */
-	if(fb_mem != 0)
+	*  explicitly for that reason.
+	*
+	*  Suspended, this whole block is skipped, and skipping it is not merely
+	*  an optimisation -- the differential redraw would be WRONG here, not
+	*  just wasted. Its premise is that the screen already shows what the
+	*  shadow buffer says, which is what lets it leave a cell alone when the
+	*  new content equals the old. Under a suspension that premise is exactly
+	*  what has stopped holding: the screen shows somebody else's picture. A
+	*  redraw on those terms would paint the differing cells over that
+	*  picture and, worse, leave the matching ones untouched -- a console
+	*  half drawn into a window it does not own.
+	*
+	*  Nothing is lost by skipping it, because the shadow buffer below is
+	*  shifted either way and paint_all() in fbcon_resume() rebuilds every
+	*  cell from it unconditionally: it fills the screen with the background
+	*  first and then draws each non-blank cell, so it never assumes anything
+	*  about what is on the screen and cannot inherit a stale pixel. The
+	*  scroll while suspended therefore costs one 15 KB memcpy and no pixels
+	*  at all, however many screens' worth of text go past. */
+	if(may_paint())
 	{
 		for(row = 0; row < fb_rows - 1; row++)
 		{
@@ -857,7 +978,7 @@ void fbcon_cursor(int col, int row)
 *  somewhere is here and nothing else is: the console keeps its shadow buffer,
 *  its palette and its cell arithmetic to itself.
 *
-*  All five report the MAPPED framebuffer, so they answer 0 in three different
+*  All six report the MAPPED framebuffer, so they answer 0 in three different
 *  situations that come to the same thing for a caller -- a machine that booted
 *  into text mode, a graphics mode described but not yet activated, and one the
 *  vmm could not map. In none of them is there an address a drawing routine may
@@ -891,6 +1012,39 @@ uint32_t fbcon_bpp(void)
 uint8_t *fbcon_pixels(void)
 {
 	return fb_mem;
+}
+
+/* The same framebuffer as fbcon_pixels(), named the way a page table names it.
+*  The caller this exists for is a ring 3 program: it cannot use the kernel's
+*  window, which lives in the kernel half of every address space and is not
+*  reachable from user mode, so it needs the physical address to have the
+*  frames mapped into its own.
+*
+*  Tied to fb_mem, exactly like the five above, and that is a decision worth
+*  stating because fb_phys itself is known much earlier -- fbcon_describe()
+*  records it before paging can even reach it, and it is a property of the card
+*  rather than of anything the kernel did. Reporting it from then on would still
+*  be wrong, for two reasons:
+*
+*    - Nothing has been checked yet. fbcon_activate() is where the depth is
+*      established as one this file understands, where the pitch is checked
+*      against the width, and where pitch * height is checked for wrapping. A
+*      caller handed the address before that has the one number that lets it
+*      map memory and none of the numbers that say how much or in what format
+*      -- fbcon_width(), fbcon_pitch() and fbcon_bpp() all answer 0 until the
+*      same moment. An address without a size is an invitation to compute one.
+*
+*    - It may not be a screen. If activation failed the console fell back to
+*      text mode and what is on the display is 0xB8000, not this. Handing out
+*      the address anyway would give a program a mapping of a region nobody is
+*      scanning out, and it would draw into it and see nothing.
+*
+*  So the answer before fbcon_activate() has succeeded is 0, which the header
+*  already tells every caller to check, and the check it asks for is the one
+*  worth making: 0 means there is no screen here to be given away. */
+uint32_t fbcon_phys(void)
+{
+	return (fb_mem != 0) ? fb_phys : 0;
 }
 
 /* Nearest of the sixteen colours program_dac() actually put in the DAC.
@@ -943,6 +1097,97 @@ uint32_t fbcon_rgb(uint8_t r, uint8_t g, uint8_t b)
 	/* The channel positions the mode reports, via format_from_depth(), and
 	*  not an assumption about 32 bpp being 0x00RRGGBB. */
 	return rgb_to_pixel(r, g, b);
+}
+
+/* --- Handing the screen over ---------------------------------------------
+*
+*  See section 3 of the file comment for what suspension is. What follows is
+*  what the two ends of it have to do beyond setting the flag, which is in
+*  both cases the cursor and nothing else.
+*
+*  Refusal. Two things are refused, and both return -1 rather than being
+*  distinguished, because a caller can do exactly one thing with either: not
+*  draw. 0 means the screen is yours; anything else means it is not, and a
+*  program that goes on to draw after a non-zero return draws over a console
+*  that is still painting into the same pixels.
+*
+*    - Already suspended. Nesting is refused rather than counted, per the
+*      header. The second caller must not take a screen the first is using,
+*      and must not be given a way to hand back a screen it never held: with
+*      a count, the inner resume would return nothing to the outer owner
+*      while the outer resume would repaint over a picture still being drawn.
+*
+*    - No mapped framebuffer -- a text mode boot, or a graphics mode that was
+*      described and could not be mapped. There is nothing here to hand over:
+*      fbcon_phys() is 0 for the same reason, so the caller has nothing to
+*      map, and the console it would be silencing is not this file's at all
+*      (scrn.c is writing to 0xB8000, which no flag here touches). Answering
+*      "yes, take it" would be a lie in the one direction that matters, so
+*      the whole sequence fails at the first step and the caller reports that
+*      the machine has no framebuffer to give.
+*
+*  A caller that is refused should leave the screen alone and say so; there is
+*  nothing to retry, since neither cause clears itself with time. The one thing
+*  it must not do is call fbcon_resume() anyway -- which is why resume is a
+*  no-op unless a suspension is actually standing, so that a caller which does
+*  it in a cleanup path cannot repaint the console over the owner's picture. */
+
+int fbcon_suspend(void)
+{
+	int had_cursor;
+
+	if(fb_mem == 0)
+		return -1;
+	if(fb_suspended)
+		return -1;
+
+	/* The cursor comes off the screen while painting is still allowed. It is
+	*  the console's one mark that is NOT in the shadow buffer, so nothing
+	*  later would clean it up: a block left in the corner of somebody else's
+	*  window, in the console's colours, that the owner did not draw and
+	*  cannot erase without knowing it is there.
+	*
+	*  The flag is put back afterwards on purpose. erase_cursor() clears it,
+	*  which is the truth about the pixels and the wrong thing to remember --
+	*  the console wants a cursor at csr_col/csr_row and will want one again
+	*  when it gets the screen back. From here to fbcon_resume() the flag
+	*  means "a cursor belongs here" rather than "a cursor is on the screen",
+	*  which is the reading draw_cursor() and erase_cursor() keep up while
+	*  suspended, and fbcon_repaint() turns it back into the other one. */
+	had_cursor = csr_drawn;
+	erase_cursor();
+	csr_drawn = had_cursor;
+
+	fb_suspended = 1;
+	return 0;
+}
+
+void fbcon_resume(void)
+{
+	/* Idempotent, and a no-op when nothing was suspended. Resume is the
+	*  thing a caller reaches for in an error path, where it is not always
+	*  obvious whether the suspend succeeded -- and where repainting the
+	*  console over a screen somebody else still owns would be the worst
+	*  possible answer. */
+	if(!fb_suspended)
+		return;
+
+	/* Order matters: the flag first, or the repaint below would be gated by
+	*  may_paint() and do nothing at all. */
+	fb_suspended = 0;
+
+	/* And that is the whole of coming back. Everything printed while the
+	*  screen was somebody else's is in the shadow buffer, in the order it
+	*  was printed, scrolled as far as it scrolled; fbcon_repaint() paints
+	*  all of it and restores the cursor from the flag maintained above.
+	*  Nothing needs to be known about what the other program drew, because
+	*  the repaint fills the screen before it draws a single cell. */
+	fbcon_repaint();
+}
+
+int fbcon_suspended(void)
+{
+	return fb_suspended;
 }
 
 /* --- Description for the shell -------------------------------------------

@@ -51,6 +51,9 @@
 #define SYS_FWRITE  21       /* fwrite(path, offset, len, buf) -> written    */
 #define SYS_UNLINK  22       /* unlink(path)                                */
 #define SYS_TRUNCATE 23      /* truncate(path, size)                        */
+#define SYS_MAPFB   24       /* mapfb(sys_fbinfo *out)                      */
+#define SYS_UNMAPFB 25       /* unmapfb()                                   */
+#define SYS_INPUT   26       /* input(sys_input_event *out, timeout_ms)     */
 
 /* --- Error returns -- mirror of src/include/syscall.h ------------------- */
 #define SYS_ENOSYS   (-1)    /* no such call number                         */
@@ -65,6 +68,8 @@
 #define SYS_EEXIST  (-10)    /* the file is already there                   */
 #define SYS_EROFS   (-11)    /* nothing mounted, or it cannot be written     */
 #define SYS_ENOSPC  (-12)    /* the volume is full                          */
+#define SYS_ENODEV  (-13)    /* there is no framebuffer to map              */
+#define SYS_EBUSY   (-14)    /* another task holds the screen               */
 
 /* --- Structures crossing the gate -- mirror of src/include/syscall.h ----
 *
@@ -81,6 +86,48 @@ typedef struct
 	unsigned long size;              /* bytes; 0 for a directory            */
 	unsigned long flags;             /* SYS_DIRENT_DIR                      */
 } sys_dirent;
+
+/* What sys_mapfb() hands back -- mirror of src/include/syscall.h.
+*
+*  The pitch is BYTES per row and is not width * bytes: a card may pad a row,
+*  and computing the stride instead of reading it draws a picture that shears
+*  diagonally. The channel positions are given for the same reason; 32 bpp is
+*  usually but not always 0x00RRGGBB. */
+typedef struct
+{
+	unsigned long addr;              /* first byte, in this program's space   */
+	unsigned long size;              /* bytes mapped                          */
+	unsigned long width;             /* pixels                                */
+	unsigned long height;
+	unsigned long pitch;             /* BYTES per row                         */
+	unsigned long bpp;               /* 32, 24, 16 or 15                      */
+	unsigned char red_pos;
+	unsigned char red_size;
+	unsigned char green_pos;
+	unsigned char green_size;
+	unsigned char blue_pos;
+	unsigned char blue_size;
+	unsigned char reserved[2];
+} sys_fbinfo;
+
+#define SYS_INPUT_KEY    1
+#define SYS_INPUT_MOUSE  2
+
+/* One thing the user did. One type for keyboard and mouse on purpose: a
+*  program with both has to wait for whichever comes first, and two queues
+*  would mean waiting on two things at once, which this kernel cannot do. */
+typedef struct
+{
+	unsigned long type;              /* SYS_INPUT_KEY or SYS_INPUT_MOUSE      */
+	unsigned long time_ms;
+	long          x;                 /* mouse: where the pointer is now       */
+	long          y;
+	long          dx;                /* mouse: how far it moved this time     */
+	long          dy;
+	unsigned long buttons;           /* mouse: which are down now             */
+	unsigned long changed;           /* mouse: which changed, 0 for a move    */
+	unsigned long key;               /* key: the character                    */
+} sys_input_event;
 
 typedef struct
 {
@@ -360,6 +407,47 @@ static __inline__ int sys_unlink(const char *path)
 static __inline__ int sys_truncate(const char *path, unsigned long size)
 {
 	return syscall2(SYS_TRUNCATE, (int)path, (int)size);
+}
+
+/* --- The screen ---------------------------------------------------------
+*
+*  sys_mapfb() puts the framebuffer into this program's address space and
+*  hands over the screen. It is the first thing here that maps HARDWARE: what
+*  comes back is a window onto the card, not memory, and writing to it changes
+*  what is on the monitor immediately. There is no compositing and no
+*  clipping -- a program that has it can draw anywhere.
+*
+*  Which is why only one task may hold it. The kernel's own console lives on
+*  that screen too and stops painting while somebody else has it, so a second
+*  caller gets SYS_EBUSY rather than a shared screen. Give it back with
+*  sys_unmapfb(), which repaints the console; a program that exits without
+*  doing so has it released and the console repainted on its behalf.
+*
+*  Returns 0 and fills in *out, SYS_ENODEV when the machine booted into text
+*  mode and there is no framebuffer at all, or SYS_EBUSY.
+*
+*  Reads are slow -- it is uncached device memory -- so draw into a buffer of
+*  your own and copy that in, and never read a pixel back. */
+static __inline__ int sys_mapfb(sys_fbinfo *out)
+{
+	return syscall1(SYS_MAPFB, (int)out);
+}
+
+static __inline__ int sys_unmapfb(void)
+{
+	return syscall0(SYS_UNMAPFB);
+}
+
+/* The next thing the user did, waiting up to timeout_ms for one. Returns 1
+*  when *out was filled in, 0 when the time ran out, negative on a bad
+*  pointer. A timeout of 0 waits forever, which is right for a program with
+*  nothing else to do and wrong for one that has to redraw or check a clock.
+*
+*  It blocks: the task is descheduled while it waits and everything else keeps
+*  running, so a loop around this is not a spin. */
+static __inline__ int sys_input(sys_input_event *out, int timeout_ms)
+{
+	return syscall2(SYS_INPUT, (int)out, timeout_ms);
 }
 
 #endif

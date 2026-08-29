@@ -21,6 +21,7 @@
 #include <system.h>
 #include <stdio.h>
 #include <vmm.h>
+#include <mm.h>
 #include <syscall.h>
 #include <fat.h>
 #include <ata.h>
@@ -28,6 +29,8 @@
 #include <tcp.h>
 #include <dns.h>
 #include <dhcp.h>
+#include <fbcon.h>
+#include <mouse.h>
 
 /* The stub in start.asm. It pushes a dummy error code and the interrupt
 *  number, saves the registers and calls syscall_handler(). */
@@ -210,6 +213,89 @@ extern int exec_spawn_path(const char *path, const char *args, int prio);
 *  see sysnet_slot_of(). */
 #define SYS_PORT_MAX          65535
 #define SYS_NET_HANDLE_MAX    TCP_MAX_CONNS
+
+/* Where the framebuffer is put in the CALLING TASK's address space.
+*
+*  This is the first mapping this kernel places in a user half because ring 3
+*  asked for one, so the address is a decision rather than a detail -- and the
+*  question it has to answer is not "is anything there today" but "can anything
+*  ever be there". Three things live in a task's user half and all three are
+*  placed by somebody other than this file:
+*
+*    - THE PROGRAM IMAGE. user/user.ld links every program at 0x00400000 and
+*      says at length why; exec.c maps the PT_LOAD segments it finds and
+*      nothing else, so an image occupies a contiguous run growing UPWARDS
+*      from 4 MiB. A program would have to be 2.7 gigabytes long to reach
+*      0xB0000000, on a machine this kernel runs with 32 MiB of RAM.
+*    - THE USER STACK. tasks.c parks the stacks directly under the kernel
+*      half: USER_STACK_REGION_TOP is 0xBFFFF000 and MAX_TASKS = 64 slots of
+*      8 KiB reach down to 0xBFF80000. That is the LOWEST address any stack
+*      page can have, with the task table full, and it is 255 MiB above the
+*      end of the largest mapping this call can make.
+*    - THE ARGUMENT BLOCK. exec.c writes argc, argv and the strings into the
+*      top of the stack page it already found -- inside the stack, not next
+*      to it -- so it adds no third region to keep clear of.
+*
+*  0xB0000000 therefore sits in the wide empty middle that user.ld's own
+*  comment describes as "almost 3 GiB of untouched address space", 704 MiB
+*  above the top of any image and 247 MiB below the lowest stack page even
+*  after the 8 MiB bound below. Both distances are checked against the numbers
+*  those two files state, not against what a program happens to do today.
+*
+*  It is aligned to 4 MiB, i.e. to a page directory entry, for the reason
+*  user.ld gives for the load address: the mapping starts a page table of its
+*  own and shares it with nothing, so the table vmm_destroy_space() eventually
+*  frees for it holds nothing else the task owns.
+*
+*  The one collision arithmetic cannot rule out is a second SYS_MAPFB into the
+*  same space, and it does not have to: one owner at a time is enforced below,
+*  and the owner's second call is refused before anything is mapped. */
+#define SYS_FB_VIRT       0xB0000000u
+
+/* Most bytes SYS_MAPFB will map, and so how far past SYS_FB_VIRT the mapping
+*  can reach.
+*
+*  The largest mode anything can establish on this machine is 1024x768 at
+*  32 bpp -- which is a fact about the bootloader rather than a guess, see
+*  FBCON_MAX_COLS in fbcon.h -- and that is 3 MiB exactly. Eight leaves room
+*  for a card that pads its rows, and it is the number the collision argument
+*  above is made with, so a mode this kernel cannot currently produce does not
+*  quietly invalidate it.
+*
+*  A geometry that needs more is refused rather than clipped. Half a screen
+*  mapped is a program drawing into memory the card is not scanning out, i.e.
+*  a picture that is silently wrong in its lower half, and there is no way for
+*  the program to find that out. */
+#define SYS_FB_MAX_BYTES  0x00800000u
+
+/* How often the reclaim task looks for a screen whose owner has died, in
+*  milliseconds. See sysfb_reclaim_task() for why the task exists at all. 250
+*  is a quarter of a second of a black screen in the worst case -- fast enough
+*  that a killed program looks like it took the console with it and gave it
+*  straight back, and slow enough that four state lookups a second is not a
+*  cost worth discussing. */
+#define SYS_FB_REAP_MS    250
+
+/* Longest ONE wait inside SYS_INPUT may last, in milliseconds.
+*
+*  It is not the call's timeout -- the caller gives that -- it is how long the
+*  task stays blocked before it looks at the keyboard again, and it exists
+*  because this call waits on two devices at once and task_wait() waits on one
+*  channel. The mouse has a published channel and wakes it for every packet;
+*  the keyboard's is a file static in kb.c with no accessor, and sys_getch()
+*  below says why this file does not invent one. So the wait is on the mouse
+*  and the keyboard is sampled once per turn, which makes this the keyboard's
+*  sampling interval and nothing else.
+*
+*  20 ms is chosen from both ends. A key held down repeats at about 30 Hz and
+*  a typist at speed leaves 100 ms between characters, while kb.c holds ONE
+*  key -- so the sample has to be well below the gap between two keystrokes or
+*  the second one overwrites the first before anybody takes it. And 20 ms is
+*  below a 60 Hz frame, so a keystroke never costs a drawn frame of latency.
+*  The price is 50 wakeups a second in a task that is otherwise asleep, which
+*  is the same order as SYS_NET_POLL's 20 and is nothing next to the thousand
+*  ticks the timer produces anyway. */
+#define SYS_INPUT_POLL    20
 
 /* Upper bound for the schedule() calls in sys_exit(), same reasoning as
 *  FAULT_SCHEDULE_TRIES in isrs.c: schedule() only switches once the running
@@ -1010,6 +1096,274 @@ static void sysnet_remember(int slot, int khandle, uint32_t ip, uint16_t port)
 
 
 /* ------------------------------------------------------------------ */
+/* The screen owned by ring 3                                          */
+/* ------------------------------------------------------------------ */
+
+/* Who has the screen, and everything needed to take it back from them.
+*
+*  One owner at a time, because the kernel's console is on that screen too and
+*  two owners of one screen is not a thing that can be made to work -- fbcon.h
+*  says so at fbcon_suspend() and refuses nesting for the same reason. The
+*  record here is the kernel side of that: fbcon.c knows the console is
+*  suspended, and this knows WHO for, which is the part needed to give the
+*  screen back when that task stops existing.
+*
+*  THE SPACE IS RECORDED RATHER THAN LOOKED UP LATER, and that is the field
+*  that matters most. A dead task's slot is recycled by find_free_slot() in
+*  tasks.c, its address space handed back by task_space_release(), and the pid
+*  reissued to somebody else -- so taskmgr_task_space(owner) at cleanup time
+*  can name a DIFFERENT space, belonging to a live task, whose pages have
+*  nothing to do with the screen. Unmapping SYS_FB_VIRT in that one would take
+*  a page away from a program that legitimately owns it. Keeping the space we
+*  mapped into and comparing the two is what makes the cleanup safe: they
+*  agree only while the mapping is still where it was put.
+*
+*  bytes is the size that was mapped, so the unmap covers exactly the pages the
+*  map covered, and not a size re-derived from a mode that may have changed. */
+static int         sysfb_owner = -1;
+static addrspace_t sysfb_space = 0;
+static uint32_t    sysfb_bytes = 0;
+
+/* Non-zero once the reclaim task exists. It is never taken down again -- see
+*  sysfb_reclaim_task(). */
+static int         sysfb_janitor = 0;
+
+/* Removes the mapping SYS_MAPFB made, page by page.
+*
+*  The whole range is walked even when only part of it was mapped, which is
+*  what the failure path in sys_mapfb() relies on: vmm_unmap_in() answers -1
+*  for a page that was never mapped and changes nothing, so one function
+*  cleans up after both a complete mapping and a half finished one.
+*
+*  NOTHING IS FREED HERE and nothing may be. The frames behind these pages are
+*  the card's, not the pmm's -- vmm_map_mmio() spells out what handing one to
+*  pmm_free_frame() would do, namely clear a bit belonging to a completely
+*  unrelated frame and hand that one out twice. Only the mapping goes. */
+static void sysfb_unmap_pages(addrspace_t space, uint32_t bytes)
+{
+	uint32_t off;
+
+	for(off = 0; off < bytes; off += PAGE_SIZE)
+	{
+		vmm_unmap_in(space, SYS_FB_VIRT + off);
+	}
+}
+
+/* Takes the screen back and gives it to the console. Safe to call when nobody
+*  holds it, and safe to call twice.
+*
+*  The record is read and cleared with interrupts off, in one step, and the
+*  work is done afterwards out of the locals. Both halves of that matter. The
+*  clear has to be atomic against everything else that can call this -- the
+*  owner's own SYS_UNMAPFB, sys_exit(), and the reclaim task, any two of which
+*  can be interleaved because vector 0x80 is a trap gate and the timer
+*  preempts -- or two callers both see an owner, both unmap and both repaint,
+*  and the second repaint lands on a screen a third program may already have
+*  taken. And the work has to happen with interrupts back ON, because
+*  fbcon_resume() repaints the entire console: three megabytes of writes to
+*  uncached device memory is not a thing to do with the timer masked.
+*
+*  THE UNMAP IS CONDITIONAL, THE REPAINT IS NOT. If the space is not the one
+*  that was mapped into, the mapping is already gone with the space it lived in
+*  and touching that directory would be a write into whatever the pmm has since
+*  handed the frames to. The console does not care either way: the screen is
+*  hardware and it has to be repainted whatever became of the task that was
+*  drawing on it. Getting that order wrong is the difference between a machine
+*  that comes back and one that sits at a black screen. */
+static void sysfb_drop(void)
+{
+	unsigned long flags;
+	addrspace_t space;
+	uint32_t bytes;
+	int owner;
+
+	flags = sysnet_irq_save();
+
+	owner = sysfb_owner;
+	space = sysfb_space;
+	bytes = sysfb_bytes;
+
+	sysfb_owner = -1;
+	sysfb_space = 0;
+	sysfb_bytes = 0;
+
+	sysnet_irq_restore(flags);
+
+	if(owner < 0) return;
+
+	if(space != 0 && taskmgr_task_space(owner) == space)
+		sysfb_unmap_pages(space, bytes);
+
+	fbcon_resume();
+}
+
+/* Gives the screen back if the task holding it has ended. The screen's version
+*  of sysnet_reap(), and the same three states mean the same thing here:
+*  ABORTED for a task that faulted or was killed, EXITED for one that returned,
+*  NULL for a slot that names nobody. A SUSPENDED task is alive and keeps its
+*  screen -- taking it away would repaint the console over a picture whose
+*  owner is coming back. */
+static void sysfb_reap(void)
+{
+	int state;
+
+	if(sysfb_owner < 0) return;
+
+	state = taskmgr_task_state(sysfb_owner);
+	if(state != TASK_STATE_ABORTED && state != TASK_STATE_EXITED
+	   && state != TASK_STATE_NULL) return;
+
+	sysfb_drop();
+}
+
+/* Drops what one particular pid holds. Called from sys_exit() next to
+*  sysnet_release_task(), and from sys_spawn() on the pid it was just handed,
+*  for exactly the two reasons given there: a program that returns without
+*  calling SYS_UNMAPFB is the ordinary case rather than the exceptional one,
+*  and a pid is not unique over time, so a record left behind by a task that
+*  died without reaching sys_exit() must not be inherited by whoever next gets
+*  that number. */
+static void sysfb_release_task(int pid)
+{
+	if(pid < 0) return;
+	if(sysfb_owner != pid) return;
+
+	sysfb_drop();
+}
+
+/* Looks, four times a second, for a screen whose owner is gone.
+*
+*  This task exists because of a gap this file cannot close any other way.
+*  sys_exit() covers the program that ends properly, and the reap at the head
+*  of SYS_MAPFB covers the next program that wants the screen -- but a task can
+*  also die by a page fault, by "taskmgr -k" and by taskmgr_killall(), and in
+*  all three it simply never executes another instruction. There is no
+*  notification: taskmgr_task_abort() changes a state and no more, and no
+*  address stands for "this pid finished" (run_wait() in main.c makes the same
+*  observation about waiting for a program and settles for polling too). So
+*  nothing runs on behalf of the dead task, and the screen it was drawing on
+*  would stay exactly as it left it -- with the console printing into a shadow
+*  buffer nobody paints -- until some other program happened to ask for it.
+*  On a machine whose shell is a kernel task and issues no system calls at all,
+*  that can be forever. A black screen with a live prompt behind it is the one
+*  outcome a user cannot recover from without a reboot.
+*
+*  A task is what it takes, because the recovery is fbcon_resume() and that
+*  repaints the whole console: it needs task context, not the timer interrupt.
+*  It is created on the first successful SYS_MAPFB rather than at boot -- a
+*  machine that never runs a graphical program never pays for it -- and it is
+*  never taken down, because the cost of an existing one is a state lookup four
+*  times a second and the cost of tearing it down and recreating it is a task
+*  slot changing hands for no gain.
+*
+*  It is a poll and it is honest about being one. The mechanism that would
+*  replace it is one line in tasks.c: taskmgr_task_exit() and
+*  taskmgr_task_abort() waking a channel that stands for the slot, and system.h
+*  naming that address. Then this becomes a task_wait() with SYS_FB_REAP_MS as
+*  the backstop instead of the interval, and a killed program's console comes
+*  back in the same millisecond. tasks.c is not this file's to edit. */
+static void sysfb_reclaim_task(void)
+{
+	for(;;)
+	{
+		sleep(SYS_FB_REAP_MS);
+		sysfb_reap();
+	}
+}
+
+/* Starts it, once. A failure to create it is not a failure of the call that
+*  triggered it: the screen still works, only the recovery after a kill is
+*  missing, and refusing SYS_MAPFB over that would be trading a working
+*  program for a cleanup path. */
+static void sysfb_start_janitor(void)
+{
+	int pid;
+
+	if(sysfb_janitor) return;
+
+	pid = taskmgr_add_task(sysfb_reclaim_task, "Screen Reclaim Task",
+	                       TASK_PRIORITY_LOW);
+	if(pid < 0) return;
+
+	taskmgr_task_start(pid);
+	sysfb_janitor = 1;
+}
+
+/* Position and width of one colour channel, read off the bit mask that channel
+*  alone produces. Both 0 for a mask of 0.
+*
+*  The mask is assumed to be contiguous, which every pixel format on hardware
+*  is: a channel is a run of adjacent bits. A hypothetical scattered one would
+*  come out as the run that spans it, which is wrong in the same way and to the
+*  same degree as any other answer this file could invent for it. */
+static void sysfb_channel(uint32_t mask, uint8_t *pos, uint8_t *size)
+{
+	int first;
+	int last;
+	int i;
+
+	*pos  = 0;
+	*size = 0;
+
+	if(mask == 0) return;
+
+	first = -1;
+	last  = -1;
+
+	for(i = 0; i < 32; i++)
+	{
+		if((mask & ((uint32_t)1 << i)) == 0) continue;
+
+		if(first < 0) first = i;
+		last = i;
+	}
+
+	*pos  = (uint8_t)first;
+	*size = (uint8_t)(last - first + 1);
+}
+
+/* Fills in where the colour channels sit, which sys_fbinfo carries because 32
+*  bpp is usually but not always 0x00RRGGBB and 16 bpp is usually but not
+*  always 5-6-5.
+*
+*  fbcon.h publishes no accessor for the channel layout -- it has fbcon_rgb(),
+*  which PACKS a colour, and that is asked instead of guessed. A pure red gives
+*  back exactly the bits red occupies, and the same for the other two, so three
+*  calls to the function that owns the format produce the format. Deriving it
+*  from the depth here would be a second implementation of format_from_depth()
+*  in fbcon.c, kept in step by hand, and would be wrong for precisely the modes
+*  the fields exist for.
+*
+*  Two answers are refused rather than reported. A depth below 15 is an INDEXED
+*  mode, where a pixel is a palette index and fbcon_rgb() returns the nearest
+*  console colour -- a small integer that is not a bit field at all and would
+*  read as a lie about a channel. And masks that overlap, or any that is zero,
+*  mean the probe did not measure what it thinks it did. Both leave the six
+*  fields at zero, which the struct's memset() already made them: no claim,
+*  rather than a wrong one. A program that finds red_size at 0 knows it has to
+*  work the format out for itself or refuse the mode. */
+static void sysfb_format(sys_fbinfo *info)
+{
+	uint32_t red;
+	uint32_t green;
+	uint32_t blue;
+
+	if(fbcon_bpp() < 15) return;
+
+	red   = fbcon_rgb(255, 0, 0);
+	green = fbcon_rgb(0, 255, 0);
+	blue  = fbcon_rgb(0, 0, 255);
+
+	if(red == 0 || green == 0 || blue == 0) return;
+	if((red & green) != 0 || (red & blue) != 0 || (green & blue) != 0) return;
+
+	sysfb_channel(red,   &info->red_pos,   &info->red_size);
+	sysfb_channel(green, &info->green_pos, &info->green_size);
+	sysfb_channel(blue,  &info->blue_pos,  &info->blue_size);
+}
+
+
+/* ------------------------------------------------------------------ */
 /* The calls                                                           */
 /* ------------------------------------------------------------------ */
 
@@ -1047,6 +1401,21 @@ static int sys_exit(struct regs *r)
 	*  closing is the ordinary case, not the exceptional one, and four
 	*  connections is few enough that leaking one matters. */
 	sysnet_release_task(pid);
+
+	/* And the screen, for the same reason and with one addition: this is the
+	*  last moment at which the mapping can be removed cheaply and correctly.
+	*  The task's address space is the ACTIVE one right now -- entering through
+	*  a gate never reloads CR3 -- so the unmap below walks the very directory
+	*  the pages are in and gets its invlpg for free, and the space is
+	*  certainly still alive because the task is standing in it. A moment later
+	*  it may not be: taskmgr_task_exit() makes the slot recyclable, and
+	*  whoever recycles it hands the space back.
+	*
+	*  It is also not optional in the way a leaked connection is. A connection
+	*  nobody closes costs one of four slots; a screen nobody gives back is a
+	*  console printing into a shadow buffer that never reaches the monitor,
+	*  i.e. a machine that looks dead to the person sitting in front of it. */
+	sysfb_release_task(pid);
 
 	/* The task is marked as ended and loses its remaining time slice, so the
 	*  search below skips it. Ended, not aborted: a program that returns 0 has
@@ -1530,6 +1899,7 @@ static int sys_spawn(struct regs *r)
 	*  passing through sys_exit(). Anything still recorded against this number
 	*  belongs to that dead task and must not be inherited by this one. */
 	sysnet_release_task(pid);
+	sysfb_release_task(pid);
 
 	/* exec_spawn_path() hands the task back SUSPENDED on purpose, so that the
 	*  shell can look at it -- or take it back down -- before it has executed
@@ -2475,6 +2845,455 @@ static int sys_truncate(struct regs *r)
 
 
 /* ------------------------------------------------------------------ */
+/* The screen, and what the user does to it                            */
+/* ------------------------------------------------------------------ */
+
+/* mapfb(out) -- puts the framebuffer into the caller's address space and hands
+*  it the screen. Returns 0 and fills in *out, or a negative code.
+*
+*  THIS IS THE FIRST CALL THAT MAPS HARDWARE INTO A RING 3 ADDRESS SPACE, and
+*  every other call in this file only ever handed ring 3 bytes it had copied.
+*  What crosses here is a window onto the card: writes to it change what is on
+*  the monitor, immediately, anywhere on it. That is the point of the call --
+*  a graphical program cannot exist without it -- and the whole of the work
+*  below is making sure that is ALL it is. Four things guard that:
+*
+*    - WHERE. SYS_FB_VIRT, and its comment is the argument that a 3 MiB
+*      mapping there cannot land on the program image, on any task's stack or
+*      on the argument block. Nothing is mapped over, because nothing of the
+*      caller's is ever there to map over.
+*    - WHAT. The physical range must lie above every frame the pmm has ever
+*      heard of. A framebuffer is decoded outside RAM -- QEMU's stdvga puts it
+*      at 0xFD000000 -- so this costs nothing in the ordinary case, and in the
+*      case it is written for it is everything: an address that OVERLAPS RAM,
+*      whether the bootloader lied, the mode line is wrong or a chipset carved
+*      the buffer out of main memory, would map kernel memory into a user half
+*      with PAGE_USER set. The check is a single compare and it converts the
+*      worst outcome in this file into SYS_ENODEV.
+*    - HOW MUCH. pitch * height, bounded by SYS_FB_MAX_BYTES, computed without
+*      ever forming a product that could wrap.
+*    - WHO ELSE. The console is on that screen. fbcon_suspend() takes it and
+*      is refused if anybody already has it, which makes fbcon.c the second
+*      opinion on the ownership this file records.
+*
+*  THE CACHING FLAGS ARE THE ONES vmm_map_mmio() ARGUES FOR, and the argument
+*  is not this file's to re-run: PAGE_NOCACHE with PAGE_WRITETHROUGH, i.e. the
+*  strongest uncached type available without PAT or MTRR setup. A framebuffer
+*  left write-back is the classic bug where the picture updates late or only
+*  when something else evicts the line -- the writes sit in the cache and the
+*  card has no way to be told. PCD forbids caching; PWT is set alongside it so
+*  the entry names fully uncached UC rather than the weaker UC- of the default
+*  PAT layout. Exactly what the kernel's own mapping of the same frames uses,
+*  which is the point: two mappings of one device with different cacheability
+*  is an architecturally undefined thing to do, and it would be undefined in a
+*  direction nobody could debug -- the console and the program disagreeing
+*  about pixels neither of them wrote.
+*
+*  PAGE_USER is what the kernel's mapping does not have, and it is the whole
+*  difference. It is added here only after the address, the range and the size
+*  have all been settled.
+*
+*  The bounds are handed to the mouse as well. mouse.h asks for the screen the
+*  pointer is drawn on and the driver's default is 640x480, set before anything
+*  knew the mode -- so on a 1024x768 screen the pointer would stop a third of
+*  the way from the right edge and the user could not get it back. Nothing is
+*  restored on release, and that is correct rather than lazy: main.c derives
+*  the console's own field from fbcon_width()/fbcon_height() too, so this is
+*  the same rectangle either way. The screen does not change when its owner
+*  does. */
+static int sys_mapfb(struct regs *r)
+{
+	sys_fbinfo info;
+	unsigned long flags;
+	addrspace_t space;
+	uint32_t out;
+	uint32_t phys;
+	uint32_t pitch;
+	uint32_t height;
+	uint32_t bytes;
+	uint32_t off;
+	uint32_t mapflags;
+	int pid;
+
+	out = (uint32_t)r->ebx;
+
+	if(!user_range_ok(out, (uint32_t)sizeof(sys_fbinfo), 1)) return SYS_EFAULT;
+
+	/* A screen held by a task that is already gone is not a busy screen. */
+	sysfb_reap();
+
+	/* No task means no address space of the caller's to map into, and no pid
+	*  to record the ownership against. That is the kernel calling itself,
+	*  which has fbcon_pixels() and does not need this. */
+	pid = taskmgr_get_currpid();
+	if(pid < 0) return SYS_EINVAL;
+
+	phys   = fbcon_phys();
+	pitch  = fbcon_pitch();
+	height = fbcon_height();
+
+	/* No framebuffer at all is the ordinary "make run" case rather than a
+	*  failure: QEMU's -kernel loader does not implement the Multiboot video
+	*  request, so the machine comes up in text mode and there is nothing here
+	*  to hand over. Each of the five is asked because each is separately 0 in
+	*  that case and a caller that got a structure full of zeroes would be
+	*  drawing into an address of 0 with a pitch of 0. */
+	if(phys == 0 || pitch == 0 || height == 0) return SYS_ENODEV;
+	if(fbcon_width() == 0 || fbcon_bpp() == 0) return SYS_ENODEV;
+
+	/* Size, and the product is only formed once it is known not to wrap: the
+	*  division is against a constant that is never 0 and pitch is known
+	*  non-zero above, so the test is exact rather than approximate. */
+	if(height > SYS_FB_MAX_BYTES / pitch) return SYS_ENODEV;
+
+	bytes = pitch * height;
+	bytes = (bytes + (uint32_t)PAGE_SIZE - 1) & ~(uint32_t)(PAGE_SIZE - 1);
+	if(bytes == 0 || bytes > SYS_FB_MAX_BYTES) return SYS_ENODEV;
+
+	/* Not RAM, and does not run off the end of the address space. The first
+	*  is the isolation check the call comment describes; the second keeps the
+	*  loop below from wrapping phys + off around zero and mapping the low
+	*  frames -- which on this kernel are the ones holding it. */
+	if(phys < pmm_total_bytes()) return SYS_ENODEV;
+	if(phys > 0xFFFFFFFFu - (bytes - 1)) return SYS_ENODEV;
+
+	space = taskmgr_task_space(pid);
+	if(space == 0) return SYS_EINVAL;
+
+	/* The claim is one indivisible step, for the reason sysfb_drop() gives:
+	*  the timer preempts a system call, so a plain test followed by a store
+	*  is two tasks both finding the screen free. */
+	flags = sysnet_irq_save();
+
+	if(sysfb_owner >= 0)
+	{
+		sysnet_irq_restore(flags);
+		return SYS_EBUSY;
+	}
+
+	sysfb_owner = pid;
+	sysfb_space = space;
+	sysfb_bytes = bytes;
+
+	sysnet_irq_restore(flags);
+
+	/* fbcon.c gets to refuse as well. It does so when the console is already
+	*  suspended by somebody who did not come through this gate -- "gfx" hands
+	*  the screen over the same way -- and that is a busy screen even though
+	*  no task owns it here. Reported as SYS_EBUSY rather than as an error of
+	*  its own because it is the same thing to the caller: come back later. */
+	if(fbcon_suspend() != 0)
+	{
+		flags = sysnet_irq_save();
+		sysfb_owner = -1;
+		sysfb_space = 0;
+		sysfb_bytes = 0;
+		sysnet_irq_restore(flags);
+
+		return SYS_EBUSY;
+	}
+
+	mapflags = PAGE_PRESENT | PAGE_WRITE | PAGE_USER
+	           | PAGE_NOCACHE | PAGE_WRITETHROUGH;
+
+	for(off = 0; off < bytes; off += PAGE_SIZE)
+	{
+		if(vmm_map_in(space, SYS_FB_VIRT + off, phys + off, mapflags) == 0)
+			continue;
+
+		/* The only way this fails is the pmm having no frame left for the one
+		*  page table the range needs. Everything done so far comes back --
+		*  sysfb_drop() walks the whole range and does not mind the pages that
+		*  never got mapped -- and the console is repainted, so a failed
+		*  SYS_MAPFB leaves the machine exactly as it found it. */
+		sysfb_drop();
+		return SYS_ENOMEM;
+	}
+
+	mouse_set_bounds((int)fbcon_width(), (int)fbcon_height());
+
+	/* Asked a second time, after the mapping. The invariant that makes one
+	*  check enough elsewhere -- only the caller edits the caller's half, and
+	*  the caller is parked inside this call -- does not hold here, because
+	*  THIS CALL edits it. A pointer that was valid on the way in cannot in
+	*  fact have been covered (a page inside SYS_FB_VIRT's range was unmapped
+	*  before, so the first check would have refused it), but the write below
+	*  is the one place where being wrong about that is a store through a
+	*  pointer the page tables no longer agree with, and the re-test is two
+	*  compares and a walk. */
+	if(!user_range_ok(out, (uint32_t)sizeof(sys_fbinfo), 1))
+	{
+		sysfb_drop();
+		return SYS_EFAULT;
+	}
+
+	/* Built here and copied out in one go, for the reason copy_to_user()
+	*  gives: the check was about a range as a whole, so the write should be
+	*  too, and a struct that is zeroed first cannot carry kernel stack
+	*  contents across the gate in its padding. */
+	memset(&info, 0, sizeof(info));
+	info.addr   = SYS_FB_VIRT;
+	info.size   = bytes;
+	info.width  = fbcon_width();
+	info.height = height;
+	info.pitch  = pitch;
+	info.bpp    = fbcon_bpp();
+	sysfb_format(&info);
+
+	copy_to_user(out, &info, (uint32_t)sizeof(info));
+
+	/* Last, and only on the path that actually gave the screen away: there is
+	*  nothing to reclaim until somebody holds something. */
+	sysfb_start_janitor();
+
+	return 0;
+}
+
+/* unmapfb() -- gives the screen back and repaints the console.
+*
+*  Only the owner may. A task that never had it gets SYS_EINVAL, and so does a
+*  task calling it while a DIFFERENT task holds the screen: the alternative is
+*  a call that repaints the console over a picture somebody else is drawing,
+*  which is precisely what one-owner-at-a-time exists to prevent, reachable by
+*  any program that calls the wrong function.
+*
+*  Everything it does, sys_exit() does too. That is deliberate -- a program
+*  that returns without calling this is the ordinary case, not a leak the
+*  kernel has to punish -- and this call exists for the program that wants its
+*  output printed into a console that is back. */
+static int sys_unmapfb(struct regs *r)
+{
+	int pid;
+
+	(void)r;
+
+	sysfb_reap();
+
+	pid = taskmgr_get_currpid();
+	if(pid < 0) return SYS_EINVAL;
+	if(sysfb_owner != pid) return SYS_EINVAL;
+
+	sysfb_drop();
+	return 0;
+}
+
+/* Takes the next mouse event into an ABI event. 1 if there was one.
+*
+*  The two structures are close enough to look interchangeable and are not:
+*  mouse_event stores coordinates in int16_t and the button masks in uint8_t,
+*  sys_input_event uses int32_t and uint32_t. The widening is the conversion,
+*  and doing it through a local is what keeps a partially built structure out
+*  of user memory. The button masks cross unchanged -- MOUSE_BUTTON_LEFT is 1,
+*  RIGHT is 2, MIDDLE is 4, and user/syscall.h publishes the same three
+*  numbers, so there is nothing to translate. */
+static int sysinput_take_mouse(sys_input_event *ev)
+{
+	mouse_event m;
+
+	if(mouse_poll(&m) == 0) return 0;
+
+	memset(ev, 0, sizeof(*ev));
+	ev->type    = SYS_INPUT_MOUSE;
+	ev->time_ms = m.time_ms;
+	ev->x       = (int32_t)m.x;
+	ev->y       = (int32_t)m.y;
+	ev->dx      = (int32_t)m.dx;
+	ev->dy      = (int32_t)m.dy;
+	ev->buttons = (uint32_t)m.buttons;
+	ev->changed = (uint32_t)m.changed;
+
+	return 1;
+}
+
+/* The same for the keyboard. 1 if a key was waiting.
+*
+*  getchn() is the non-blocking read SYS_PEEKCH already uses, and 0 is the
+*  driver's own "nothing", which is also what every key that has no character
+*  maps to -- a modifier or a function key is indistinguishable from no key at
+*  all through this interface, exactly as it is through SYS_GETCH.
+*
+*  Only type, time and key are filled in. The other fields belong to the mouse
+*  by the header's own comments, and a key event that carried a pointer
+*  position would be inviting a program to read x and y out of an event that
+*  is not about the pointer. The time is taken here rather than in the driver
+*  because kb.c does not record one: it is when the key was COLLECTED, which
+*  on a 20 ms sample is within a sample of when it was pressed. */
+static int sysinput_take_key(sys_input_event *ev)
+{
+	unsigned char key;
+
+	key = getchn();
+	if(key == 0) return 0;
+
+	memset(ev, 0, sizeof(*ev));
+	ev->type    = SYS_INPUT_KEY;
+	ev->time_ms = (uint32_t)timer_get_ticks();
+	ev->key     = (uint32_t)key;
+
+	return 1;
+}
+
+/* Which of the two was served last, so the next look starts with the other
+*  one. See sysinput_take(). */
+static int sysinput_mouse_first = 1;
+
+/* One event out of whichever source has one, alternating which is asked
+*  first. 1 if *ev was filled in.
+*
+*  BOTH SOURCES CAN HAVE SOMETHING AT ONCE and that is the case worth
+*  designing for rather than discovering: a user holding a key while moving the
+*  mouse produces a repeat every 33 ms and a packet every few, and only one
+*  event is returned per call. A fixed order starves the other source for as
+*  long as the preferred one keeps delivering -- keyboard first means the
+*  pointer stops moving while a key is held, mouse first means a held key is
+*  swallowed for as long as the mouse is moving. Neither is acceptable and
+*  neither is more acceptable than the other, which is why the choice is not
+*  made once but alternated: whichever source was served last is asked second
+*  next time, so the worst case for either is one event of delay behind the
+*  other. Cheap, and it needs no knowledge of what either device is doing.
+*
+*  The variable is shared by every task in this call rather than kept per task.
+*  Two graphical programs cannot both be reading input usefully anyway -- there
+*  is one keyboard slot and one mouse queue between them -- and a global that
+*  is only ever a hint about ORDER cannot make either of them miss an event.
+*
+*  Both takes are destructive, which is what lets this be the condition of the
+*  wait below: there is no way to ASK either driver whether something is
+*  waiting without consuming it (mouse.h offers mouse_poll() and nothing
+*  weaker, kb.c's getchn() takes the key as it reads it), so the test and the
+*  take are one action, and the caller runs it with interrupts off. */
+static int sysinput_take(sys_input_event *ev)
+{
+	if(sysinput_mouse_first)
+	{
+		if(sysinput_take_mouse(ev))
+		{
+			sysinput_mouse_first = 0;
+			return 1;
+		}
+
+		return sysinput_take_key(ev);
+	}
+
+	if(sysinput_take_key(ev))
+	{
+		sysinput_mouse_first = 1;
+		return 1;
+	}
+
+	return sysinput_take_mouse(ev);
+}
+
+/* input(out, timeout_ms) -- the next thing the user did. 1 when *out was
+*  filled in, 0 when the time ran out, negative on a bad argument.
+*
+*  ONE QUEUE FOR TWO DEVICES, because a program with a pointer and a keyboard
+*  has to wait for whichever comes first and this kernel cannot wait on two
+*  things at once: task_wait() takes one channel. So one of the two has to be
+*  the one that wakes the task and the other has to be sampled, and the choice
+*  is made by what the drivers publish. mouse.h has mouse_wait_channel(),
+*  woken from the interrupt for every packet. kb.c blocks on the address of
+*  last_key, which is in no header -- and sys_getch() above already says what
+*  this file does about that: it does not rebuild the wait out of a channel it
+*  would have to invent, because a channel that is wrong by one address is a
+*  task that never runs again. So the wait is on the mouse and the keyboard is
+*  read once per turn, at SYS_INPUT_POLL, which is what that constant is.
+*
+*  The consequence is worth stating plainly: a mouse packet wakes this call at
+*  once, a keystroke is noticed within 20 ms. If the keyboard ever exports its
+*  channel the two become symmetrical and this loop does not otherwise change.
+*
+*  THE IDIOM IS system.h's, and the condition it tests is sysinput_take()
+*  itself. Interrupts are off across the test AND the block, so a packet or a
+*  key that arrives between the two cannot be lost; the condition is re-tested
+*  after every wake rather than trusted, so a wake for the other waiter -- the
+*  console is in getch() on the same keyboard, and a second task can be in here
+*  -- costs one turn of the loop instead of an event. The take being
+*  destructive is what makes the test meaningful: what it reports is not "there
+*  is something" but "I have it", which cannot then be stolen between the test
+*  and the return.
+*
+*  It is deliberately not tied to SYS_MAPFB. A program that has not taken the
+*  screen may still want the pointer, and one that has may want neither.
+*
+*  What it shares with SYS_GETCH is the one key slot in kb.c: the console's own
+*  getch() takes from it too, so whoever looks first wins. In practice the
+*  shell is in run_wait() while a program it started runs -- main.c says why it
+*  deliberately does not poll the keyboard there -- so a program has the
+*  keyboard to itself until the shell gives up waiting for it.
+*
+*  timeout_ms of 0 waits forever, which is task_wait()'s own convention and
+*  what user/syscall.h documents; a negative one is not a duration and is
+*  refused. Even a forever wait is chunked, so a task blocked here is blocked
+*  in the scheduler's sense -- "ps" shows Blocked, not a busy loop -- and comes
+*  back once every SYS_INPUT_POLL to look at the keyboard. */
+static int sys_input(struct regs *r)
+{
+	sys_input_event ev;
+	unsigned long flags;
+	uint32_t out;
+	uint32_t start;
+	uint32_t waited;
+	int timeout;
+	int chunk;
+	int got;
+
+	out     = (uint32_t)r->ebx;
+	timeout = (int)r->ecx;
+
+	if(!user_range_ok(out, (uint32_t)sizeof(sys_input_event), 1))
+		return SYS_EFAULT;
+	if(timeout < 0) return SYS_EINVAL;
+
+	start = (uint32_t)timer_get_ticks();
+
+	for(;;)
+	{
+		/* How much of the caller's budget is left, and therefore how long
+		*  this turn may block. Worked out before the take so that a call with
+		*  a timeout that has already expired still gets one look at both
+		*  devices -- input(out, 0-length) is a poll, and a poll that returns
+		*  without looking would be useless. */
+		chunk = SYS_INPUT_POLL;
+
+		if(timeout != 0)
+		{
+			waited = sysnet_ms_since(start);
+			if(waited >= (uint32_t)timeout) chunk = 0;
+			else if((uint32_t)timeout - waited < (uint32_t)SYS_INPUT_POLL)
+				chunk = (int)((uint32_t)timeout - waited);
+		}
+
+		flags = sysnet_irq_save();
+
+		got = sysinput_take(&ev);
+
+		/* Only when there is something to wait for and somebody to wait. A
+		*  caller with no current task is answered "timed out" by task_wait()
+		*  at once, which would turn this into a spin; it is not reachable from
+		*  ring 3 and costs one comparison to keep out. chunk of 0 means the
+		*  budget is gone, and task_wait() would read that as "wait forever". */
+		if(!got && chunk > 0 && taskmgr_get_currpid() >= 0)
+			task_wait(mouse_wait_channel(), chunk);
+
+		sysnet_irq_restore(flags);
+
+		if(got)
+		{
+			copy_to_user(out, &ev, (uint32_t)sizeof(ev));
+			return 1;
+		}
+
+		if(chunk == 0) return 0;
+
+		/* No task: the wait above did not happen, so this is the fallback
+		*  sysnet_pump() uses for the same case -- sleep rather than spin. */
+		if(taskmgr_get_currpid() < 0) sleep(chunk);
+	}
+}
+
+
+/* ------------------------------------------------------------------ */
 /* Dispatch                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -2509,7 +3328,10 @@ static syscall_fn syscall_table[SYSCALL_MAX] =
 	sys_fcreate,   /* SYS_FCREATE  20 */
 	sys_fwrite,    /* SYS_FWRITE   21 */
 	sys_unlink,    /* SYS_UNLINK   22 */
-	sys_truncate   /* SYS_TRUNCATE 23 */
+	sys_truncate,  /* SYS_TRUNCATE 23 */
+	sys_mapfb,     /* SYS_MAPFB    24 */
+	sys_unmapfb,   /* SYS_UNMAPFB  25 */
+	sys_input      /* SYS_INPUT    26 */
 };
 
 void syscall_handler(struct regs *r)

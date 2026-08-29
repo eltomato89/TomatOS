@@ -17,7 +17,7 @@
 #include "system.h"
 
 #define SYSCALL_VECTOR   0x80
-#define SYSCALL_MAX      24      /* table size, keep in step with the list */
+#define SYSCALL_MAX      32      /* table size, keep in step with the list */
 
 /* Call numbers. Keep them stable, user code encodes them literally.
 *
@@ -70,6 +70,24 @@
 #define SYS_UNLINK      22       /* unlink(path)                               */
 #define SYS_TRUNCATE    23       /* truncate(path, size)                       */
 
+/* The screen, and what the user does to it.
+*
+*  These three are what let a graphical program be a program rather than
+*  another thing compiled into the kernel. SYS_MAPFB is the first call in this
+*  kernel that puts HARDWARE into a ring 3 address space -- the framebuffer is
+*  a window onto the card, not memory, and a program holding it can draw
+*  anything anywhere on the screen. That is the point of it, and it is also
+*  why it is an ownership transfer rather than a mapping: the kernel's own
+*  console lives on that screen too, and the two cannot both have it.
+*
+*  Ownership is released by SYS_UNMAPFB, and by the task ending -- the same
+*  cleanup on exit the network calls already do, and for the same reason. A
+*  program that crashes must not leave the machine with a screen nobody
+*  repaints. */
+#define SYS_MAPFB       24       /* mapfb(sys_fbinfo *out)                     */
+#define SYS_UNMAPFB     25       /* unmapfb()                                  */
+#define SYS_INPUT       26       /* input(sys_input_event *out, timeout_ms)    */
+
 /* Error returns. Negative so a valid result stays distinguishable. */
 #define SYS_ENOSYS       (-1)    /* no such call number                        */
 #define SYS_EFAULT       (-2)    /* argument pointer outside the caller's reach */
@@ -83,6 +101,8 @@
 #define SYS_EEXIST      (-10)    /* the file is already there                  */
 #define SYS_EROFS       (-11)    /* nothing mounted, or it cannot be written   */
 #define SYS_ENOSPC      (-12)    /* the volume is full                         */
+#define SYS_ENODEV      (-13)    /* there is no framebuffer to map             */
+#define SYS_EBUSY       (-14)    /* another task holds the screen              */
 
 /* ---------------------------------------------------------------------------
 *  Structures crossing the gate
@@ -105,6 +125,51 @@ typedef struct
 	uint32_t size;               /* bytes; 0 for a directory                 */
 	uint32_t flags;              /* SYS_DIRENT_DIR                           */
 } sys_dirent;
+
+/* What SYS_MAPFB hands back. Everything a program needs to put a pixel down
+*  without guessing anything: where the memory is IN ITS OWN address space, how
+*  far apart two rows are, and where the colour channels sit.
+*
+*  The pitch is not width * bytes. A card may pad a row and several do, so a
+*  program computing the stride instead of reading it draws a picture that
+*  shears diagonally. The channel positions are supplied for the same reason --
+*  32 bpp is usually but not always 0x00RRGGBB. */
+typedef struct
+{
+	uint32_t addr;               /* first byte, in the caller's address space */
+	uint32_t size;               /* bytes mapped, pitch * height rounded up   */
+	uint32_t width;              /* pixels                                    */
+	uint32_t height;
+	uint32_t pitch;              /* BYTES per row -- not width * bytes        */
+	uint32_t bpp;                /* bits per pixel: 32, 24, 16 or 15          */
+	uint8_t  red_pos;            /* channel positions and widths, in bits     */
+	uint8_t  red_size;
+	uint8_t  green_pos;
+	uint8_t  green_size;
+	uint8_t  blue_pos;
+	uint8_t  blue_size;
+	uint8_t  reserved[2];
+} sys_fbinfo;
+
+/* One thing the user did. Deliberately one type for the keyboard and the
+*  mouse: a program with a pointer and a keyboard has to wait for whichever
+*  comes first, and two queues would mean waiting on two things at once --
+*  which this kernel's scheduler cannot express. */
+#define SYS_INPUT_KEY    1
+#define SYS_INPUT_MOUSE  2
+
+typedef struct
+{
+	uint32_t type;               /* SYS_INPUT_KEY or SYS_INPUT_MOUSE          */
+	uint32_t time_ms;            /* uptime when it happened                   */
+	int32_t  x;                  /* mouse: where the pointer is now           */
+	int32_t  y;
+	int32_t  dx;                 /* mouse: how far it moved this time         */
+	int32_t  dy;
+	uint32_t buttons;            /* mouse: which are down now                 */
+	uint32_t changed;            /* mouse: which changed, 0 for a plain move  */
+	uint32_t key;                /* key: the character                        */
+} sys_input_event;
 
 typedef struct
 {

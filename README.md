@@ -230,6 +230,79 @@ type string in the boot sector — that field is advisory and often wrong. And
 the root directory of FAT12/16 is a fixed area behind the FATs, not part of
 the cluster chain, unlike every subdirectory.
 
+### A window system in ring 3
+
+`gui` is a program on the disk — `/BIN/GUI.ELF` — with windows, a pointer, a Z
+order, dragging and raising. The kernel supplies three system calls and
+nothing else:
+
+```
+sys_mapfb(&info)     take the screen; address, geometry and pixel format
+sys_unmapfb()        give it back, the kernel repaints its console
+sys_input(&ev, ms)   the next keyboard or mouse event, blocking
+```
+
+**`sys_mapfb` is the first call here that puts hardware into a ring 3 address
+space.** What comes back is a window onto the graphics card: writes change the
+monitor immediately, there is no clipping and no compositing, and a program
+holding it can draw anywhere. That is the point. What it must not be able to
+do is reach anything else, and the guard that matters is that the physical
+range has to lie **above the RAM the frame allocator knows about** — a
+"framebuffer" overlapping RAM would put kernel memory into a user half with
+`PAGE_USER` set. The caching flags are deliberately identical to the kernel's
+own mapping of the same frames, because two mappings of one device with
+different cacheability is architecturally undefined.
+
+It is an **ownership transfer**, not just a mapping. The kernel's console is on
+that screen too, so `fbcon_suspend()` takes it and `fbcon_resume()` gives it
+back with a full repaint; a second caller gets `SYS_EBUSY`. The console keeps
+its shadow buffer up to date while suspended, so everything printed meanwhile
+appears in order afterwards — verified by counting colours in a screenshot:
+during a suspension the image contains exactly the three colours the other
+program drew and zero console pixels, despite 120 lines being printed.
+
+**Releasing on death is not optional.** A program that crashes must not leave a
+screen nobody repaints, so the release happens on a normal exit, on a page
+fault, on `taskmgr -k` and on pid reuse — all four confirmed on screen, with
+the console and its full boot log back each time.
+
+Keyboard and mouse share **one** event queue, because a program with a pointer
+and a keyboard has to wait for whichever comes first, and this kernel cannot
+wait on two things at once.
+
+#### Redrawing is the whole problem
+
+Moving a window exposes what was behind it, and that — not drawing — is what a
+window system is about. `gui` keeps no saved pixels anywhere, not even under
+the pointer: for each damage rectangle it sets a clip window and repaints the
+*entire* scene into it, desktop first, then windows bottom to top, then the
+cursor. The exposed area is repaired without anything having to know it was
+exposed. The desktop's grid is there on purpose — a repaint that got the region
+wrong shows as a broken line where a flat colour would hide it.
+
+**Damage rectangles are not an optimisation here, they are the difference
+between usable and not.** Measured on the machine: a full-screen blit is 3.0 to
+3.8 ms, while the cheapest real frame — the pointer moved and nothing else — is
+one 24×34 rectangle, 3264 bytes, about 960 times cheaper. A whole session came
+to 71 MB copied in 97 ms where flushing every frame would have moved 550 MB.
+Damage is coalesced until the event queue runs dry or a 16 ms budget expires,
+so a drag burst becomes frames rather than one blit per mouse packet.
+
+Hit testing walks the Z order **top down** and stops at the first window
+containing the point, and raising happens *after* the hit is decided — raising
+first would change the answer. Raising damages two rectangles, not one: the
+window coming forward, and the one that *was* in front, which does not move but
+is drawn differently once it is no longer active. A screenshot caught exactly
+that bug, as half a title bar in the old colour.
+
+The 3 MB back buffer is `.bss`, which turns out to be right rather than merely
+available: `exec.c` allocates a frame per page and zeroes everything past
+`p_filesz`, so it costs nothing on disk and arrives already cleared — a 3 MB
+`memset` that never runs.
+
+**A framebuffer needs a loader that supplies one.** `make run` does not, so
+`gui` is `make run-iso` or `make run-bootdisk`.
+
 ### The mouse
 
 `mouse` shows the pointer live: position, movement, buttons, and counters for
