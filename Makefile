@@ -110,11 +110,25 @@ LDFLAGS  := -m elf_i386 -T $(LINKER_SCRIPT) -nostdlib -no-pie
 #  Programs are single translation units on purpose -- there is no libc to
 #  link against, so anything shared between them belongs in a header.
 # ---------------------------------------------------------------------------
-USER_PROGS := hello
+# Programs that live on the disk rather than in the kernel. "make disk" copies
+# each one into /BIN as NAME.ELF, and the shell runs an unknown command by
+# looking for it there -- so adding a name here is all it takes to add a
+# command. Keep the names to eight characters: they end up as 8.3 entries on a
+# FAT16 volume, and a longer one would need a VFAT long name entry, which the
+# kernel's directory reader skips.
+USER_PROGS := hello ls cat
+
+# The C library every program links against: user/lib.c, holding _start (which
+# calls main), printf, the string routines and the file helpers. It is a plain
+# object rather than an archive -- with a handful of programs, "ar" would only
+# add a step and a chance for a stale index, and the linker garbage collects
+# nothing here either way.
+USER_LIB_SRC := $(USER_DIR)/lib.c
+USER_LIB_OBJ := $(USER_OBJ_DIR)/lib.o
 
 USER_ELFS  := $(patsubst %,$(BUILD_DIR)/%.elf,$(USER_PROGS))
 USER_OBJS  := $(patsubst %,$(USER_OBJ_DIR)/%.o,$(USER_PROGS))
-USER_DEPS  := $(USER_OBJS:.o=.d)
+USER_DEPS  := $(USER_OBJS:.o=.d) $(USER_OBJ_DIR)/lib.d
 
 # The objects deliberately land in a directory of their own. Nothing forces
 # the separation otherwise: both sides are -m32 freestanding ELF objects, and
@@ -569,17 +583,21 @@ $(USER_OBJ_DIR):
 # --- user space programs ---------------------------------------------------
 user: $(USER_ELFS) $(USER_MODULES)
 
-$(USER_OBJS): $(USER_OBJ_DIR)/%.o: $(USER_DIR)/%.c | $(USER_OBJ_DIR)
+$(USER_OBJS) $(USER_LIB_OBJ): $(USER_OBJ_DIR)/%.o: $(USER_DIR)/%.c | $(USER_OBJ_DIR)
 	@echo "  CC/U    $<"
 	$(CC) $(USER_CFLAGS) $(DEPFLAGS) -c $< -o $@
 
-# One object per program, and nothing else on the link line: no kernel
+# The program plus the library, and nothing else on the link line: no kernel
 # objects, no libgcc, no crt files. What comes out is a static ET_EXEC with a
 # single PT_LOAD segment and not one relocation -- verify with
 # "readelf -l" and "readelf -r".
-$(USER_ELFS): $(BUILD_DIR)/%.elf: $(USER_OBJ_DIR)/%.o $(USER_LINKER_SCRIPT) | $(BUILD_DIR)
+#
+# lib.o carries _start, so it has to be on the line even for a program that
+# never calls anything else in it; ENTRY(_start) in user.ld would otherwise
+# have no symbol to resolve.
+$(USER_ELFS): $(BUILD_DIR)/%.elf: $(USER_OBJ_DIR)/%.o $(USER_LIB_OBJ) $(USER_LINKER_SCRIPT) | $(BUILD_DIR)
 	@echo "  LD/U    $@"
-	$(LD) $(USER_LDFLAGS) -o $@ $<
+	$(LD) $(USER_LDFLAGS) -o $@ $< $(USER_LIB_OBJ)
 
 # The bare-name alias QEMU loads (see the Multiboot module block at the top).
 # Relative symlink, so moving $(BUILD_DIR) does not break it.

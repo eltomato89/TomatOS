@@ -43,16 +43,32 @@ static int current_task = -1;
 
 task_settings tasks[MAX_TASKS];
 
-/* The kernel stack of every task. A ring 0 task simply runs on it. A ring 3
-*  task never touches it directly: it is the stack the CPU switches to, using
-*  esp0 out of the TSS, whenever an interrupt or a system call drags the task
-*  into the kernel. Either way this is where the task's saved struct regs
-*  lives, which is why every task needs one of its own - two tasks sharing a
-*  kernel stack would overwrite each other's saved context.
+/* The kernel stack of every task, or 0 for a slot that has none. A ring 0
+*  task simply runs on it. A ring 3 task never touches it directly: it is the
+*  stack the CPU switches to, using esp0 out of the TSS, whenever an interrupt
+*  or a system call drags the task into the kernel. Either way this is where
+*  the task's saved struct regs lives, which is why every task needs one of
+*  its own - two tasks sharing a kernel stack would overwrite each other's
+*  saved context.
 *
-*  Aligned because the saved register frame is carved out of the top of it and
-*  is accessed as struct regs, i.e. as 32 bit words. */
-static uint8_t task_kernel_stacks[MAX_TASKS][KERNEL_STACK_SIZE] __attribute__((aligned(16)));
+*  This used to be a static uint8_t[MAX_TASKS][KERNEL_STACK_SIZE], i.e. 256
+*  KiB of bss that existed from the first instruction of the kernel onwards,
+*  on a machine that realistically runs a handful of tasks. Now a stack is
+*  allocated when a task is created and given back when its slot is recycled,
+*  and an unused slot costs the four bytes of this pointer.
+*
+*  The pointer names the stack page itself, i.e. its LOWEST address; the stack
+*  grows down from kernel_stack_top(). Zero initialised statics give the right
+*  answer before the first task exists: no slot has a stack, and none is ever
+*  looked at, because a slot only becomes schedulable in
+*  taskmgr_task_start(), long after its stack is in place. */
+static uint8_t *task_kstacks[MAX_TASKS];
+
+/* A kernel stack whose task is gone but that could not be handed back at the
+*  moment its slot was recycled, see kernel_stack_release(). Freed by
+*  reap_pending_kstack() on the next task creation, exactly like
+*  pending_space next to it. */
+static uint8_t *pending_kstack;
 
 /* The address space a slot runs in, or 0 for "the kernel space".
 *
@@ -113,10 +129,262 @@ static void copy_bounded(char *dest, const char *src, int size)
 *  eip *below* esp0, so esp0 has to be the first address past the end of the
 *  stack, not its base. Handing over the base instead would make the very
 *  first interrupt push five words into whatever happens to lie in front of
-*  the array. */
+*  the stack. */
 static uint32_t kernel_stack_top(int slot)
 {
-	return (uint32_t) task_kernel_stacks[slot] + KERNEL_STACK_SIZE;
+	return (uint32_t) task_kstacks[slot] + KERNEL_STACK_SIZE;
+}
+
+/* --- Kernel stacks -------------------------------------------------------
+*
+*  Where the memory comes from, and why it is the frame allocator rather than
+*  malloc().
+*
+*  A kernel stack has two hard requirements that a plain heap block does not
+*  meet on its own:
+*
+*    - It has to be page aligned. The saved struct regs is carved out of the
+*      top of the stack and read back as 32 bit words, and the page below it
+*      is meant to be the guard page described further down. malloc() promises
+*      neither; asking it for a page aligned page means asking for two and
+*      throwing half away, plus the chunk header of the neighbouring block
+*      sits directly under the stack - the one thing an overflow must not be
+*      able to reach quietly.
+*
+*    - It has to be mapped in EVERY address space, not just in the one that
+*      happened to be active when it was allocated. An interrupt can arrive
+*      while any task runs, and the very first thing the CPU does with it is
+*      push onto the kernel stack of that task - through whatever page
+*      directory is in CR3 at that moment. A stack that exists in only one
+*      directory would work perfectly until the first context switch and then
+*      triple fault the machine, which is precisely the kind of failure that
+*      never shows up in the code that caused it.
+*
+*  One frame out of pmm_alloc_frames(), addressed through P2V(), satisfies
+*  both. Alignment comes for free - a frame is 4 KiB and frame aligned, and
+*  KERNEL_STACK_SIZE is exactly one frame. Visibility comes from the direct
+*  mapping: vmm_init() maps all usable RAM at KERNEL_VIRTUAL_BASE + phys
+*  before any task space can exist, and vmm_create_space() copies the kernel
+*  half of the directory - the ENTRIES, so every space walks into the same
+*  page tables (see vmm.h). A P2V() address is therefore mapped in every space
+*  that exists and in every space that will ever be created, and no allocation
+*  here can ever need a new kernel page table, which is the one thing that
+*  would NOT propagate. The heap would have been acceptable on that second
+*  point for the same reason - heap_init() and every later growth take frames
+*  out of that same window and never call vmm_map() - but it fails the first.
+*
+*  The pmm can hand out frames the direct mapping does not reach (physical
+*  memory above DIRECT_MAP_TOP on a large machine); P2V() is meaningless for
+*  those, so both frames are checked with vmm_is_mapped() before use rather
+*  than assumed.
+*
+*  The guard page. Each stack is the UPPER of two contiguous frames, and the
+*  lower one is unmapped from the direct mapping for as long as the stack
+*  lives. A kernel stack overflow then hits a not-present page instead of
+*  quietly writing into whatever the frame allocator handed out next - a page
+*  table, a page directory, a heap block, another task's saved registers.
+*  This was impossible while all the stacks sat in one bss array: the page
+*  below a stack was the next task's stack, and unmapping it would have taken
+*  that task's memory away.
+*
+*  It is worth being honest about what the fault looks like. On x86-32 a fault
+*  taken in ring 0 does not switch stacks, so the CPU tries to push the
+*  exception frame at the esp that just ran off the end - inside the guard
+*  page - which faults again: double fault, and the double fault handler is
+*  pushed onto the same dead stack, so in practice the machine triple faults
+*  and resets. That is still the better outcome by a wide margin: it happens
+*  at the exact instruction that overflowed, it is perfectly reproducible, and
+*  it destroys nothing. Silent corruption of a random kernel frame is the
+*  alternative, and it surfaces minutes later somewhere unrelated. Turning the
+*  reset into a readable message needs a double fault task gate with a stack
+*  of its own, which belongs in the descriptor tables and not here.
+*
+*  The guard frame is deliberately kept ALLOCATED in the pmm although it is
+*  unmapped. It is not free memory - handing it back while its direct mapping
+*  is missing would give the next owner a frame it cannot address through
+*  P2V(), and the first heap growth or page table would fault. That is also
+*  why kernel_stack_destroy() restores the mapping before, and only before,
+*  the pair goes back. */
+
+/* One page of stack plus one page of guard, or 0 if that could not be had.
+*  Returns the stack page, i.e. the address the stack grows down from the end
+*  of; the guard page is the one directly below it. */
+static uint8_t *kernel_stack_create(void)
+{
+	void    *frames;
+	uint32_t guard;
+	uint32_t stack;
+
+	/* Contiguous, because the guard has to be the page immediately below
+	*  the stack - in the direct mapping neighbouring virtual pages are
+	*  neighbouring physical frames, so nothing else will do. */
+	frames = pmm_alloc_frames(2);
+	if(frames == 0) return 0;
+
+	guard = (uint32_t) P2V(frames);
+	stack = guard + PAGE_SIZE;
+
+	/* Both halves have to be reachable through the direct mapping before
+	*  the pair is of any use: the stack because the kernel runs on it, the
+	*  guard because the unmap below has to have something to remove. A pair
+	*  outside the window goes straight back. */
+	if(!vmm_is_mapped(guard) || !vmm_is_mapped(stack))
+	{
+		pmm_free_frames(frames, 2);
+		return 0;
+	}
+
+	/* Punching the hole edits a page table of the kernel half, which every
+	*  address space shares, so the guard is gone in all of them at once and
+	*  no space can be created later that still has it. The TLB of the
+	*  active space is invalidated by vmm_unmap() itself; a parked space
+	*  picks the change up from the CR3 load that reactivates it, because
+	*  nothing here is mapped PAGE_GLOBAL. */
+	if(vmm_unmap(guard) != 0)
+	{
+		pmm_free_frames(frames, 2);
+		return 0;
+	}
+
+	return (uint8_t *) stack;
+}
+
+/* Gives a stack and its guard page back. The direct mapping is repaired
+*  first: a frame whose P2V() alias is missing must never reach the free list,
+*  so if the repair fails - which it cannot today, the page table it writes
+*  into has existed since vmm_init() - the two frames are leaked on purpose
+*  rather than handed out again. */
+static void kernel_stack_destroy(uint8_t *stack)
+{
+	uint32_t guard;
+
+	if(stack == 0) return;
+
+	guard = (uint32_t) stack - PAGE_SIZE;
+
+	if(vmm_map(guard, V2P(guard), PAGE_PRESENT | PAGE_WRITE) != 0) return;
+
+	pmm_free_frames((void *) V2P(guard), 2);
+}
+
+/* The esp of the caller, used only to answer "are we standing on this very
+*  stack right now". Reading it is enough: the value is compared against a
+*  page sized range, and no call this function returns through can move esp
+*  out of the frame that asked. */
+static uint32_t current_esp(void)
+{
+	uint32_t esp;
+
+	__asm__ __volatile__ ("movl %%esp, %0" : "=r" (esp));
+
+	return esp;
+}
+
+/* Is anything still relying on this stack? Two things can:
+*
+*    - the CPU, if it is executing on it at this very moment. That is the
+*      whole trap: a task that frees its own kernel stack from inside a call
+*      that is running on it hands live memory to the allocator, and the next
+*      allocation overwrites the return addresses under esp.
+*    - a saved context, if some slot's task_states[] entry points into it. A
+*      slot whose stack is being replaced has its entry cleared first, so what
+*      this finds is an entry that ended up pointing at a FOREIGN stack - the
+*      case of a task that aborted itself, saw its own slot recycled, and was
+*      only then preempted, so the scheduler wrote its context into a slot
+*      that now belongs to somebody else. Dispatching from freed memory is the
+*      failure that would follow, and refusing to free is the cheap way out.
+*
+*  Everything else is genuinely dead: an aborted task that is not the current
+*  one will never be elected again - schedule() only looks at
+*  TASK_STATE_RUNNING - so nothing will ever return onto its stack. */
+static int kernel_stack_in_use(uint8_t *stack)
+{
+	uint32_t base;
+	uint32_t top;
+	uint32_t esp;
+	uint32_t saved;
+	int      i;
+
+	if(stack == 0) return 0;
+
+	base = (uint32_t) stack;
+	top  = base + KERNEL_STACK_SIZE;
+
+	/* >= base, <= top: an esp of exactly top means the stack is empty,
+	*  which cannot happen while a call is running on it, and counting it as
+	*  "in use" errs towards keeping memory rather than towards freeing it. */
+	esp = current_esp();
+	if(esp >= base && esp <= top) return 1;
+
+	for(i=0; i <= MAX_TASKS-1; i++)
+	{
+		saved = (uint32_t) task_states[i];
+		if(saved >= base && saved < top) return 1;
+	}
+
+	return 0;
+}
+
+/* Hands a slot's kernel stack back. Called when a slot is recycled, and that
+*  is the only moment a task's memory is ever given up here: taskmgr_task_
+*  abort(), the exception handler, exit() and taskmgr_killall() all do nothing
+*  but set a state, and everything a dead task owns deliberately stays around
+*  until somebody actually wants the slot. Which means the caller is always a
+*  taskmgr_add_*_task(), running in some task's context - never in an
+*  interrupt handler, and never on the stack of the slot being recycled unless
+*  that task is recycling its own slot, which is the case the parking below
+*  exists for.
+*
+*  The context pointer goes first, because it is by definition the stack's own
+*  saved frame and would otherwise make the in-use test below answer "yes" for
+*  every single stack. The caller replaces it immediately anyway; in the one
+*  path where it does not - an allocation that fails - a zero entry is exactly
+*  right, since taskmgr_task_start() and taskmgr_task_set_entry() both refuse
+*  a slot without a context.
+*
+*  A stack that is still live is parked instead of freed, the same answer
+*  task_space_release() gives for an address space that is still in CR3 and
+*  for the same reason. At most one can be parked: parking requires the caller
+*  to be running on the stack it is releasing, and there is only one esp. */
+static void kernel_stack_release(int slot)
+{
+	uint8_t *stack;
+
+	stack = task_kstacks[slot];
+
+	//Both together, and before the early exit, so that "no stack" and "no
+	//saved context" can never disagree: a context always lives on the stack
+	//of its own slot, so one without the other would be a dangling pointer.
+	task_kstacks[slot] = 0;
+	task_states[slot]  = 0;
+
+	if(stack == 0) return;
+
+	if(kernel_stack_in_use(stack))
+	{
+		pending_kstack = stack;
+		return;
+	}
+
+	kernel_stack_destroy(stack);
+}
+
+/* Frees a parked stack once nothing depends on it any more. Called from task
+*  context only, never from schedule(): this walks into the pmm and the vmm,
+*  and the timer IRQ can hit in the middle of an allocation somewhere else -
+*  the same rule reap_pending_space() states next door.
+*
+*  A stack can stay parked across several attempts, and in the pathological
+*  case (a saved context that ended up on a foreign stack) forever. That costs
+*  8 KiB and is the deliberate trade: leaking memory is recoverable, freeing a
+*  stack somebody still returns onto is not. */
+static void reap_pending_kstack(void)
+{
+	if(pending_kstack == 0) return;
+	if(kernel_stack_in_use(pending_kstack)) return;
+
+	kernel_stack_destroy(pending_kstack);
+	pending_kstack = 0;
 }
 
 /* Highest address of the slot's user stack, i.e. the initial user esp. */
@@ -385,11 +653,19 @@ struct regs* schedule(struct regs* cpu)
 	//  - the code: schedule() and its caller are linked above
 	//    KERNEL_VIRTUAL_BASE, so the instruction after the write to CR3 is
 	//    fetched from a still valid mapping,
-	//  - the stack: esp points into task_kernel_stacks[] in the kernel's bss,
-	//    so the return address and the locals survive,
-	//  - the value returned: task_states[] points into that same array, so the
-	//    pointer irq_common_stub loads into esp and pops the new context from
-	//    is mapped in the new space as well.
+	//  - the stack: esp points into the kernel stack of a task, which is a
+	//    frame addressed through the direct mapping, so the return address
+	//    and the locals survive,
+	//  - the value returned: task_states[] points into such a stack as well,
+	//    so the pointer irq_common_stub loads into esp and pops the new
+	//    context from is mapped in the new space too.
+	//The kernel stacks moved out of the bss into individually allocated
+	//frames, which changes nothing about this argument: both live in the
+	//kernel half, and the kernel half is the same page tables in every
+	//directory. It does add a rule - a stack must never need a page table
+	//that did not already exist when the first address space was created -
+	//and that rule is met by construction, because a stack is a frame seen
+	//through the direct mapping vmm_init() completed long before mt_install().
 	//Nothing below this line reads user memory, which is the other half of the
 	//argument - the old user half is gone the moment CR3 changes.
 	space = task_space[current_task];
@@ -406,6 +682,25 @@ struct regs* schedule(struct regs* cpu)
 }
 
 //No caller evaluates a result, hence void instead of int.
+//
+//Nothing is allocated here, and that is the point: not one of the 64 slots
+//owns a kernel stack until a task moves into it. What has to hold instead is
+//that the scheduler can never reach a slot whose stack is not there yet, and
+//that follows from two things.
+//
+//  - Marking every slot TASK_STATE_NULL is the whole initialisation. A slot
+//    only becomes a candidate in schedule() once it is TASK_STATE_RUNNING AND
+//    has a saved context, and taskmgr_add_*_task() sets neither before its
+//    kernel stack exists: occupy_slot() leaves the task suspended, and only
+//    taskmgr_task_start() - a separate call, made by whoever created the task
+//    - makes it runnable. So the stack is always older than the first tick
+//    that could look at it.
+//  - The timer IRQ is in fact still masked when this runs; kernel.c does its
+//    "sti" further down and creates the console task after that. But the
+//    scheduler is written not to depend on that ordering, and it must not
+//    start to: taskmgr_add_task() runs with interrupts on for every task
+//    after the first one, and a tick landing in the middle of it finds either
+//    a slot that is not runnable yet or one that is complete.
 void mt_install()
 {
 	int i;
@@ -446,11 +741,14 @@ static void occupy_slot(int slot, const char *name, int prio)
 
 int taskmgr_add_task( void* tfunct, const char *name, int prio)
 {
-	int i;
+	uint8_t *kstack;
+	int      i;
 
-	//Before the slot search, so a space that was still active the last time a
-	//slot was recycled gives its frames back in time to be used again here.
+	//Before the slot search, so a space or a kernel stack that was still live
+	//the last time a slot was recycled gives its frames back in time to be
+	//used again here.
 	reap_pending_space();
+	reap_pending_kstack();
 
 	i = find_free_slot();
 
@@ -466,9 +764,33 @@ int taskmgr_add_task( void* tfunct, const char *name, int prio)
 	//task_space[i] == 0, the kernel space, which is where a ring 0 task runs.
 	task_space_release(i);
 
+	//Same for the previous occupant's kernel stack, and for the same reason
+	//it happens before the allocation below rather than after: two frames
+	//that come back here may well be the two the new task is about to get.
+	kernel_stack_release(i);
+
+	//The one allocation in this function, and the one thing that can fail
+	//now that a kernel stack is no longer simply there. Nothing about the
+	//slot has been changed yet at this point - the state is still whatever
+	//find_free_slot() accepted, TASK_STATE_NULL or TASK_STATE_ABORTED, and
+	//task_states[i] was cleared above - so returning here leaves the slot
+	//exactly as free as it was found. There is no half built task to undo,
+	//and the next attempt will pick the very same slot.
+	kstack = kernel_stack_create();
+	if(kstack == 0)
+	{
+		printf("ERR: Task '%s' could not be started, no memory for its kernel stack!\n", name);
+		return -1;
+	}
+
 	occupy_slot(i, name, prio);
 
-	task_states[i] = init_task(task_kernel_stacks[i], tfunct);
+	//The stack is recorded before the context is built on it, so that
+	//kernel_stack_top() is right the first time the scheduler asks - which
+	//it can only do once taskmgr_task_start() makes the slot runnable, but
+	//the order costs nothing and leaves no window to reason about.
+	task_kstacks[i] = kstack;
+	task_states[i] = init_task(kstack, tfunct);
 
 	//printf("Task '%s' started with PID %i\n", name, i);
 	return i;
@@ -490,9 +812,11 @@ int taskmgr_add_user_task( void* tfunct, const char *name, int prio)
 {
 	uint32_t    user_esp;
 	addrspace_t space;
+	uint8_t    *kstack;
 	int         i;
 
 	reap_pending_space();
+	reap_pending_kstack();
 
 	i = find_free_slot();
 	if(i < 0)
@@ -505,6 +829,7 @@ int taskmgr_add_user_task( void* tfunct, const char *name, int prio)
 	//new task gets a space of its own and must not inherit the dead one, and
 	//the frames come back early enough to serve the allocations below.
 	task_space_release(i);
+	kernel_stack_release(i);
 
 	space = vmm_create_space();
 	if(space == 0)
@@ -524,11 +849,26 @@ int taskmgr_add_user_task( void* tfunct, const char *name, int prio)
 		return -1;
 	}
 
+	//The kernel stack comes last of the three allocations, which is what
+	//keeps the unwinding to a single line: the user stack frame and the page
+	//table holding it belong to the space, so destroying the space gives
+	//everything allocated so far back at once. Ordered the other way round
+	//each later failure would have to remember to release the kernel stack
+	//as well.
+	kstack = kernel_stack_create();
+	if(kstack == 0)
+	{
+		vmm_destroy_space(space);
+		printf("ERR: Task '%s' could not be started, no memory for its kernel stack!\n", name);
+		return -1;
+	}
+
 	task_space[i] = space;
+	task_kstacks[i] = kstack;
 
 	occupy_slot(i, name, prio);
 
-	task_states[i] = init_user_task(task_kernel_stacks[i], tfunct, user_esp);
+	task_states[i] = init_user_task(kstack, tfunct, user_esp);
 
 	return i;
 }
@@ -629,6 +969,59 @@ int taskmgr_task_set_entry(int pid, uint32_t entry)
 	return 0;
 }
 
+//Moves a suspended ring 3 task's initial user stack pointer.
+//
+//The counterpart of taskmgr_task_set_entry(), and it exists for the same
+//reason: a loader has to finish building a task after the task manager created
+//it. add_user_task() hands out a stack page and points esp at its very top,
+//which is right for a program that gets nothing - but a program that gets
+//arguments needs them written into that page first, and esp then has to start
+//BELOW the block instead of above it.
+//
+//Without this call exec.c had to reach the same end by writing twelve bytes of
+//machine code into the top of the stack page ("mov eax, entry; mov esp, base;
+//jmp eax") and entering there. That works - 32 bit x86 without PAE has no NX
+//bit - but executing off the stack is precisely the pattern hardware spent two
+//decades learning to forbid, and it made the loader's output depend on the
+//encoding of three instructions. One field write says the same thing.
+//
+//The conditions match set_entry() exactly, and for the same reasons: a slot
+//with a context, suspended so that no CPU is looking at the frame, and a value
+//that is not the "not set" marker. Whether esp is mapped in the task's space
+//is not checked and cannot be - the caller usually maps it afterwards, in a
+//directory that is not the active one. A wrong value faults in ring 3 with
+//CR2 naming it, which is a readable failure.
+int taskmgr_task_set_stack(int pid, uint32_t user_esp)
+{
+	if(pid < 0 || pid > MAX_TASKS-1) return -1;
+	if(task_states[pid] == 0) return -1;
+	if(tasks[pid].state != TASK_STATE_SUSPENDED) return -1;
+	if(user_esp == 0) return -1;
+
+	task_states[pid]->useresp = user_esp;
+
+	return 0;
+}
+
+//What state a slot is in, for a caller that has to wait for a task rather than
+//just start one.
+//
+//The shell needs this: once a command can be a program on disk, "cat file"
+//means spawn, then wait, or the prompt comes back and prints over the output.
+//Without an accessor the only way to ask was taskmgr_list_tasks(), which
+//prints rather than answers.
+//
+//TASK_STATE_NULL for a pid that names no slot, which is deliberately the same
+//answer a slot that was never used gives: to a waiting caller "gone" and
+//"never existed" are the same thing, and both mean stop waiting. A caller that
+//needs to tell them apart is asking the wrong question.
+int taskmgr_task_state(int pid)
+{
+	if(pid < 0 || pid > MAX_TASKS-1) return TASK_STATE_NULL;
+
+	return tasks[pid].state;
+}
+
 void taskmgr_task_abort(int pid, int error_number, const char *error_descr)
 {
 	if(pid < 0 || pid > MAX_TASKS-1)
@@ -639,7 +1032,15 @@ void taskmgr_task_abort(int pid, int error_number, const char *error_descr)
 		tasks[pid].error_no = error_number;
 		copy_bounded(tasks[pid].error, error_descr, sizeof(tasks[pid].error));
 
-		//The stack slot deliberately stays occupied, taskmgr_add_task() recycles it later.
+		//The slot deliberately stays occupied, taskmgr_add_task() recycles it later.
+		//That now covers the kernel stack as well, and freeing it here instead
+		//would be the classic way to lose the machine: an abort arrives from
+		//exactly three places - exit(), the exception handler, and the kill
+		//command - and the first two run in the kernel ON the stack of the task
+		//they are aborting. The task also keeps running until the next tick
+		//elects somebody else, so its stack is live well past this line. Handing
+		//it to the allocator here would give the next caller of malloc() the
+		//return addresses this function is standing on.
 		//But if the currently running task is aborted, its remaining CPU time must be
 		//dropped: otherwise it would keep running in the else branch of schedule() until
 		//cpu_time expires, even though it is no longer TASK_STATE_RUNNING.
@@ -709,6 +1110,12 @@ void taskmgr_task_suspend(int pid)
 //Terminates all tasks from index 1 on. Slot 0 is deliberately spared: it runs the
 //console (the system task) through which killall is invoked in the first place -
 //if it were aborted as well, no runnable task would be left.
+//
+//Nothing is released here either, for one reason more than in
+//taskmgr_task_abort(): this walks 63 slots at once, and any number of them
+//may have been preempted somewhere deep inside the kernel, with a half
+//finished call parked on their kernel stacks. Their memory becomes free the
+//moment their slot is wanted and not a tick earlier.
 //No caller evaluates a result, hence void instead of int.
 void taskmgr_killall()
 {

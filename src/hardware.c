@@ -440,29 +440,13 @@ void audio_beep(unsigned frequency, int duration)
 	audio_switch_off();
 }
 
-int floppy_detect(char drive)
-{
-	unsigned char c;
-	outportb(0x70, 0x10);
-	c = inportb(0x71);
-	int a,b;
-	a = c >> 4; // get the high nibble
-	b = c & 0xF; // get the low nibble by ANDing out the high nibble
-	if(drive == 'a') return a;
-	if(drive == 'b') return b;
-	
-	return 0;
-}
-
-char *floppy_getDriveType(int num)
-{
-	/* Six entries - the array used to be declared as [5], which lost the
-	 * last type. The range check catches unknown nibbles. */
-	static char *drive_type[6] = { "no floppy drive",
-							"360kb 5.25in floppy drive",
-							"1.2mb 5.25in floppy drive",
-							"720kb 3.5in", "1.44mb 3.5in",
-							"2.88mb 3.5in"};
-	if(num < 0 || num > 5) return "unknown floppy drive";
-	return drive_type[num];
-}
+/* floppy_detect() and floppy_getDriveType() are gone. They read CMOS byte
+ * 0x10 and turned the two nibbles into drive descriptions, and nothing ever
+ * called them: no header declared them, so nothing outside this file could,
+ * and nothing inside it did either. They were also the last code here that
+ * declared variables in the middle of a block, which this kernel does not do.
+ *
+ * Nothing was lost with them. The kernel boots from ATA (src/ata.c) and
+ * mounts FAT off it; there is no floppy driver for a detection result to
+ * feed, and "make run-floppy" boots an image through the BIOS without ever
+ * asking this file about it. */

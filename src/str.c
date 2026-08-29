@@ -7,7 +7,6 @@
 #include <system.h>
 #include <string.h>
 #include <stdio.h>
-#include <math.h>
 #define EOS '\0'
 #define NULL 0
 

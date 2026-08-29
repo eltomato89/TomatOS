@@ -2,10 +2,8 @@
 #include <system.h>
 #include <string.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <stdarg.h>
 #include <asm.h>
-#include <math.h>
 #include <mm.h>
 #include <vmm.h>
 #include <syscall.h>
@@ -226,35 +224,51 @@ extern char usertext_end[];
 
 /* --- filesystem --------------------------------------------------------- */
 
-/* Column widths of the "ls" table, padded by hand like every other table in
-*  this file. The name field is FAT_NAME_MAX wide plus one space, so a full
-*  8.3 name never touches the size column. */
-#define LS_NAME_WIDTH    14
-#define LS_SIZE_WIDTH    10
-
-/* Upper bound on the directory walk. fat_readdir() says when it is done, so
-*  this is not how the loop normally ends -- it is the guard that keeps a
-*  damaged or looping directory from hanging the shell forever. */
-#define LS_MAX_ENTRIES   4096
-
 /* Width of the model column in "df". IDENTIFY hands out 40 characters, plus
 *  one space to the next column. */
 #define DF_MODEL_WIDTH   41
 
-/* How much of a file "cat" holds at a time. A file can be far larger than
-*  any buffer worth putting on a task stack, and fat_read() is offset based
-*  precisely so it can be streamed -- so the file is walked one chunk at a
-*  time and nothing is allocated for it at all. One sector is the natural
-*  unit: it is what the layer underneath moves anyway. */
-#define CAT_CHUNK        ATA_SECTOR_SIZE
+/* --- programs on the disk ------------------------------------------------
+*
+*  Where a command that is not built in is looked for, and what its file is
+*  called. Neither half is a matter of taste here: the Makefile copies every
+*  user program into /BIN as NAME.ELF in upper case, because mcopy would
+*  otherwise write VFAT long name entries and fat.c skips those -- a lower
+*  case name would simply not be there to find.
+*
+*  So the shell converts, in run_path() and nowhere else: what the user types
+*  is lower case, what the directory holds is upper case 8.3. */
+#define BIN_DIR          "/BIN/"
+#define BIN_EXT          ".ELF"
 
-/* Bytes "cat" lets through untouched. Everything outside this range is
-*  replaced, see fs_cat(). */
-#define CAT_FIRST_PRINT  0x20
-#define CAT_LAST_PRINT   0x7E
+/* The "8" of 8.3, and therefore the longest command name that can name a
+*  file on this volume. */
+#define BIN_NAME_MAX     8
 
-/* What a byte that cannot be printed is shown as. */
-#define CAT_REPLACEMENT  '.'
+/* "/BIN/" plus eight characters plus ".ELF" plus the terminator. */
+#define BIN_PATH_MAX     18
+
+/* Upper bound on the walk over /BIN that "help" does. fat_readdir() says when
+*  it is done, so this is not how the loop normally ends -- it is the guard
+*  that keeps a damaged or looping directory from hanging the shell. */
+#define BIN_MAX_ENTRIES  4096
+
+/* The listing "help" prints. A name is at most BIN_NAME_MAX characters once
+*  the extension is off, so ten leaves two spaces between columns, and six of
+*  those plus the leading tab stay inside eighty columns. */
+#define BIN_NAME_WIDTH   10
+#define BIN_PER_LINE     6
+
+/* How the shell waits for a program it started.
+*
+*  RUN_WAIT_MS bounds the SHELL's patience, not the program's life: a program
+*  that outlives it keeps running and keeps its output, the shell merely stops
+*  waiting and says so. Killing it instead would be the shell deciding that
+*  half a minute of work is too much, which is not its call to make; waiting
+*  forever would let one bad program on the disk take the machine away, which
+*  is worse than a prompt printed into somebody's output. */
+#define RUN_POLL_MS      10
+#define RUN_WAIT_MS      30000
 
 /* --- graphics ----------------------------------------------------------- */
 
@@ -469,8 +483,6 @@ void paging(char *cmd);
 void usermode(char *cmd);
 void processes(char *cmd);
 void execute(char *cmd);
-void listdir(char *cmd);
-void printfile(char *cmd);
 void diskfree(char *cmd);
 void graphics(char *cmd);
 void listpci(char *cmd);
@@ -505,10 +517,16 @@ static void exec_remember(int pid, addrspace_t space, const char *name);
 
 static void fs_print_right_text(const char *text, int width);
 static int  fs_drives_found(void);
-static int  fs_require_mount(const char *what);
-static void fs_list(const char *path);
-static void fs_cat(const char *path);
+static void fs_explain_unmounted(void);
 static void fs_df(void);
+
+static int  run_name_char(char c);
+static char run_upper(char c);
+static int  run_path(const char *word, char *path);
+static const char *run_arguments(char *cmd);
+static void run_wait(int pid, const char *name);
+static void run_program(const char *word, char *cmd);
+static void help_programs(void);
 
 static void gfx_statusbar_hold(void);
 static void gfx_statusbar_release(void);
@@ -606,8 +624,6 @@ void main()
 		else if(strcmp(word, "user") == 0) usermode(cmd);
 		else if(strcmp(word, "ps") == 0) processes(cmd);
 		else if(strcmp(word, "exec") == 0) execute(cmd);
-		else if(strcmp(word, "ls") == 0) listdir(cmd);
-		else if(strcmp(word, "cat") == 0) printfile(cmd);
 		else if(strcmp(word, "df") == 0) diskfree(cmd);
 		else if(strcmp(word, "gfx") == 0) graphics(cmd);
 		else if(strcmp(word, "lspci") == 0) listpci(cmd);
@@ -618,8 +634,12 @@ void main()
 		else if(strcmp(word, "help") == 0) help();
 		else if(strcmp(word, "start") == 0) taskmgr_task_start(taskmgr_add_task( task, "Test Task", TASK_PRIORITY_LOW ));
 		else if(strcmp(word, "exit") == 0) ; /* handled by the loop condition */
-		/* Only an empty input silently brings up a new prompt. */
-		else if(word[0] != EOS) printf("Unknown command: %s\n", word);
+		/* Only an empty input silently brings up a new prompt. Everything
+		   else is not necessarily a mistake: a word this list does not know
+		   may be the name of a program on the disk, and run_program() is
+		   what looks. "Unknown command" is what it says when there is no
+		   such program either. */
+		else if(word[0] != EOS) run_program(word, cmd);
 
 	} while(strcmp(cmd, "exit") != 0);
 
@@ -2565,7 +2585,17 @@ void execute(char *cmd)
 	printf("  Started. \"ps\" shows it for as long as it runs.\n");
 }
 
-/* --- ls, cat and df ------------------------------------------------------ */
+/* --- df ------------------------------------------------------------------
+*
+*  What is left of the filesystem in the kernel. Listing a directory and
+*  printing a file used to live here as "ls" and "cat"; they are ring 3
+*  programs now (/BIN/LS.ELF and /BIN/CAT.ELF), because SYS_READDIR, SYS_STAT
+*  and SYS_READ give a program everything those two ever did -- they were pure
+*  formatting on top of the same three questions.
+*
+*  "df" stays, and not out of sentiment: it reports the ATA drive table as
+*  well as the mount, and there is no system call for the drive half. Moving
+*  it would mean either inventing one or quietly dropping half the command. */
 
 /* Prints text right-aligned in a field of the given width -- the counterpart
 *  to ps_print_left(), and the same idea as mem_print_right() for numbers.
@@ -2608,24 +2638,26 @@ static int fs_drives_found(void)
 	return found;
 }
 
-/* Guard in front of every command that needs a filesystem, and the one place
-*  that says why there is none.
+/* Why there is no filesystem. The one place that knows, so that everything
+*  which runs into an unmounted volume gives the same account of the same
+*  machine -- the filesystem counterpart of net_explain_down().
 *
 *  Booting without a disk is a normal state here, not a failure -- "make run"
 *  does exactly that -- so the answer has to distinguish the two cases that
 *  lead to it. No drive at all is a different situation from a drive that
 *  holds nothing this kernel recognises, and only the second one has an error
-*  message worth printing. Returns 1 when the command may go ahead. */
-static int fs_require_mount(const char *what)
+*  message worth printing.
+*
+*  The caller prints the headline, because the two callers are asking
+*  different questions: "help" is listing what could be run, and the shell is
+*  explaining a word it could not place. Only the reasons underneath are the
+*  same, and only those are here. */
+static void fs_explain_unmounted(void)
 {
 	const char *why;
 	int drives;
 
-	if(fat_mounted()) return 1;
-
 	drives = fs_drives_found();
-
-	printf("%s: no filesystem is mounted.\n", what);
 
 	if(drives == 0)
 	{
@@ -2640,217 +2672,6 @@ static int fs_require_mount(const char *what)
 	}
 
 	printf("      \"df\" shows what the drivers did find.\n");
-	return 0;
-}
-
-/* "ls [path]": one row per directory entry, and a summary underneath.
-*
-*  fat_readdir() is index based rather than handing out a cursor, so the walk
-*  is a plain count upwards until it reports there are no more entries. That
-*  makes the loop trivial and stateless -- nothing has to be closed, and a
-*  half finished listing leaves nothing behind. The cost is that the driver
-*  re-walks the directory for every index, which for a shell listing a handful
-*  of entries is not worth a line of code to avoid. */
-static void fs_list(const char *path)
-{
-	fat_dirent ent;
-	uint32_t bytes;
-	int entries;
-	int files;
-	int dirs;
-	int index;
-	int rc;
-
-	printf("Directory of %s\n", path);
-
-	printf("  ");
-	ps_print_left("Name", LS_NAME_WIDTH);
-	fs_print_right_text("Size", LS_SIZE_WIDTH);
-	printf("  Type\n");
-
-	bytes = 0;
-	entries = 0;
-	files = 0;
-	dirs = 0;
-	rc = 0;
-
-	for(index = 0; index < LS_MAX_ENTRIES; index++)
-	{
-		rc = fat_readdir(path, index, &ent);
-
-		/* 1 means the directory is exhausted, which is the normal way out;
-		   anything negative is a real failure and is reported below. */
-		if(rc != 0) break;
-
-		printf("  ");
-		ps_print_left(ent.name, LS_NAME_WIDTH);
-
-		if(ent.is_dir)
-		{
-			/* A directory carries no size of its own in FAT, so the column
-			   shows a dash instead of a zero that would mean "empty". */
-			fs_print_right_text("-", LS_SIZE_WIDTH);
-			printf("  dir\n");
-			dirs++;
-		} else {
-			mem_print_right(ent.size, LS_SIZE_WIDTH);
-			printf("  file\n");
-			bytes += ent.size;
-			files++;
-		}
-
-		entries++;
-	}
-
-	if(rc < 0)
-	{
-		printf("  Reading the directory failed at entry %i: %s\n",
-		       index, fat_last_error());
-		return;
-	}
-
-	if(index == LS_MAX_ENTRIES)
-	{
-		printf("  ... stopped after %i entries.\n", LS_MAX_ENTRIES);
-	}
-
-	if(entries == 0)
-	{
-		printf("  (empty)\n");
-	}
-
-	printf("  %i entries (%i files, %i directories), ", entries, files, dirs);
-	printf("%u bytes\n", (int)bytes);
-}
-
-/* The buffer "cat" streams a file through. At file scope on purpose: the
-*  shell runs as a task with a stack of its own, and half a kilobyte of it is
-*  better spent on the call chain than on a copy of somebody's file. Only the
-*  shell task ever reaches this. */
-static char cat_buf[CAT_CHUNK];
-
-/* "cat <path>": the contents of a file, printed as text.
-*
-*  The file is never held in memory as a whole. fat_size() says how long it
-*  is, fat_read() takes an offset, and the loop below moves CAT_CHUNK bytes at
-*  a time -- so a megabyte file costs the same half kilobyte of memory as an
-*  empty one.
-*
-*  What the bytes are allowed to do to the screen is the other half of the
-*  job. putch() acts on the control characters it is given: 0x08 walks the
-*  cursor backwards, 0x09 jumps it to the next tab stop, 0x0D throws it back
-*  to the left margin. A binary file is full of such bytes, and printed
-*  verbatim it would overwrite whatever was on screen and leave the cursor
-*  somewhere arbitrary. So exactly three kinds of byte get through:
-*
-*    - printable ASCII, 0x20 to 0x7E, which is the range every VGA font agrees
-*      on and the only range where a byte means the same thing everywhere;
-*    - '\n', because line breaks are what makes a text file readable;
-*    - '\t', whose effect on the cursor is forwards and bounded.
-*
-*  '\r' is dropped rather than replaced: DOS text files end every line with
-*  CR LF, and turning the CR into a visible character would put a mark at the
-*  end of every single line of an ordinary file. The LF that follows does the
-*  work. Everything else -- other control codes, and everything from 0x7F up,
-*  where the meaning depends on a code page -- becomes CAT_REPLACEMENT, so a
-*  binary file shows its shape and its length without touching the cursor.
-*  The count of what was replaced is printed at the end, which is what tells
-*  a file that was not text from one that was. */
-static void fs_cat(const char *path)
-{
-	uint32_t size;
-	uint32_t offset;
-	uint32_t want;
-	uint32_t hidden;
-	unsigned char c;
-	int at_margin;
-	int got;
-	int i;
-
-	if(fat_size(path, &size) != 0)
-	{
-		printf("cat: %s: %s\n", path, fat_last_error());
-		return;
-	}
-
-	if(size == 0)
-	{
-		printf("cat: %s is empty (0 bytes).\n", path);
-		return;
-	}
-
-	offset = 0;
-	hidden = 0;
-
-	/* Whether the cursor sits at the start of a line, so the trailer below
-	   can begin on one of its own without inserting a blank line after a
-	   file that already ended with a newline. */
-	at_margin = 1;
-
-	while(offset < size)
-	{
-		want = size - offset;
-		if(want > (uint32_t)CAT_CHUNK) want = (uint32_t)CAT_CHUNK;
-
-		got = fat_read(path, offset, want, cat_buf);
-
-		if(got < 0)
-		{
-			if(!at_margin) printf("\n");
-			printf("cat: reading %s failed at offset %u: %s\n",
-			       path, (int)offset, fat_last_error());
-			return;
-		}
-
-		/* A short result means end of file -- the size in the directory
-		   entry and what the cluster chain actually holds need not agree on
-		   a damaged disk, and the chain is the one that decides. */
-		if(got == 0) break;
-		if((uint32_t)got > want) got = (int)want;
-
-		for(i = 0; i < got; i++)
-		{
-			c = (unsigned char)cat_buf[i];
-
-			if(c == '\n')
-			{
-				putch(c);
-				at_margin = 1;
-			}
-			else if(c == '\t')
-			{
-				putch(c);
-				at_margin = 0;
-			}
-			else if(c == '\r')
-			{
-				/* CR LF line ends: swallowed, the LF does the work. */
-				hidden++;
-			}
-			else if(c >= CAT_FIRST_PRINT && c <= CAT_LAST_PRINT)
-			{
-				putch(c);
-				at_margin = 0;
-			} else {
-				putch((unsigned char)CAT_REPLACEMENT);
-				at_margin = 0;
-				hidden++;
-			}
-		}
-
-		offset += (uint32_t)got;
-	}
-
-	if(!at_margin) printf("\n");
-
-	printf("[%s: %u of %u bytes shown", path, (int)offset, (int)size);
-
-	if(hidden != 0)
-	{
-		printf(", %u not printable", (int)hidden);
-	}
-
-	printf("]\n");
 }
 
 /* "df": the state of the mount and of the drives underneath it.
@@ -2946,53 +2767,6 @@ static void fs_df(void)
 	}
 }
 
-void listdir(char *cmd)
-{
-	char path[100];
-
-	if(prmc(cmd) == 0)
-	{
-		/* No argument means the root, which is what fat_readdir() reads for
-		   "/" as well as for the empty string. */
-		strcpy(path, "/");
-	} else {
-		/* prmv() hands back a pointer into one static buffer, so the path is
-		   copied out before anything else can call prmv() again. */
-		strcpy(path, prmv(1, cmd));
-	}
-
-	if(path[0] == '-')
-	{
-		printf("Syntax: ls [PATH]\n");
-		printf("\t          List the root directory\n");
-		printf("\tPATH      List that directory instead\n");
-		return;
-	}
-
-	if(!fs_require_mount("ls")) return;
-
-	fs_list(path);
-}
-
-void printfile(char *cmd)
-{
-	char path[100];
-
-	if(prmc(cmd) == 0)
-	{
-		printf("Syntax: cat PATH\n");
-		printf("\t          Print the file PATH as text\n");
-		printf("\t          \"ls\" lists what there is\n");
-		return;
-	}
-
-	strcpy(path, prmv(1, cmd));
-
-	if(!fs_require_mount("cat")) return;
-
-	fs_cat(path);
-}
-
 void diskfree(char *cmd)
 {
 	if(prmc(cmd) != 0)
@@ -3003,6 +2777,245 @@ void diskfree(char *cmd)
 	}
 
 	fs_df();
+}
+
+/* --- running a program off the disk ---------------------------------------
+*
+*  What happens to a word the dispatch above does not know. It used to be an
+*  error; it is now a lookup, and that single change is what lets a command
+*  leave the kernel at all -- "ls" works after the deletion above because
+*  /BIN/LS.ELF is found here, and it is typed exactly as it was before.
+*
+*  Three things had to be got right for that to be usable rather than merely
+*  present, and they are the three routines below: the name has to be turned
+*  into something a FAT volume can actually hold (run_path), the rest of the
+*  line has to reach the program intact (run_arguments), and the shell has to
+*  wait rather than print its prompt into somebody's output (run_wait). */
+
+/* Whether a character may stand in an 8.3 short name.
+*
+*  The set is FAT's, not this file's invention: letters, digits and the
+*  handful of punctuation marks DOS left alone. Everything else is excluded
+*  for a reason worth being precise about -- the space and the dot end a name
+*  field, '/' is the separator this shell builds the path with, and
+*  "*+,:;<=>?[\]| and the quote are reserved. A word containing any of them
+*  can never name a file here, so building a path out of it would only produce
+*  a nonsense string to fail on later. */
+static int run_name_char(char c)
+{
+	static const char allowed[] = "$%'-_@~`!(){}^#&";
+	int i;
+
+	if(c >= 'A' && c <= 'Z') return 1;
+	if(c >= 'a' && c <= 'z') return 1;
+	if(c >= '0' && c <= '9') return 1;
+
+	for(i = 0; allowed[i] != EOS; i++)
+	{
+		if(allowed[i] == c) return 1;
+	}
+
+	return 0;
+}
+
+/* ASCII case folding, which is all an 8.3 name needs -- everything outside
+*  a..z is already what it has to be. */
+static char run_upper(char c)
+{
+	if(c >= 'a' && c <= 'z') return (char)(c - 'a' + 'A');
+
+	return c;
+}
+
+/* The one place that turns a typed word into the path of a program.
+*
+*  Returns 1 and fills path (BIN_PATH_MAX bytes) when the word can name a file
+*  in BIN_DIR, and 0 when it cannot -- too long for the eight characters an
+*  8.3 name has, empty, or carrying a character run_name_char() refuses. A
+*  refusal is not an error to report: nothing on this volume can be called
+*  that, so the answer to "is there a program of that name" is simply no.
+*
+*  Note what is NOT accepted: a name with an extension. "cat" becomes
+*  /BIN/CAT.ELF, and "cat.elf" is rejected rather than becoming
+*  /BIN/CAT.ELF.ELF -- the extension belongs to the mechanism, not to the
+*  command. */
+static int run_path(const char *word, char *path)
+{
+	int len;
+	int at;
+	int i;
+
+	len = (int)strlen(word);
+	if(len < 1 || len > BIN_NAME_MAX) return 0;
+
+	for(i = 0; i < len; i++)
+	{
+		if(!run_name_char(word[i])) return 0;
+	}
+
+	strcpy(path, BIN_DIR);
+	at = (int)strlen(path);
+
+	for(i = 0; i < len; i++)
+	{
+		path[at + i] = run_upper(word[i]);
+	}
+
+	strcpy(path + at + len, BIN_EXT);
+
+	return 1;
+}
+
+/* Everything after the command word, as one string, or 0 when there is
+*  nothing.
+*
+*  This deliberately does not go through prmv(). prmv() hands back one word at
+*  a time out of a single static buffer -- the trap this file works around
+*  everywhere else by copying the result out immediately -- so assembling a
+*  line from it would mean copying every word into a second buffer only to put
+*  the blanks back in. The line is already sitting in the caller's own buffer
+*  in exactly the form the program wants, so a pointer into it is both cheaper
+*  and more faithful: exec_spawn_path() does the splitting, and it splits what
+*  was actually typed rather than a reconstruction of it.
+*
+*  cmd is the shell's own array and outlives the spawn, so the pointer stays
+*  valid for as long as the loader needs it. */
+static const char *run_arguments(char *cmd)
+{
+	int i;
+
+	i = 0;
+	while(cmd[i] != EOS && cmd[i] != ' ') i++;   /* over the command word    */
+	while(cmd[i] == ' ') i++;                    /* and the blanks after it  */
+
+	if(cmd[i] == EOS) return 0;
+
+	return cmd + i;
+}
+
+/* Waits for a program to finish, so the prompt comes back after its output
+*  instead of into the middle of it.
+*
+*  The wait is a poll with sleep() rather than a spin: exec_spawn_path()
+*  returns as soon as the task exists, the program runs as a task of its own,
+*  and the only way it gets a processor is if this one gives it up. A busy
+*  loop here would work -- the timer preempts -- but would burn every slice
+*  the scheduler hands the shell on asking the same question again.
+*
+*  A program that never ends is the case worth deciding rather than
+*  discovering. The shell stops waiting after RUN_WAIT_MS and says so; the
+*  program is left running and can be looked at with "ps" and stopped with
+*  "taskmgr -k". Two things it deliberately does not do: it does not wait
+*  forever, because then one bad file on the disk takes the machine away for
+*  good, and it does not kill the program, because a shell that decides half
+*  a minute of work is too much is worse than a prompt in the wrong place.
+*  There is no key to interrupt with either, and that is the same kind of
+*  choice: getch() and SYS_GETCH share one single key slot in kb.c, so a shell
+*  polling the keyboard while a program runs would take every keystroke away
+*  from the program it is waiting for. */
+static void run_wait(int pid, const char *name)
+{
+	int start;
+	int state;
+	int elapsed;
+
+	/* The deadline is read off the clock rather than added up from the sleeps
+	   below, and the difference is not academic. sleep() rounds up to whole
+	   timer ticks and, more importantly, returns only once this task is
+	   scheduled again -- with a program and the status bar competing for the
+	   processor, three thousand sleeps of ten milliseconds take a good deal
+	   more than the thirty seconds they nominally add up to. Counting them
+	   would make RUN_WAIT_MS mean whatever the load happens to be. */
+	start = timer_get_ticks();
+
+	for(;;)
+	{
+		state = taskmgr_task_state(pid);
+
+		/* ABORTED is where a task that called exit() ends up -- sys_exit()
+		   goes through taskmgr_task_abort(), so a clean return and a fault
+		   look the same from here, and to a caller that only has to stop
+		   waiting they are the same. NULL is a slot that names no task at
+		   all. Everything else means it is still there. */
+		if(state == TASK_STATE_ABORTED || state == TASK_STATE_NULL) return;
+
+		elapsed = timer_get_ticks() - start;
+		if(elapsed >= RUN_WAIT_MS || elapsed < 0) break;
+
+		sleep(RUN_POLL_MS);
+	}
+
+	printf("\n[%s is still running as pid %i after %i seconds. The prompt is\n",
+	       name, pid, RUN_WAIT_MS / 1000);
+	printf(" back and its output will land in it -- \"taskmgr -k %i\" stops it.]\n",
+	       pid);
+}
+
+/* A word the built-in list did not know: look for a program of that name in
+*  BIN_DIR and run it, and only say "Unknown command" when there is none.
+*
+*  The file is looked up with fat_size() before exec_spawn_path() is asked to
+*  load it, and that is not a redundant walk of the directory. It separates
+*  the two answers the user needs to be able to tell apart: a name that is on
+*  no disk is a typo and deserves "Unknown command", while a name that IS
+*  there and will not load is a broken program and deserves the loader's own
+*  reason for refusing it. Without the lookup both come back as one failed
+*  spawn. */
+static void run_program(const char *word, char *cmd)
+{
+	char path[BIN_PATH_MAX];
+	const char *args;
+	uint32_t size;
+	int pid;
+
+	if(!run_path(word, path))
+	{
+		/* No file on this volume can carry that name, so there was never
+		   anywhere to look. */
+		printf("Unknown command: %s\n", word);
+		printf("      No file in %s can be called that. \"help\" lists them.\n",
+		       BIN_DIR);
+		return;
+	}
+
+	if(!fat_mounted())
+	{
+		printf("Unknown command: %s\n", word);
+		printf("      Not built in, and nothing is mounted -- no %s to look\n",
+		       BIN_DIR);
+		printf("      a program up in.\n");
+		fs_explain_unmounted();
+		return;
+	}
+
+	if(fat_size(path, &size) != 0)
+	{
+		printf("Unknown command: %s\n", word);
+		printf("      Not built in, and there is no %s. \"help\" lists both.\n",
+		       path);
+		return;
+	}
+
+	args = run_arguments(cmd);
+
+	/* Everything the loader can refuse -- a text file with the right name, a
+	   truncated ELF, a 64-bit binary, no free frame -- comes back here as one
+	   negative return with the reason in exec_last_error(). */
+	pid = exec_spawn_path(path, args, TASK_PRIORITY_NORMAL);
+	if(pid < 0)
+	{
+		printf("%s: %s could not be loaded: %s\n", word, path,
+		       exec_last_error());
+		return;
+	}
+
+	/* The task comes back suspended, which is what let "exec" print the
+	   address space before anything ran. Nothing needs printing here: the
+	   program's own output is the answer to the command, and a shell that
+	   announces every start would bury it. */
+	taskmgr_task_start(pid);
+
+	run_wait(pid, word);
 }
 
 /* --- gfx ----------------------------------------------------------------
@@ -4595,10 +4608,99 @@ void pinghost(char *cmd)
 	net_ping(dst);
 }
 
+/* The other half of what can be typed: the programs in BIN_DIR.
+*
+*  Read off the disk rather than written out here, and that is worth the
+*  twenty lines it costs. A hardcoded list would be a promise this file cannot
+*  keep -- the programs are separate binaries now, added by dropping a name
+*  into the Makefile, and the day somebody does that the kernel would have to
+*  be edited too or "help" would start lying. Worse, it would go on listing
+*  "ls" on a machine that booted without a disk, which is precisely the
+*  situation where the difference between a built-in command and a program
+*  becomes visible and the user needs to be told about it.
+*
+*  So the listing is the directory, and when there is no directory it says so
+*  and why. The names lose their extension because that is how they are
+*  typed -- run_path() puts it back. */
+static void help_programs(void)
+{
+	fat_dirent ent;
+	char name[FAT_NAME_MAX];
+	int index;
+	int shown;
+	int len;
+	int ext;
+	int i;
+	int rc;
+
+	printf("Programs in %s, typed by name without the extension:\n", BIN_DIR);
+
+	if(!fat_mounted())
+	{
+		printf("\tNone are reachable -- no filesystem is mounted.\n");
+		fs_explain_unmounted();
+		return;
+	}
+
+	shown = 0;
+	rc = 0;
+	ext = (int)strlen(BIN_EXT);
+
+	for(index = 0; index < BIN_MAX_ENTRIES; index++)
+	{
+		rc = fat_readdir(BIN_DIR, index, &ent);
+
+		/* 1 means the directory is exhausted, the normal way out. Anything
+		   negative -- including "no such directory" on a volume that has no
+		   /BIN at all -- ends the walk and is explained below. */
+		if(rc != 0) break;
+
+		if(ent.is_dir) continue;
+
+		/* Only the files this mechanism can actually start. A README in
+		   there is not a command and must not be listed as one. */
+		len = (int)strlen(ent.name);
+		if(len <= ext) continue;
+		if(strcmp(ent.name + (len - ext), BIN_EXT) != 0) continue;
+
+		/* The name as it is typed: extension off, lower case back on. */
+		len = len - ext;
+		if(len > (int)sizeof(name) - 1) len = (int)sizeof(name) - 1;
+		for(i = 0; i < len; i++)
+		{
+			name[i] = (ent.name[i] >= 'A' && ent.name[i] <= 'Z')
+			          ? (char)(ent.name[i] - 'A' + 'a') : ent.name[i];
+		}
+		name[len] = EOS;
+
+		if((shown % BIN_PER_LINE) == 0) printf("\t");
+		ps_print_left(name, BIN_NAME_WIDTH);
+		shown++;
+		if((shown % BIN_PER_LINE) == 0) printf("\n");
+	}
+
+	if((shown % BIN_PER_LINE) != 0) printf("\n");
+
+	if(shown == 0)
+	{
+		printf("\tNone -- %s holds no %s file.\n", BIN_DIR, BIN_EXT);
+		if(rc < 0) printf("\t%s\n", fat_last_error());
+		return;
+	}
+
+	printf("  %i program(s), run with their arguments as typed.\n", shown);
+}
+
 void help(void)
 {
 	printf("TomatOS Help\n");
-	printf("Available commands:\n");
+
+	/* Two lists, because there are now two kinds of command and the
+	   difference matters exactly once: when the disk is missing. Typing them
+	   feels identical, but only the first list is in the kernel and works
+	   with no volume mounted -- so they are not run together into one
+	   "available commands" that would be wrong half the time. */
+	printf("Built into the kernel, always available:\n");
 	printf("\thelp      Show this overview\n");
 	printf("\ttaskmgr   List and control tasks\n");
 	printf("\tstart     Start a test task\n");
@@ -4608,8 +4710,6 @@ void help(void)
 	printf("\t          user -i tests the address space isolation\n");
 	printf("\tps        List the loaded modules and the running tasks\n");
 	printf("\texec      exec NAME runs the module NAME as a ring 3 task\n");
-	printf("\tls        ls [PATH] lists a directory, the root without PATH\n");
-	printf("\tcat       cat PATH prints a file as text\n");
 	printf("\tdf        Show the mounted filesystem and the drives found\n");
 	printf("\tgfx       Draw the graphics demo, gfx -t tests mode 13h,\n");
 	printf("\t          gfx -i shows the mode the machine booted into\n");
@@ -4620,4 +4720,7 @@ void help(void)
 	printf("\tping      ping IP sends echo requests and times the replies\n");
 	printf("\treboot    Restart the computer\n");
 	printf("\texit      Exit the shell\n");
+
+	printf("\n");
+	help_programs();
 }

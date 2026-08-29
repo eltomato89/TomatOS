@@ -17,19 +17,68 @@
 #include "system.h"
 
 #define SYSCALL_VECTOR   0x80
-#define SYSCALL_MAX      8       /* table size, keep in step with the list */
+#define SYSCALL_MAX      16      /* table size, keep in step with the list */
 
-/* Call numbers. Keep them stable, user code encodes them literally. */
+/* Call numbers. Keep them stable, user code encodes them literally.
+*
+*  Arguments live in ebx, ecx, edx, esi, edi in that order -- the first three
+*  are the original convention, esi and edi were added for SYS_READ, which
+*  genuinely needs four. */
 #define SYS_EXIT         0       /* exit(status)            -- does not return */
 #define SYS_WRITE        1       /* write(text)             -- prints a string */
 #define SYS_GETPID       2       /* getpid()                                   */
 #define SYS_SLEEP        3       /* sleep(ms)                                  */
 #define SYS_PUTCH        4       /* putch(c)                                   */
 #define SYS_UPTIME       5       /* uptime()   -- milliseconds since boot      */
+#define SYS_GETCH        6       /* getch()    -- one key, blocks              */
+#define SYS_PEEKCH       7       /* peekch()   -- one key or 0, never blocks   */
+#define SYS_CLS          8       /* cls()                                      */
+#define SYS_SETCOLOR     9       /* setcolor(foreground, background)           */
+#define SYS_FSINFO      10       /* fsinfo(sys_fsinfo *out)                    */
+#define SYS_STAT        11       /* stat(path, uint32_t *size)                 */
+#define SYS_READ        12       /* read(path, offset, len, buf) -> bytes read */
+#define SYS_READDIR     13       /* readdir(path, index, sys_dirent *out)      */
+#define SYS_SPAWN       14       /* spawn(path, args, prio) -> pid             */
 
 /* Error returns. Negative so a valid result stays distinguishable. */
 #define SYS_ENOSYS       (-1)    /* no such call number                        */
 #define SYS_EFAULT       (-2)    /* argument pointer outside the caller's reach */
+#define SYS_ENOENT       (-3)    /* no such file, or nothing is mounted        */
+#define SYS_EIO          (-4)    /* the driver below refused                   */
+#define SYS_EINVAL       (-5)    /* an argument makes no sense                 */
+#define SYS_ENOMEM       (-6)    /* out of memory, or no task slot left        */
+
+/* ---------------------------------------------------------------------------
+*  Structures crossing the gate
+*
+*  These are ABI, not internal types: a program on disk may have been compiled
+*  against an older kernel, so the layout is fixed deliberately rather than
+*  left to the compiler. Every field is a fixed width, char arrays are sized
+*  so that no padding is inserted, and nothing is ever appended in the middle.
+*  The same declarations exist in user/syscall.h and have to move in step --
+*  see the note at the top of that file for why they are copies and not a
+*  shared include. */
+
+#define SYS_NAME_MAX     16      /* 8.3 plus dot plus terminator, rounded up  */
+
+#define SYS_DIRENT_DIR   0x01    /* the entry is a directory                  */
+
+typedef struct
+{
+	char     name[SYS_NAME_MAX];
+	uint32_t size;               /* bytes; 0 for a directory                 */
+	uint32_t flags;              /* SYS_DIRENT_DIR                           */
+} sys_dirent;
+
+typedef struct
+{
+	char     type[8];            /* "FAT12" / "FAT16", empty if not mounted  */
+	char     label[12];          /* volume label, may be empty               */
+	uint32_t total_bytes;
+	uint32_t free_bytes;
+	uint32_t cluster_bytes;
+	int32_t  drive;              /* ATA drive it sits on, -1 if none         */
+} sys_fsinfo;
 
 /* Installs the IDT gate for 0x80 with DPL 3. Call after idt_install(). */
 extern void syscall_install(void);

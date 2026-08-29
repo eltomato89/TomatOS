@@ -169,6 +169,18 @@ extern addrspace_t taskmgr_task_space(int pid);
 *  already have run), or entry is 0. */
 extern int taskmgr_task_set_entry(int pid, uint32_t entry);
 
+/* Moves a suspended ring 3 task's initial user stack pointer. Needed when the
+*  loader has to put something -- an argument vector -- into the stack page
+*  before the program starts, so that esp begins below it. Same conditions as
+*  taskmgr_task_set_entry(). Returns 0, or -1 if the slot is not in a state
+*  where writing its saved frame is safe. */
+extern int taskmgr_task_set_stack(int pid, uint32_t user_esp);
+
+/* The state of a slot: one of the TASK_STATE_* values, and TASK_STATE_NULL for
+*  a pid that names none. For a caller that has to wait for a task to finish
+*  rather than merely start it -- the shell running a program off the disk. */
+extern int taskmgr_task_state(int pid);
+
 extern int taskmgr_get_currpid();
 extern void taskmgr_task_abort(int pid, int error_number, const char *error_descr);
 extern void taskmgr_task_start(int pid);

@@ -33,10 +33,49 @@
 #define SYS_SLEEP    3       /* sleep(ms)                                   */
 #define SYS_PUTCH    4       /* putch(c)       -- one character             */
 #define SYS_UPTIME   5       /* uptime()       -- milliseconds since boot   */
+#define SYS_GETCH    6       /* getch()        -- one key, blocks           */
+#define SYS_PEEKCH   7       /* peekch()       -- one key or 0, never blocks */
+#define SYS_CLS      8       /* cls()                                       */
+#define SYS_SETCOLOR 9       /* setcolor(foreground, background)            */
+#define SYS_FSINFO  10       /* fsinfo(sys_fsinfo *out)                     */
+#define SYS_STAT    11       /* stat(path, unsigned long *size)             */
+#define SYS_READ    12       /* read(path, offset, len, buf) -> bytes read  */
+#define SYS_READDIR 13       /* readdir(path, index, sys_dirent *out)       */
+#define SYS_SPAWN   14       /* spawn(path, args, prio) -> pid              */
 
 /* --- Error returns -- mirror of src/include/syscall.h ------------------- */
 #define SYS_ENOSYS   (-1)    /* no such call number                         */
 #define SYS_EFAULT   (-2)    /* argument pointer outside the caller's reach */
+#define SYS_ENOENT   (-3)    /* no such file, or nothing is mounted         */
+#define SYS_EIO      (-4)    /* the driver below refused                    */
+#define SYS_EINVAL   (-5)    /* an argument makes no sense                  */
+#define SYS_ENOMEM   (-6)    /* out of memory, or no task slot left         */
+
+/* --- Structures crossing the gate -- mirror of src/include/syscall.h ----
+*
+*  Fixed layout on purpose: this program may be read from disk by a kernel
+*  newer than the compiler that built it. Field widths are spelled out rather
+*  than left to <stdint.h>, which does not exist here.
+*/
+#define SYS_NAME_MAX 16      /* 8.3 plus dot plus terminator, rounded up    */
+#define SYS_DIRENT_DIR 0x01  /* the entry is a directory                    */
+
+typedef struct
+{
+	char          name[SYS_NAME_MAX];
+	unsigned long size;              /* bytes; 0 for a directory            */
+	unsigned long flags;             /* SYS_DIRENT_DIR                      */
+} sys_dirent;
+
+typedef struct
+{
+	char          type[8];           /* "FAT12" / "FAT16", empty if unmounted */
+	char          label[12];         /* volume label, may be empty          */
+	unsigned long total_bytes;
+	unsigned long free_bytes;
+	unsigned long cluster_bytes;
+	long          drive;             /* ATA drive it sits on, -1 if none    */
+} sys_fsinfo;
 
 
 /* ------------------------------------------------------------------ */
@@ -96,6 +135,20 @@ static __inline__ int syscall3(int num, int arg1, int arg2, int arg3)
 	return ret;
 }
 
+/* Four arguments. esi joins the set for SYS_READ, whose (path, offset, len,
+*  buffer) genuinely does not fit in three -- splitting it into an open/read
+*  pair would have meant a file descriptor table in the kernel, which for a
+*  read only filesystem buys nothing but state to get wrong. */
+static __inline__ int syscall4(int num, int arg1, int arg2, int arg3, int arg4)
+{
+	int ret;
+	__asm__ __volatile__("int $0x80"
+	                     : "=a"(ret)
+	                     : "a"(num), "b"(arg1), "c"(arg2), "d"(arg3), "S"(arg4)
+	                     : "memory");
+	return ret;
+}
+
 
 /* ------------------------------------------------------------------ */
 /* The calls                                                           */
@@ -142,6 +195,73 @@ static __inline__ int sys_putch(int c)
 static __inline__ int sys_uptime(void)
 {
 	return syscall0(SYS_UPTIME);
+}
+
+/* Waits for a key and returns it. Blocks: the task is descheduled while the
+*  keyboard is idle, it does not spin. */
+static __inline__ int sys_getch(void)
+{
+	return syscall0(SYS_GETCH);
+}
+
+/* The same, but returns 0 straight away when nothing was typed. For a program
+*  that has to keep doing something while it watches the keyboard. */
+static __inline__ int sys_peekch(void)
+{
+	return syscall0(SYS_PEEKCH);
+}
+
+/* Clears the screen and puts the cursor in the top left corner. */
+static __inline__ int sys_cls(void)
+{
+	return syscall0(SYS_CLS);
+}
+
+/* Sets the colour of everything printed from here on. */
+static __inline__ int sys_setcolor(int foreground, int background)
+{
+	return syscall2(SYS_SETCOLOR, foreground, background);
+}
+
+/* Fills in what is mounted. Returns 0, or SYS_ENOENT if nothing is. Named
+*  after the call it makes rather than after the struct it fills, so that the
+*  struct can keep the obvious name. */
+static __inline__ int sys_statfs(sys_fsinfo *out)
+{
+	return syscall1(SYS_FSINFO, (int)out);
+}
+
+/* Size of a file in bytes. Returns 0 on success, SYS_ENOENT if there is no
+*  such file. */
+static __inline__ int sys_stat(const char *path, unsigned long *size)
+{
+	return syscall2(SYS_STAT, (int)path, (int)size);
+}
+
+/* Reads up to len bytes from offset. Returns how many were actually read,
+*  which is short at the end of the file and 0 past it. There is no file
+*  descriptor and no file position: every call names the file and says where
+*  to start, so nothing has to be opened, closed or leaked. */
+static __inline__ int sys_read(const char *path, unsigned long offset,
+                               unsigned long len, void *buf)
+{
+	return syscall4(SYS_READ, (int)path, (int)offset, (int)len, (int)buf);
+}
+
+/* Entry number "index" of a directory, counting from 0. Returns 0 on
+*  success and SYS_ENOENT once the directory is exhausted -- which is how a
+*  caller knows to stop. */
+static __inline__ int sys_readdir(const char *path, int index, sys_dirent *out)
+{
+	return syscall3(SYS_READDIR, (int)path, index, (int)out);
+}
+
+/* Loads a program from disk and starts it as a task of its own. args is the
+*  command line it will find in argv, or 0 for none. Returns the new pid, or
+*  a negative error. It does NOT wait for the program to finish. */
+static __inline__ int sys_spawn(const char *path, const char *args, int prio)
+{
+	return syscall3(SYS_SPAWN, (int)path, (int)args, prio);
 }
 
 #endif

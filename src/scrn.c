@@ -354,7 +354,12 @@ int printf(char * string, ...)
             i++;
             break;
           case 'c':
-            putch(va_arg(argptr, char));
+            /* int, not char: everything smaller than an int is promoted to
+            *  one on its way into a "..." argument list, so there is no char
+            *  on the stack to fetch. The old DJGPP stdarg.h rounded every
+            *  size up to sizeof(int) and hid this; the compiler's own
+            *  builtins do not, and are right to say so. */
+            putch((char)va_arg(argptr, int));
             i++;
             break;
           case 'p':

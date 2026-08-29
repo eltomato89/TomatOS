@@ -1,16 +1,28 @@
 /* TomatOS - Loading programs
-*  Desc: Turns a bootloader module into a running ring 3 task.
+*  Desc: Turns a bootloader module or a file on disk into a running ring 3
+*        task.
 *
-*  There is no filesystem yet, so programs arrive as multiboot modules: GRUB
-*  loads them alongside the kernel, one per "module" line in grub.cfg, and
-*  hands over their physical addresses in the info structure. The kernel
-*  records them at boot and can later load one into a fresh address space.
+*  A program reaches the loader from one of two places. GRUB can load it
+*  alongside the kernel, one per "module" line in grub.cfg, and hand over its
+*  physical address in the info structure - that is what exec_init() records
+*  at boot and what exec_spawn() runs. Or it simply lies on the mounted
+*  volume, in which case exec_spawn_path() reads it off the disk. Both end in
+*  the same loader; only the source of the bytes differs.
 *
 *  Loading means: parse the ELF32 headers, allocate a frame per page each
 *  PT_LOAD segment needs, copy the file contents in, zero the part that is
 *  .bss (p_memsz beyond p_filesz), and map it into the task's own address
 *  space with PAGE_USER. Nothing is shared with the kernel or with another
 *  program except the kernel quarter every space carries anyway.
+*
+*  On top of that the task gets its argument vector, built on its own user
+*  stack rather than in kernel memory, in the layout a plain
+*
+*      void _start(int argc, char **argv)
+*
+*  finds at [esp+4] and [esp+8]. Every program is entered that way, whether
+*  it was given arguments or not: without any, argc is 1 and argv[0] is the
+*  program's name.
 */
 #ifndef __EXEC_H
 #define __EXEC_H
@@ -46,7 +58,29 @@ extern int exec_module_find(const char *name);
 *  from taskmgr_add_user_task(). */
 extern int exec_spawn(int index, int prio);
 
-/* Why the last exec_spawn() failed, for the shell to print. */
+/* Loads the ELF file at path from the mounted volume as a new ring 3 task
+*  and returns its pid, or a negative value on failure, with the reason in
+*  exec_last_error().
+*
+*  Nothing about the file is trusted: it is a file on a disk, not a module the
+*  bootloader vouched for, so it may be a text file, a truncated download or a
+*  64-bit binary. Everything is checked before a single frame is allocated,
+*  and a rejected file leaves neither a task nor an address space behind.
+*
+*  args is the rest of the command line as one string, or 0 when there is
+*  none. It is split into words here - blanks and tabs separate, runs of them
+*  count once, there is no quoting - and handed to the program as argv[1] and
+*  up. argv[0] is always the last component of path. Arguments that would not
+*  leave the program enough stack to run in are refused rather than
+*  truncated, and the spawn fails.
+*
+*  Like exec_spawn(), the task comes back SUSPENDED. It runs when the caller
+*  passes its pid to taskmgr_task_start(), which is what leaves room to look
+*  at the task, or to take it back down, before it has executed anything. */
+extern int exec_spawn_path(const char *path, const char *args, int prio);
+
+/* Why the last exec_spawn() or exec_spawn_path() failed, for the shell to
+*  print. */
 extern const char *exec_last_error(void);
 
 #endif

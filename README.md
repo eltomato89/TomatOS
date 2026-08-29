@@ -165,23 +165,43 @@ QEMU's `-kernel`.
 
 ### Programs
 
-There is no filesystem yet, so programs arrive as **multiboot modules**: the
-bootloader loads them next to the kernel, and the kernel records them at
-boot. `ps` lists them, `exec <name>` loads one into a fresh address space
-and runs it. Starting the same program twice gives two independent
-instances, each with its own directory and its own copy of the data.
+**Typing a command that is not built into the shell runs a program off the
+disk.** `ls` is `/BIN/LS.ELF`, an ordinary ring 3 ELF in an address space of
+its own — the shell spawns it, waits for it, and prints the prompt afterwards.
+That is the mechanism the kernel/userland split rests on: moving a command out
+of the kernel means writing it as a program and adding its name to
+`USER_PROGS`, nothing else. `help` lists both categories and reads the second
+one off `/BIN` rather than from a hardcoded list, so it cannot drift.
 
-Programs are ordinary static ELF32 executables built separately from the
-kernel — see `user/`. They link against nothing but `user/syscall.h`, which
-is the entire libc a TomatOS program gets: inline `int 0x80` wrappers. Entry
-point is `_start`, there is no C runtime and nothing to return to, so a
-program ends by calling `SYS_EXIT`.
+Programs also arrive as **multiboot modules**, which is how they work with no
+disk attached: the bootloader loads them next to the kernel, `ps` lists them
+and `exec <name>` runs one.
 
 ```sh
-make user      # builds build/hello.elf
-make run       # QEMU passes it via -initrd
-make run-iso   # GRUB passes it via a module line
+make user      # builds build/hello.elf, build/ls.elf, build/cat.elf
+make run       # QEMU passes them via -initrd, and attaches the disk image
+make run-iso   # GRUB passes them via module lines
 ```
+
+A program is a static ELF32 built separately from the kernel — see `user/`.
+It links against `user/syscall.h` (the raw `int 0x80` wrappers) and
+`user/lib.c`, a small C library holding `_start`, `printf`, the string
+routines and the file helpers. `_start` calls `main(argc, argv)` and hands its
+return value to `SYS_EXIT`, so a utility is just a `main()`.
+
+Two things about that library are worth knowing. Its `printf` **has field
+widths**; the kernel's does not, which is why the kernel's shell pads columns
+by hand. And an unsupported conversion makes it stop rather than continue —
+the kernel's `printf` skips one silently, and because the skipped argument is
+never fetched, *every later* `va_arg` reads from the wrong place. That is why
+`printf("%02x", v)` prints the literal text `02x` inside the kernel.
+
+Arguments live **on the user stack**, not in kernel memory. The loader writes
+the strings, the `argv` array, `argc` and a fake return address into the top of
+the program's stack page and points `esp` below them, which is exactly the
+frame a cdecl `_start(int argc, char **argv)` expects. A per-task argument
+buffer in the kernel would have been 64 tasks' worth of `.bss` in a kernel
+being actively shrunk.
 
 The loader walks the `PT_LOAD` program headers page by page rather than
 segment by segment, because segments are not page aligned: the tail of one
@@ -353,6 +373,72 @@ neither belongs in the same change as the first packet that works.
 
 Deliberately absent: DHCP, TCP, and any form of fragment reassembly.
 
+### What is in the kernel, and what is not
+
+A standing question in this project: what actually gets compiled into the
+kernel, and what could live outside it. Two things make the question
+answerable rather than rhetorical — there is a filesystem to put programs on,
+and there are system calls for them to work through.
+
+The `.bss` went from **341 KB to 67 KB**, and almost all of that was one array:
+
+**Kernel stacks are allocated per task.** `task_kernel_stacks[64][4096]` was
+256 KB reserved from boot on a machine that runs five tasks. A stack now comes
+from the frame allocator when a task is created. Two properties decide whether
+that works. It has to be page aligned, because the saved `struct regs` is
+carved out of the top and read as 32-bit words — which rules `malloc` out, and
+would in any case put a neighbouring heap header directly under the stack, the
+one thing an overflow must not reach quietly. And it has to be visible in
+**every** address space, because an interrupt can arrive while any task is
+running: that is a page-table question, not an address one. `vmm_init()` maps
+all usable RAM before any space exists and `vmm_create_space()` copies
+directory *entries*, so every space walks into the same kernel page tables and
+a stack allocation can never need a new one.
+
+Freeing is the part that bites. `taskmgr_task_abort()` runs **on the stack of
+the task it is aborting**, and the task keeps running until the next tick
+elects somebody else — so nothing is freed there. The only real release is
+slot recycling, and a stack that is still live is parked rather than freed, the
+same answer `task_space_release()` already gives for an address space still
+loaded in CR3.
+
+Allocating separately also made a **guard page** possible, which a static array
+could not have: the page below each stack is unmapped, so a kernel stack
+overflow faults instead of silently eating the next task's saved registers. On
+x86-32 a ring 0 fault does not switch stacks, so the machine triple-faults and
+resets — still far better than corrupting a page table and continuing.
+
+**`ls` and `cat` are programs now**, `/BIN/LS.ELF` and `/BIN/CAT.ELF`. They
+were pure filesystem formatting, and `SYS_READDIR`, `SYS_STAT` and `SYS_READ`
+do everything they need. The immediate saving is small — what left is largely
+balanced by the machinery that arrived — but that machinery is a one-off, and
+the next command to leave subtracts cleanly.
+
+**What deliberately stays.** Most of the shell cannot move and should not:
+`page` walks page tables, `mem` drives the allocators, `user` is a ring 3
+self-test wearing a command's clothes, and `gfx`, `lspci` and the network
+commands reach hardware with no system call behind it. A command that needs
+kernel internals belongs in the kernel; moving it would mean inventing a
+system call that exports those internals, which is worse than the problem.
+`df` stays for a smaller reason: it reports the ATA drive table as well as the
+filesystem, and only the filesystem half has a call.
+
+Smaller items in the same pass:
+
+- The framebuffer console's shadow buffer was dimensioned for 1280×1024, a
+  mode **this bootloader cannot produce** — `vbe_res_table` in `boot/vbe.inc`
+  tops out at 1024×768. The constants derive from that now: 8 KB less, and 20
+  percent off every scroll, which moved whole rows of the old width.
+- `start.asm` had 4088 bytes of pure alignment padding between the boot stack
+  and the page directory. Same footprint, stack half again as large.
+- The DJGPP `stdarg.h` and the 30 unused headers under `src/include/sys/` are
+  gone, replaced by seven lines over GCC's own builtins. That immediately
+  exposed a bug the old macros hid: `va_arg(argptr, char)` in the kernel's
+  `printf`. Nothing smaller than an `int` survives the trip through `...`, so
+  there was no `char` on the stack to fetch — the old header rounded every size
+  up to `sizeof(int)` and made it look correct.
+- `src/math.c` was dead, and its `pow()` was wrong: `pow(2,3)` returned 4.
+
 ## On real hardware
 
 `make iso` produces an image that boots via **legacy BIOS/CSM**. It goes onto
@@ -380,7 +466,8 @@ Since the kernel is linked as ELF, GDB has all symbols available.
 
 ```
 src/            kernel sources
-src/include/    own headers (src/include/sys/ is an unused DJGPP leftover)
+src/include/    own headers
+user/           ring 3 programs and their C library, built separately
 linker.ld       linker script, loads at 1 MiB
 bin/            the original GRUB Legacy floppy image (template, never modified)
 legacy/         the 2011 Windows toolchain (DJGPP, VFD) and its batch files

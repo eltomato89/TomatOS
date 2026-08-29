@@ -30,10 +30,24 @@
 #include "typedefs.h"
 
 /* Upper bounds for the shadow buffer, which is statically allocated. A
-*  larger mode is clipped to this rather than refused. 160x64 covers
-*  1280x1024 with an 8x16 cell and costs 10 KiB of .bss. */
-#define FBCON_MAX_COLS   160
-#define FBCON_MAX_ROWS    64
+*  larger mode is clipped to this rather than refused.
+*
+*  The numbers are not a guess at "big enough": they are the highest mode the
+*  bootloader can actually establish, divided by the cell size. vbe_res_table
+*  in boot/vbe.inc lists 1024x768, 800x600 and 640x480 and nothing above, and
+*  the cell is 8x16 -- so 1024/8 by 768/16. Multiboot cannot raise that
+*  either, because start.asm deliberately does not set the VIDEO_MODE flag,
+*  which means a framebuffer only ever comes from our own stage 2.
+*
+*  They were 160x64 before, sized for a 1280x1024 nothing can produce. That
+*  cost 8 KiB of .bss for cells no mode reaches, and 20 percent of every
+*  scroll, since fbcon_scroll() moves whole rows of MAX_COLS.
+*
+*  Keeping the coupling in mind matters: adding a row to vbe_res_table means
+*  raising these two, otherwise the console silently uses the top left corner
+*  of the new mode instead of all of it. */
+#define FBCON_MAX_COLS   (1024 / 8)
+#define FBCON_MAX_ROWS   (768 / 16)
 
 /* Records what the bootloader handed over, before anything can be mapped.
 *  Safe to call with no framebuffer; fbcon_active() then stays false and

@@ -5,18 +5,20 @@
 *  page -- code that was compiled and linked as part of the kernel and just
 *  happened to execute with CPL 3. This is the real thing: an ELF32
 *  executable built on its own, with its own linker script and its own load
-*  address, that the bootloader hands to the kernel as a module and that the
-*  loader maps into an address space of its own.
+*  address, that the kernel maps into an address space of its own -- either
+*  from a Multiboot module or from a file on the mounted volume.
 *
-*  Consequences, all of them visible in this file:
+*  It used to hand-roll its own decimal conversion, because the only header a
+*  program got was the raw "int 0x80" wrappers. There is a small C library now
+*  (user/lib.h), so this reads like a C program: an entry point called main(),
+*  arguments, printf. What it demonstrates has not changed:
 *
-*    - There is no C runtime. Nothing calls main() and nothing catches its
-*      return value, so the entry point is _start() and it must never fall
-*      off its end. The last thing it does is sys_exit().
-*    - There is no libc. Formatting a number means writing the loop for it.
-*    - The only way to reach the outside world is "int 0x80".
+*    - There is still no C runtime beyond what lib.c provides, and no libc
+*      underneath it. Everything ultimately becomes "int 0x80".
+*    - main() may return; _start() passes the value to sys_exit() for it.
 */
 #include "syscall.h"
+#include "lib.h"
 
 /* Exit status handed to the kernel. Deliberately not 0 -- a distinctive
 *  value proves the status actually travels from ring 3 through sys_exit()
@@ -27,110 +29,48 @@
 #define TICK_COUNT         10
 #define TICK_INTERVAL_MS   200
 
-/* Scratch space for print_dec(). Deliberately a file scope buffer rather
-*  than a local: it puts something in .bss, which means the program's single
-*  PT_LOAD segment has p_memsz > p_filesz and the loader's zeroing path gets
-*  exercised by the very first program that ever runs. 11 bytes is the
-*  longest an unsigned 32-bit value plus terminator can get. */
-static char dec_buf[11];
-
-
-/* Prints an unsigned value in decimal.
-*
-*  Digits come out of the division loop least significant first, so they are
-*  written into the buffer from the back and the string starts wherever that
-*  loop stopped. No leading zeros, no padding -- there is nothing here that
-*  would need them. */
-static void print_dec(unsigned int value)
+int main(int argc, char **argv)
 {
-	int i;
-
-	i = (int)sizeof(dec_buf) - 1;
-	dec_buf[i] = '\0';
-
-	if(value == 0)
-	{
-		dec_buf[--i] = '0';
-	}
-	else
-	{
-		while(value != 0 && i > 0)
-		{
-			dec_buf[--i] = (char)('0' + (value % 10));
-			value /= 10;
-		}
-	}
-
-	sys_write(&dec_buf[i]);
-}
-
-/* Prints a signed value, for the milliseconds the kernel returns as int. */
-static void print_int(int value)
-{
-	if(value < 0)
-	{
-		sys_putch('-');
-		print_dec((unsigned int)(-value));
-	}
-	else
-	{
-		print_dec((unsigned int)value);
-	}
-}
-
-
-/* The entry point. ENTRY(_start) in user.ld puts its address in e_entry, and
-*  that is the address the loader iret's to. There is no argc, no argv and no
-*  return address on the stack -- the kernel builds the initial user context
-*  from scratch, so the stack is empty and this function has nowhere to
-*  return to. */
-void _start(void)
-{
-	int pid;
 	int start_ms;
 	int end_ms;
 	int i;
 
-	sys_write("\nHello from user space! This is a real ELF, loaded as a module.\n");
+	printf("\nHello from user space! This is a real ELF with its own address space.\n");
+	printf("  pid       : %d\n", sys_getpid());
 
-	pid = sys_getpid();
-	sys_write("  pid       : ");
-	print_int(pid);
-	sys_putch('\n');
+	/* argv[0] is the program name and is always there, so argc is never 0.
+	*  Printing the arguments back is the cheapest proof that the loader put
+	*  them where the calling convention says they are. */
+	printf("  argc      : %d\n", argc);
+	for(i = 0; i < argc; i++)
+	{
+		printf("  argv[%d]   : %s\n", i, argv[i]);
+	}
 
 	start_ms = sys_uptime();
-	sys_write("  uptime    : ");
-	print_int(start_ms);
-	sys_write(" ms since boot\n");
+	printf("  uptime    : %d ms since boot\n", start_ms);
 
-	/* Something visibly alive: one dot every TICK_INTERVAL_MS. Each dot is
-	*  a separate SYS_PUTCH and each pause a separate SYS_SLEEP, so the line
-	*  grows in real time -- and while this task sleeps the scheduler is free
-	*  to run everything else, which is the point of doing it this way rather
-	*  than in a busy loop. */
-	sys_write("  ticking   : ");
+	/* Something visibly alive: one dot every TICK_INTERVAL_MS. Each pause is
+	*  a separate SYS_SLEEP, so the line grows in real time -- and while this
+	*  task sleeps the scheduler is free to run everything else, which is the
+	*  point of doing it this way rather than in a busy loop. */
+	printf("  ticking   : ");
 	for(i = 0; i < TICK_COUNT; i++)
 	{
-		sys_putch('.');
+		printf(".");
 		sys_sleep(TICK_INTERVAL_MS);
 	}
-	sys_putch('\n');
+	printf("\n");
 
 	/* The measured time is what the kernel actually granted, not what was
 	*  asked for: sleeps round up to whole timer ticks and other tasks run in
 	*  between, so this is always a little more than the nominal total. */
 	end_ms = sys_uptime();
-	sys_write("  slept     : ");
-	print_int(end_ms - start_ms);
-	sys_write(" ms (asked for ");
-	print_int(TICK_COUNT * TICK_INTERVAL_MS);
-	sys_write(" ms)\n");
+	printf("  slept     : %d ms (asked for %d ms)\n",
+	       end_ms - start_ms, TICK_COUNT * TICK_INTERVAL_MS);
 
-	sys_write("Goodbye - exiting with status ");
-	print_int(HELLO_EXIT_STATUS);
-	sys_write(".\n");
+	printf("Goodbye - exiting with status %d.\n", HELLO_EXIT_STATUS);
 
-	/* No return. If sys_exit() ever did come back, the iret would resume a
-	*  task that is supposed to be dead. */
-	sys_exit(HELLO_EXIT_STATUS);
+	/* Returning is enough: _start() in lib.c hands this to sys_exit(). */
+	return HELLO_EXIT_STATUS;
 }

@@ -72,12 +72,30 @@
 #define VGA_OFF_AC     (VGA_OFF_GC   + VGA_NUM_GC_REGS)
 
 /* The text mode font: 256 glyphs, and the hardware reserves 32 bytes per
-*  glyph in plane 2 regardless of how many scan lines the glyph actually uses
-*  (16 for the 8x16 font of mode 3). Saving the padding as well costs 4 KiB of
-*  .bss and saves having to know the font height. */
+*  glyph in plane 2 regardless of how many scan lines the glyph actually uses.
+*  VGA_FONT_GLYPH_SIZE is therefore the STRIDE from one glyph to the next in
+*  plane 2, and VGA_FONT_ROWS is how much of each of those slots the character
+*  generator ever fetches.
+*
+*  Only the rows matter, and only sixteen of them. mode 3's CRTC 0x09 is 0x4F
+*  -- maximum scan line 15, a sixteen line character cell -- so the generator
+*  reads bytes 0..15 of a slot and never bytes 16..31. Both tables in this
+*  file are const and there is no other text table, so no mode this kernel
+*  can enter raises that number; SEQ 0x03 is 0x00 as well, so both character
+*  map selects point at font block 0 and no second block is in play either.
+*
+*  Backing up the padding as well would therefore copy 4 KiB of bytes that
+*  nothing reads, out and back again, and hold them in .bss for the life of
+*  the machine. The cost of not doing it is that the copy is 256 strided
+*  moves instead of one flat one, which is a loop counter -- and it moves
+*  half as many bytes, so against this kernel's byte-at-a-time memcpy() it is
+*  the faster of the two anyway. After a restore the padding holds whatever
+*  pixels mode 13h left in it, which is exactly as visible as it sounds:
+*  not at all. */
 #define VGA_FONT_GLYPHS      256
 #define VGA_FONT_GLYPH_SIZE   32
-#define VGA_FONT_BYTES  (VGA_FONT_GLYPHS * VGA_FONT_GLYPH_SIZE)
+#define VGA_FONT_ROWS         16
+#define VGA_FONT_BYTES  (VGA_FONT_GLYPHS * VGA_FONT_ROWS)
 
 /* --- The register tables -------------------------------------------------
 *
@@ -173,9 +191,14 @@ static const uint8_t vga_regs_text[VGA_NUM_REGS] =
 static int vga_current_mode = VGA_MODE_TEXT;
 
 /* The glyph bitmaps, rescued from plane 2 before the first switch away from
-*  text mode. 8 KiB of .bss, allocated whether it is ever used or not -- the
+*  text mode. 4 KiB of .bss, allocated whether it is ever used or not -- the
 *  alternative would be a heap allocation at exactly the moment when failing
-*  is least acceptable, because by then the font is about to be overwritten. */
+*  is least acceptable, because by then the font is about to be overwritten.
+*  There is no useful answer to malloc() returning 0 inside vga_set_mode():
+*  refusing the switch makes a graphics mode fail on a machine that is merely
+*  low on memory, and going ahead without a backup means the text console
+*  never comes back. Statically allocated it cannot fail, and 4 KiB is a
+*  cheaper guarantee than either of those outcomes. */
 static uint8_t vga_font_backup[VGA_FONT_BYTES];
 static int vga_font_valid = 0;
 
@@ -399,13 +422,23 @@ static void vga_plane2_leave(const struct vga_plane_state *saved)
 
 /* Copies the 256 glyphs out of plane 2 into vga_font_backup. Must be called
 *  while text mode is still programmed, i.e. before the mode 13h table goes
-*  in -- afterwards chain-4 is on and plane 2 holds pixels, not glyphs. */
+*  in -- afterwards chain-4 is on and plane 2 holds pixels, not glyphs.
+*
+*  Strided, not flat: plane 2 puts glyph n at n * VGA_FONT_GLYPH_SIZE, and
+*  only the first VGA_FONT_ROWS bytes of that slot are the glyph. See the
+*  note by the constants for why the rest is not worth carrying. */
 static void vga_font_save(void)
 {
 	struct vga_plane_state saved;
+	const uint8_t *plane;
+	int n;
 
 	vga_plane2_enter(&saved);
-	memcpy(vga_font_backup, P2V(VGA_FB_PHYS), (size_t)VGA_FONT_BYTES);
+	plane = (const uint8_t *)P2V(VGA_FB_PHYS);
+	for(n = 0; n < VGA_FONT_GLYPHS; n++)
+		memcpy(vga_font_backup + n * VGA_FONT_ROWS,
+		       plane + n * VGA_FONT_GLYPH_SIZE,
+		       (size_t)VGA_FONT_ROWS);
 	vga_plane2_leave(&saved);
 }
 
@@ -414,9 +447,15 @@ static void vga_font_save(void)
 static void vga_font_restore(void)
 {
 	struct vga_plane_state saved;
+	uint8_t *plane;
+	int n;
 
 	vga_plane2_enter(&saved);
-	memcpy(P2V(VGA_FB_PHYS), vga_font_backup, (size_t)VGA_FONT_BYTES);
+	plane = (uint8_t *)P2V(VGA_FB_PHYS);
+	for(n = 0; n < VGA_FONT_GLYPHS; n++)
+		memcpy(plane + n * VGA_FONT_GLYPH_SIZE,
+		       vga_font_backup + n * VGA_FONT_ROWS,
+		       (size_t)VGA_FONT_ROWS);
 	vga_plane2_leave(&saved);
 }
 

@@ -879,7 +879,14 @@ SECTION .bss align=4096
 mboot_magic: resd 1
 mboot_info:  resd 1
 
-    resb 8192               ; This reserves 8KBytes of memory here
+; The boot stack. Its size is picked to end exactly on the 4 KiB boundary the
+; page directory below needs, which is why it is written as an arithmetic
+; expression rather than as a round number: the two saved multiboot words plus
+; the stack have to add up to a multiple of 4096, or the "alignb 4096" below
+; inserts padding that is reserved, mapped and never touched by anything.
+; At 8192 it did exactly that -- 8200 rounded up to 12288 and 4088 bytes were
+; lost. The same section footprint now holds a stack half again as large.
+    resb 12288 - 8          ; 12280 bytes; 12280 + 8 = 12288 = 3 pages
 sys_stack:
 
 ; The page directory used to get into the higher half. Placed ABOVE the top of

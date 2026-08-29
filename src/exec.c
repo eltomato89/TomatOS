@@ -38,7 +38,7 @@
 *  counter that faults at the first PLT entry.
 *
 *  Since there is a filesystem, a program no longer has to be baked into the
-*  boot media: exec_spawn_file() loads one from a file on the mounted volume.
+*  boot media: exec_spawn_path() loads one from a file on the mounted volume.
 *  The loader itself is not doubled for that. Everything above - the header
 *  checks, the per page frame allocation, the .bss gap, PAGE_USER and the
 *  PF_W dependent PAGE_WRITE - is one code path that asks an "image" for
@@ -66,6 +66,55 @@
 *  The price is one fat_read() per page instead of one memcpy() per segment.
 *  For a loader that runs once per program start this is the cheaper of the
 *  two prices.
+*
+*  A program also has to be told what it was started with, and that argument
+*  vector is built on the USER STACK, in the page the task manager already
+*  gave the task. Nowhere else: a per task argument buffer in the kernel
+*  would be MAX_TASKS times its size in .bss, permanently, for something a
+*  program reads once - in a kernel that is deliberately moving things out,
+*  not in. The stack page exists anyway, it is private to the task, it is
+*  handed back with the address space, and the program is free to overwrite
+*  the strings the moment it has read them.
+*
+*  The layout at the entry point is the one a plain
+*
+*      void _start(int argc, char **argv)
+*
+*  compiled cdecl expects to find, i.e. exactly what a "call" would have left
+*  behind:
+*
+*      higher addresses
+*        "hello\0" "readme.txt\0" ...   the strings, argv[0] first
+*        0                              argv[argc], the terminator
+*        &"readme.txt"                  argv[1]
+*        &"hello"                       argv[0]
+*        argv                           a pointer to the argv[0] slot above
+*        argc
+*        0                              a fake return address, never used
+*      esp -> lower addresses
+*
+*  The two things that make or break it:
+*
+*    - every pointer stored in that block is a USER address. The block is
+*      written through the direct mapping, because the space being furnished
+*      is not the active one, so the address the kernel writes at and the
+*      address the program will read at are different views of the same
+*      frame. Everything is therefore computed in user addresses and turned
+*      into a kernel one only at the moment of the store.
+*    - the block lives in the task's single 4 KiB stack page, so it competes
+*      with the stack the program is about to use. It is refused unless a
+*      fixed reserve is left below it - better a program that does not start
+*      than one that starts and overruns its stack into the guard page in its
+*      first function call.
+*
+*  What is left is the esp the task starts with. taskmgr_add_user_task() points
+*  it at the very top of the stack page, which is right for a program that gets
+*  nothing and wrong for one that gets arguments: the block has to sit ABOVE
+*  esp for the offsets to line up. taskmgr_task_set_stack() moves it down to
+*  the base of the block, and is set BEFORE the entry point - a task whose
+*  entry point is known is complete as far as taskmgr_task_start() is
+*  concerned, so the other order would leave a window in which the program
+*  could start on top of its own arguments.
 *
 *  Notes: No warranty expressed or implied. Use at own risk.
 */
@@ -106,7 +155,7 @@
 #define EXEC_ABORT_ERRNO 1
 
 /* Longest path to a program file that can be remembered in the table below,
-*  including the terminator. exec_spawn_file() itself has no such limit - it
+*  including the terminator. exec_spawn_path() itself has no such limit - it
 *  reads through the caller's string. */
 #define EXEC_PATH_MAX   64
 
@@ -122,6 +171,27 @@
 *  right behind the file header, so this bound is never anywhere near - it
 *  only stops a corrupt e_phoff from asking for a megabyte of heap. */
 #define EXEC_HEADER_MAX 16384
+
+/* Most arguments a program can be started with, argv[0] included. The array
+*  of words below it lives on the KERNEL stack, which is 4 KiB per task and
+*  shared with everything a system call does, so the bound is what keeps a
+*  caller's argument string from deciding how much of it is used. Sixteen is
+*  well past anything this shell can produce. */
+#define EXEC_ARGV_MAX   16
+
+/* Bytes of the stack page that stay free for the program itself. The
+*  argument block is refused rather than squeezed in below this: a program
+*  whose arguments leave it 200 bytes of stack would fault in its first
+*  function call, and a page fault at some address inside the guard page says
+*  a great deal less than "the arguments do not fit". */
+#define EXEC_STACK_MIN_FREE  2048
+
+/* How far down from the kernel half stack_page_of() looks for the task's
+*  user stack. The task manager puts the stacks of all MAX_TASKS slots
+*  directly below KERNEL_VIRTUAL_BASE, 8 KiB apart, which is 512 KiB for 64
+*  slots; 4 MiB of search is that with room to spare and costs one page
+*  directory lookup per empty page. */
+#define EXEC_STACK_SEARCH_PAGES 1024
 
 /* A module as the kernel keeps it: the bootloader's physical range, boiled
 *  down to start and size, plus the name taken from its command line. */
@@ -160,6 +230,17 @@ typedef struct
 	const char *path;		/* file path, 0 for a module         */
 	const char *noun;
 } exec_image;
+
+/* One argument, still where it was found: a slice of the caller's string
+*  rather than a copy of it. The words are only needed between the split and
+*  the single pass that writes them onto the user stack, and both happen
+*  before this function returns, so there is nothing to own and nothing to
+*  free. */
+typedef struct
+{
+	const char *text;
+	uint32_t    len;		/* without a terminator, there is none yet */
+} exec_word;
 
 static exec_module modules[EXEC_MAX_MODULES];
 static int         module_count = 0;
@@ -995,15 +1076,242 @@ static void image_close(exec_image *img)
 	img->hdr  = 0;
 }
 
+/* --- The initial user stack ----------------------------------------------- */
+
+/* Four bytes, little endian, byte by byte. Every store below lands on an
+*  aligned address, so this could be a uint32_t write. It is not, because the
+*  destination is a char* into a foreign task's page and writing it a byte at
+*  a time makes the layout independent of what the compiler assumes about
+*  alignment - the cost is four stores per word, in a function that runs once
+*  per program start. */
+static void put32(char *at, uint32_t value)
+{
+	at[0] = (char)(value & 0xFF);
+	at[1] = (char)((value >> 8) & 0xFF);
+	at[2] = (char)((value >> 16) & 0xFF);
+	at[3] = (char)((value >> 24) & 0xFF);
+}
+
+/* Splits an argument string into words and puts them behind argv[0], which is
+*  always the program's own name. Returns argc, -1 if there are more words
+*  than out can hold and -2 if they are longer than a stack page could ever
+*  take. *bytes_out is what the strings will occupy once every one of them
+*  has its terminator.
+*
+*  Separators are spaces and tabs, any run of them counts once, and leading
+*  and trailing ones produce no empty argument. There is no quoting and no
+*  escaping: neither the shell nor sys_spawn() offers a way to produce an
+*  argument with a blank in it, so a rule for one would be a rule about
+*  nothing. Adding it later changes this function and nothing else.
+*
+*  args may be 0 or empty, and then argc is 1 - a program always has a name,
+*  even when it was given nothing else. */
+static int args_split(const char *name, const char *args, exec_word *out,
+                      int max, uint32_t *bytes_out)
+{
+	uint32_t bytes;
+	int      argc;
+	int      i;
+
+	out[0].text = name;
+	out[0].len  = (uint32_t)strlen(name);
+
+	argc  = 1;
+	bytes = out[0].len + 1;
+
+	if (args != 0)
+	{
+		i = 0;
+
+		for (;;)
+		{
+			while (args[i] == ' ' || args[i] == '\t') i++;
+
+			if (args[i] == '\0') break;
+
+			if (argc >= max) return -1;
+
+			out[argc].text = args + i;
+
+			while (args[i] != '\0' && args[i] != ' ' && args[i] != '\t')
+				i++;
+
+			out[argc].len = (uint32_t)(args + i - out[argc].text);
+
+			/* Counted before the total can grow past anything the page
+			*  could hold, so that a pathological string cannot make the
+			*  sum wrap and come out small. */
+			bytes += out[argc].len + 1;
+			if (bytes > (uint32_t)PAGE_SIZE) return -2;
+
+			argc++;
+		}
+	}
+
+	*bytes_out = bytes;
+	return argc;
+}
+
+/* The page the task's user stack lives in, or 0 if there is none.
+*
+*  Found rather than computed: where the stacks are is the task manager's
+*  business, and repeating its arithmetic here would mean two files that have
+*  to be changed together whenever the region moves. What is used instead is
+*  the one property the loader can rely on - a brand new user task has
+*  exactly one page mapped in its user half, and that page is its stack. So
+*  the highest mapped page below the kernel half IS the stack, as long as the
+*  question is asked before any segment has been placed.
+*
+*  Which is why this runs first in spawn_image() and not where its result is
+*  needed. Afterwards a program loaded high in the user half could well own a
+*  page above the stack and the answer would be a segment. */
+static uint32_t stack_page_of(addrspace_t space)
+{
+	uint32_t page;
+	int      i;
+
+	page = KERNEL_VIRTUAL_BASE - PAGE_SIZE;
+
+	for (i = 0; i < EXEC_STACK_SEARCH_PAGES; i++)
+	{
+		if (vmm_get_phys_in(space, page) != 0) return page;
+
+		page -= PAGE_SIZE;
+	}
+
+	return 0;
+}
+
+/* Writes argc, argv and the strings into the task's stack page and hands back
+*  the esp the program has to start with. Returns 0 on success.
+*
+*  Everything is laid out in USER addresses first - base, array, str - and
+*  only the store itself is translated, by subtracting the page and adding it
+*  to the kernel view of the frame. That is what makes the pointers in the
+*  argv array right: they are the addresses the program will use, not the
+*  ones this function is writing through.
+*
+*  The block is placed against the top of the page and the stack grows down
+*  from it, so the program has everything between the page's first byte and
+*  base to itself. */
+static int stack_build(addrspace_t space, uint32_t page, const char *name,
+                       const char *args, uint32_t *esp_out)
+{
+	exec_word words[EXEC_ARGV_MAX];
+	uint32_t  phys;
+	char     *kpage;		/* the same frame, seen from the kernel */
+	uint32_t  top;			/* first address above the block        */
+	uint32_t  strbytes;
+	uint32_t  need;
+	uint32_t  room;
+	uint32_t  base;			/* the esp the program starts with      */
+	uint32_t  array;		/* user address of the argv[0] slot     */
+	uint32_t  str;			/* user address of the next string      */
+	int       argc;
+	int       i;
+
+	phys = vmm_get_phys_in(space, page);
+	if (phys == 0)
+	{
+		exec_set_error("the task has no user stack for its arguments");
+		return -1;
+	}
+
+	phys &= PAGE_ADDR_MASK;
+
+	/* The stack frame comes from the pmm and therefore lies inside the
+	*  direct mapping - but the block is written through P2V(), so this is
+	*  established rather than assumed. */
+	if (phys > DIRECT_MAP_LIMIT)
+	{
+		exec_set_error("the user stack is outside the direct mapping");
+		return -1;
+	}
+
+	kpage = (char *)P2V(phys);
+
+	argc = args_split(name, args, words, EXEC_ARGV_MAX, &strbytes);
+	if (argc == -1)
+	{
+		exec_set_error("too many arguments");
+		return -1;
+	}
+	if (argc < 0)
+	{
+		exec_set_error("the arguments do not fit on the user stack");
+		return -1;
+	}
+
+	/* The block ends at the top of the page: esp is moved to its base with
+	*  taskmgr_task_set_stack(), so nothing has to be kept free above it. */
+	top = page + PAGE_SIZE;
+
+	/* Three words - fake return address, argc, argv - then the array with
+	*  its null terminator, then the strings. */
+	need = 12 + 4 * ((uint32_t)argc + 1) + strbytes;
+
+	/* What is there to spend, checked before base is computed so that the
+	*  subtraction below cannot run off the bottom of the page. The 16 is
+	*  the alignment slack the rounding may still take. */
+	room = top - (page + EXEC_STACK_MIN_FREE);
+	if (need + 16 > room)
+	{
+		exec_set_error("the arguments do not fit on the user stack");
+		return -1;
+	}
+
+	/* base is the esp the program sees, and the ABI wants esp + 4 - the
+	*  first argument of a cdecl function - 16 byte aligned, which is the
+	*  state a real "call" leaves behind. Rounded down, never up: upwards
+	*  would run past the end of the page. */
+	base  = top - need;
+	base  = ((base - 12) & ~15u) + 12;
+
+	array = base + 12;
+	str   = array + 4 * ((uint32_t)argc + 1);
+
+	put32(kpage + (base - page),     0);			/* return address */
+	put32(kpage + (base - page) + 4, (uint32_t)argc);
+	put32(kpage + (base - page) + 8, array);
+
+	for (i = 0; i < argc; i++)
+	{
+		put32(kpage + (array - page) + 4 * (uint32_t)i, str);
+
+		memcpy(kpage + (str - page), words[i].text,
+		       (size_t)words[i].len);
+		kpage[(str - page) + words[i].len] = '\0';
+
+		str += words[i].len + 1;
+	}
+
+	/* argv[argc]. A program is free to walk the array until it hits this
+	*  instead of counting down from argc, and both have to work. */
+	put32(kpage + (array - page) + 4 * (uint32_t)argc, 0);
+
+	*esp_out = base;
+	return 0;
+}
+
 /* --- Spawning ------------------------------------------------------------- */
 
 /* Everything both sources share once the image is ready: a suspended task
-*  with an address space of its own, the segments in it, the entry point set.
-*  Returns the pid, or -1 with last_error set. */
-static int spawn_image(const exec_image *img, const char *name, int prio)
+*  with an address space of its own, the segments in it, argc and argv on its
+*  stack, the entry point set. Returns the pid, or -1 with last_error set.
+*
+*  args is the command line behind the program name and may be 0, which is
+*  what a module started with "exec NAME" passes. The argument block is built
+*  either way - a program compiled as void _start(int argc, char **argv)
+*  reads [esp+4] and [esp+8] whether it was given anything or not, so a path
+*  that skipped this would hand it two words of whatever the stack page ends
+*  in. There is no "no arguments" case, only argc == 1. */
+static int spawn_image(const exec_image *img, const char *name,
+                       const char *args, int prio)
 {
 	addrspace_t space;
+	uint32_t    stack;
 	uint32_t    entry;
+	uint32_t    esp;
 	int         pid;
 
 	/* The task comes first and comes suspended: it owns the address space
@@ -1025,7 +1333,19 @@ static int spawn_image(const exec_image *img, const char *name, int prio)
 		return -1;
 	}
 
+	/* Asked here and not where it is used: right now the stack is the only
+	*  page mapped in the user half, which is what makes it findable at all.
+	*  See stack_page_of(). */
+	stack = stack_page_of(space);
+	if (stack == 0)
+	{
+		exec_set_error("the new task has no user stack");
+		taskmgr_task_abort(pid, EXEC_ABORT_ERRNO, last_error);
+		return -1;
+	}
+
 	entry = 0;
+	esp   = 0;
 
 	/* Every failure from here on leaves a half built task behind, so it is
 	*  aborted with the reason attached. The frames and page tables already
@@ -1038,9 +1358,31 @@ static int spawn_image(const exec_image *img, const char *name, int prio)
 		return -1;
 	}
 
-	/* Last step, and the one that turns the loaded image into something that
-	*  can run. It refuses a task that is not suspended any more, which would
-	*  mean somebody started this one behind our back. */
+	/* After the segments, because a segment that reached into the stack
+	*  page would have been refused by load_segment() as "overlaps something
+	*  already mapped" - and if it had not been, the arguments would now be
+	*  sitting in the program's own data. */
+	if (stack_build(space, stack, name, args, &esp) != 0)
+	{
+		taskmgr_task_abort(pid, EXEC_ABORT_ERRNO, last_error);
+		return -1;
+	}
+
+	/* The last two steps, and the ones that turn the loaded image into
+	*  something that can run. Both refuse a task that is not suspended any
+	*  more, which would mean somebody started this one behind our back.
+	*
+	*  The stack pointer first: a task whose entry point is set is complete
+	*  as far as taskmgr_task_start() is concerned, so setting it before esp
+	*  would leave a window in which the program could be started with its
+	*  esp still at the top of the page, on top of its own argument block. */
+	if (taskmgr_task_set_stack(pid, esp) != 0)
+	{
+		exec_set_error("the stack pointer was not accepted by the task manager");
+		taskmgr_task_abort(pid, EXEC_ABORT_ERRNO, last_error);
+		return -1;
+	}
+
 	if (taskmgr_task_set_entry(pid, entry) != 0)
 	{
 		exec_set_error("the entry point was not accepted by the task manager");
@@ -1057,16 +1399,16 @@ static int spawn_image(const exec_image *img, const char *name, int prio)
 *  negative value with exec_last_error() set. Like exec_spawn(), the task
 *  comes back suspended.
 *
-*  Not declared in exec.h - that header is not ours to change here - so a
-*  caller outside this file repeats the prototype:
+*  args is everything behind the program name on the command line, one
+*  string, or 0 when there is nothing. It is split into words here, not by
+*  the caller: what a word is belongs to the argument vector, and a caller
+*  that had to split it first would need somewhere to put the pieces.
 *
-*      extern int exec_spawn_file(const char *path, int prio);
-*
-*  The shell does not have to: exec_module_find() already resolves a name to
-*  a file when no module carries it, and exec_spawn() takes the index that
-*  comes back. This entry point is for a caller that has a path rather than
-*  a name and wants no lookup in between. */
-int exec_spawn_file(const char *path, int prio)
+*  argv[0] is the last component of path, so a program called as
+*  "/BIN/CAT.ELF" sees "CAT.ELF" and not the whole path. The path is where
+*  the file was found, the name is what the program is called, and the two
+*  are only the same by accident. */
+int exec_spawn_path(const char *path, const char *args, int prio)
 {
 	exec_image img;
 	char       name[EXEC_NAME_MAX];
@@ -1084,7 +1426,7 @@ int exec_spawn_file(const char *path, int prio)
 
 	name_from_path(path, name, EXEC_NAME_MAX);
 
-	pid = spawn_image(&img, name, prio);
+	pid = spawn_image(&img, name, args, prio);
 
 	/* The header copy has done its job either way: the segments are in the
 	*  task's frames, and nothing below this line reads from the file again.
@@ -1107,7 +1449,7 @@ int exec_spawn(int index, int prio)
 	*  module. It is handed on rather than duplicated here - the loader is
 	*  the same one, only the source of the bytes differs. */
 	f = file_at(index);
-	if (f != 0) return exec_spawn_file(f->path, prio);
+	if (f != 0) return exec_spawn_path(f->path, 0, prio);
 
 	if (index < 0 || index >= module_count)
 	{
@@ -1125,5 +1467,5 @@ int exec_spawn(int index, int prio)
 	img.path = 0;
 	img.noun = "module";
 
-	return spawn_image(&img, modules[index].name, prio);
+	return spawn_image(&img, modules[index].name, 0, prio);
 }
