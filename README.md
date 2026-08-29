@@ -316,12 +316,17 @@ fixed:
 | `10.0.2.3` | DNS forwarder |
 | `255.255.255.0` | netmask |
 
-There is no DHCP client, so the address is set from the shell:
+There is a DHCP client, so the address does not have to be typed in:
 
 ```
-ifconfig 10.0.2.15 255.255.255.0 10.0.2.2
+dhcp
 ping 10.0.2.2
 ```
+
+`dhcp` prints the exchange as it happens — DISCOVER, OFFER, REQUEST, ACK — and
+then what the lease says. `ifconfig 10.0.2.15 255.255.255.0 10.0.2.2` still
+works and still wins; `ifconfig` afterwards shows which of the two the address
+came from.
 
 `lspci` lists what the bus enumeration found — the command to run when the
 card is not detected. `arp` shows the cache, `ifconfig` without arguments the
@@ -371,7 +376,51 @@ waiting. A receive queue drained by a task would be the better structure and
 is noted as such in `net.c`; it needs a task and an overflow policy, and
 neither belongs in the same change as the first packet that works.
 
-Deliberately absent: DHCP, TCP, and any form of fragment reassembly.
+#### UDP and DHCP
+
+The point of the DHCP client is that a machine on an unfamiliar network can
+find its own address. Three things about it are worth knowing, because each is
+a case that fails silently rather than loudly.
+
+**The UDP checksum covers a pseudo header that never appears on the wire** —
+source address, destination address, protocol and length — and the length is in
+it twice, once there and once in the real header. Summing only the visible
+bytes produces a datagram that looks correct in a hex dump and is discarded by
+every peer. UDP also allows a checksum of zero, meaning "not computed", so a
+computed zero has to go out as `0xFFFF` and an incoming zero must be *accepted*
+rather than rejected.
+
+**The whole exchange happens before the machine has an address.** Requests go
+out from `0.0.0.0` to `255.255.255.255`, and the answers arrive addressed to a
+machine that is not us yet. `ip_receive()` drops anything not addressed to us —
+correctly, and that is exactly what would drop the replies. So while
+`net_ip()` is still zero the receive path accepts any destination, and stops
+the instant `net_configure()` runs. Two things bound that: the ethernet layer
+above it already discards frames addressed to neither our MAC nor broadcast, so
+a unicast reaching it was sent to *this card*; and ICMP was deliberately not
+widened, so a broadcast ping is still heard and ignored rather than answered.
+
+Sending had a defect the same work uncovered: a limited broadcast from a
+machine that *does* have an address is off-subnet by definition, so it was
+routed to the gateway and would have gone to the router's MAC — a broadcast
+delivered to one station. It is short-circuited before the subnet test now,
+which is what a lease renewal after expiry needs.
+
+**The option field is a walk, not a struct**, over type/length/value triples
+that came off the wire and that nothing has vouched for. Each read is bounded
+before it happens, and a bad length *stops* the walk rather than skipping the
+option — once a length is wrong there is no way to know where the next option
+begins. It was fuzzed with 500,000 random option areas under ASan, each copied
+into an exact-size allocation so the redzone sits immediately after the last
+legal byte.
+
+Retransmission is 1 s, 2 s, 4 s, 8 s and then give up. Sub-second is useless
+anywhere but loopback — a relay agent, or a switch running spanning tree on a
+port that just came up, takes longer — and a flat retry would put fifteen
+broadcasts on a segment that has already shown nobody is listening.
+
+Deliberately absent: renewing a lease before it expires, RELEASE, DECLINE,
+TCP, and any form of fragment reassembly.
 
 ### What is in the kernel, and what is not
 

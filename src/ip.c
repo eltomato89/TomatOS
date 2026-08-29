@@ -10,9 +10,10 @@
 *  Byte order. Every field inside the packed headers is in NETWORK order and
 *  is only ever touched through htons/htonl/ntohs/ntohl. Everything else --
 *  the addresses this file passes around and the ones the API takes and
-*  returns (ip_send(), icmp_send_echo(), icmp_last_reply(), net_ip(),
-*  net_netmask(), net_gateway(), arp_lookup()) -- is in HOST order. The
-*  conversion happens exactly where a value enters or leaves a header.
+*  returns (ip_send(), ip_send_from(), icmp_send_echo(), icmp_last_reply(),
+*  udp_receive(), net_ip(), net_netmask(), net_gateway(), arp_lookup()) --
+*  is in HOST order. The conversion happens exactly where a value enters or
+*  leaves a header.
 *
 *  Checksum span. The IP checksum covers the IP header ALONE, never the
 *  payload. The ICMP checksum covers the WHOLE ICMP message, header and
@@ -86,6 +87,8 @@ static volatile int      icmp_reply_pending  = 0;
 /* local helper functions -- not declared in any header */
 static void icmp_receive(const uint8_t *msg, uint32_t len, uint32_t from);
 static void icmp_echo_reply(const uint8_t *request, uint32_t len, uint32_t to);
+static int  ip_dst_is_ours(uint32_t dst);
+static int  ip_dst_is_local(uint32_t dst);
 
 /* Entry point of the receive path. net.c calls this for every frame of type
 *  ETH_TYPE_IP, with the ethernet header already stripped: "packet" points at
@@ -100,19 +103,42 @@ void ip_receive(const uint8_t *packet, uint32_t len);
 /* ------------------------------------------------------------------ */
 
 /* Builds the IP header around a payload and hands the packet to net_send().
+*  The source address is spelled out by the caller instead of being taken
+*  from net_ip(), and this is the only implementation -- ip_send() below is a
+*  wrapper. Two copies of the header construction would be two places to fix
+*  the next time a field changes, and they would not stay identical.
 *
-*  Routing: a destination inside our subnet is reached directly, anything
-*  else goes to the gateway. The comparison is on the network part only --
-*  getting it the wrong way round still works on the local wire and fails
-*  for every address beyond it, which is a miserable thing to debug.
+*  Why a caller would pass anything other than net_ip(): a DHCP client has no
+*  address until the exchange it is trying to run has finished, so its
+*  DISCOVER and REQUEST go out from IP_ADDR_ANY. That is the one legitimate
+*  case; everything else uses ip_send().
+*
+*  Note that "src" takes no part in the routing decision below. Which wire a
+*  packet leaves by is a property of this machine's interface, not of the
+*  number it chooses to write in the source field -- and an unconfigured
+*  sender has no source address to route by in the first place.
+*
+*  Routing: the limited broadcast is never routed; a destination inside our
+*  subnet is reached directly; anything else goes to the gateway. The subnet
+*  comparison is on the network part only -- getting it the wrong way round
+*  still works on the local wire and fails for every address beyond it, which
+*  is a miserable thing to debug.
+*
+*  Unconfigured (address, netmask and gateway all zero) the subnet test is
+*  vacuous: (dst ^ 0) & 0 is zero for every destination, so everything is
+*  treated as direct, which is exactly right when the only reachable thing is
+*  the local wire.
 *
 *  ARP: the next hop has to be resolved before a frame can be addressed.
 *  arp_lookup() answers from its cache or returns 0 and sends a request, so
 *  a first send to an unknown host cannot succeed. IP_ERR_PENDING says so.
 *  A caller is expected to retry: send, wait a few milliseconds, send again,
 *  a handful of times before giving up. A ping that stops at the first
-*  refusal would never get a packet out of a cold cache. */
-int ip_send(uint32_t dst, uint8_t protocol, const void *payload, uint32_t len)
+*  refusal would never get a packet out of a cold cache. A broadcast is the
+*  exception: arp_lookup() answers it with the broadcast MAC out of hand, so
+*  a DHCP DISCOVER goes out on the first attempt from a cold cache. */
+int ip_send_from(uint32_t src, uint32_t dst, uint8_t protocol,
+                 const void *payload, uint32_t len)
 {
     ip_header *ip;
     const uint8_t *mac;
@@ -127,8 +153,17 @@ int ip_send(uint32_t dst, uint8_t protocol, const void *payload, uint32_t len)
     if (len > 0 && payload == 0)
         return IP_ERR_FAILED;
 
-    /* Routing decision. Same network part as ours -> direct. */
-    if (((dst ^ net_ip()) & net_netmask()) == 0)
+    /* Routing decision.
+    *
+    *  The limited broadcast goes on this wire and nowhere else, by
+    *  definition. Without this case a configured machine broadcasting --
+    *  a DHCP client rebinding, or one whose lease ran out starting over --
+    *  would find 255.255.255.255 outside its subnet and hand the frame to
+    *  the gateway's MAC: a broadcast delivered to exactly one station,
+    *  which is not a broadcast at all. */
+    if (dst == IP_ADDR_BROADCAST)
+        next_hop = dst;
+    else if (((dst ^ net_ip()) & net_netmask()) == 0)  /* our network -> direct */
         next_hop = dst;
     else
         next_hop = net_gateway();
@@ -141,6 +176,15 @@ int ip_send(uint32_t dst, uint8_t protocol, const void *payload, uint32_t len)
     if (mac == 0)
         return IP_ERR_PENDING;   /* request is on its way -- retry */
 
+    /* Everything above this line only reads. From here on the shared
+    *  transmit buffer is written, which is what the flag protects: a send
+    *  reached from an interrupt while a task is mid-packet gives up rather
+    *  than overwriting it. The gap between the test and the store is not a
+    *  hole on this machine -- an interrupt landing in it runs its own send
+    *  to completion and clears the flag again before the interrupted
+    *  instruction resumes, and the buffer is untouched until after the
+    *  store. What must not happen is a second writer arriving between the
+    *  store and the release below, and that is refused. */
     if (ip_tx_busy)
         return IP_ERR_FAILED;    /* interrupted a send in progress */
     ip_tx_busy = 1;
@@ -156,7 +200,7 @@ int ip_send(uint32_t dst, uint8_t protocol, const void *payload, uint32_t len)
     ip->ttl            = IP_DEFAULT_TTL;
     ip->protocol       = protocol;
     ip->checksum       = 0;      /* zeroed before summing, never after */
-    ip->src            = htonl(net_ip());
+    ip->src            = htonl(src);
     ip->dst            = htonl(dst);
     ip->checksum       = net_checksum(ip, IP_HDR_LEN);  /* header only */
 
@@ -168,6 +212,13 @@ int ip_send(uint32_t dst, uint8_t protocol, const void *payload, uint32_t len)
     ip_tx_busy = 0;
 
     return (result == 0) ? 0 : IP_ERR_FAILED;
+}
+
+/* The ordinary case: send from whatever address this machine is configured
+*  with. Every caller but the DHCP client wants this one. */
+int ip_send(uint32_t dst, uint8_t protocol, const void *payload, uint32_t len)
+{
+    return ip_send_from(net_ip(), dst, protocol, payload, len);
 }
 
 /* ------------------------------------------------------------------ */
@@ -230,6 +281,88 @@ int icmp_last_reply(uint32_t *from, uint16_t *id, uint16_t *sequence)
 /* Receiving                                                           */
 /* ------------------------------------------------------------------ */
 
+/* Is this destination address ours alone -- the single unicast address this
+*  machine answers to? A broadcast is not, and an unconfigured machine has no
+*  such address at all, so both answer 0.
+*
+*  Used for the traffic that may only be replied to when it was aimed at this
+*  machine specifically, which is ICMP echo: see ip_receive() below. */
+static int ip_dst_is_ours(uint32_t dst)
+{
+    uint32_t me;
+
+    me = net_ip();
+
+    return (me != IP_ADDR_ANY && dst == me);
+}
+
+/* Should a packet with this destination be delivered to this host at all?
+*
+*  Until DHCP there was one answer -- our own address -- and it was right for
+*  every packet a configured machine has any business with. It also drops
+*  every DHCP reply, which is why this exists. The accepted cases, and why
+*  each is needed:
+*
+*    - our own unicast address. The ordinary case, unchanged.
+*
+*    - 255.255.255.255, the limited broadcast. A DHCP server answers a client
+*      that asked to be broadcast to here, and a client whose lease expired
+*      hears its own segment's traffic here. This one is not optional: it is
+*      how a machine with no address can be spoken to at all.
+*
+*    - our subnet's broadcast, our address with the host bits set. A server
+*      on our own wire may answer there once we are configured -- a renewal
+*      or a rebind -- and it is what every other host on the segment accepts.
+*      Skipped while the netmask is zero, because "our address with the host
+*      bits set" is then 255.255.255.255 for any address at all, which is the
+*      case above and not a second one.
+*
+*    - anything, but ONLY while this machine has no address of its own. This
+*      is the case worth being uncomfortable about, so: a DHCP server that
+*      gets a request with the broadcast flag clear may unicast its OFFER and
+*      ACK to the address it is about to hand out -- addressed to a machine
+*      that is not yet us, and unmatchable by definition, because knowing the
+*      address is the entire point of the exchange. There is nothing in the
+*      IP header to compare it against.
+*
+*      What keeps this from being "accept everything" is that it is not the
+*      IP layer's only filter. To reach here at all a frame passed
+*      net_receive(), which drops anything whose ethernet destination is
+*      neither our MAC nor the broadcast MAC -- so a unicast accepted here
+*      was addressed to this card by a server that had our MAC from our own
+*      DISCOVER. And the moment net_configure() runs, this case stops
+*      applying: it is live only in the window where it is needed.
+*
+*  Deliberately still dropped: another host's unicast address once we have
+*  one of our own, every multicast group (we join none), and 0.0.0.0, which
+*  is "no address" and never a destination -- accepting it would mean an
+*  unconfigured machine treating an unaddressed packet as its own. */
+static int ip_dst_is_local(uint32_t dst)
+{
+    uint32_t me;
+    uint32_t mask;
+
+    if (dst == IP_ADDR_ANY)
+        return 0;
+
+    if (dst == IP_ADDR_BROADCAST)
+        return 1;
+
+    me = net_ip();
+
+    if (me == IP_ADDR_ANY)
+        return 1;        /* no address yet -- see the note above */
+
+    if (dst == me)
+        return 1;
+
+    mask = net_netmask();
+    if (mask != 0 && dst == (me | ~mask))
+        return 1;        /* our subnet's broadcast */
+
+    return 0;
+}
+
 /* Runs in interrupt context: no printing on the normal path, and every
 *  field is checked before it is believed. Anything that does not add up is
 *  dropped without a word -- a hostile or simply broken packet is not a
@@ -239,6 +372,8 @@ void ip_receive(const uint8_t *packet, uint32_t len)
     const ip_header *ip;
     uint32_t header_len;
     uint32_t total;
+    uint32_t src;
+    uint32_t dst;
     uint16_t fragment;
 
     if (packet == 0 || len < IP_HDR_LEN)
@@ -278,14 +413,43 @@ void ip_receive(const uint8_t *packet, uint32_t len)
     if ((fragment & IP_FLAG_MORE) || (fragment & IP_FRAG_OFFSET))
         return;
 
-    /* Not ours, not our business. No forwarding -- this is a host. */
-    if (ntohl(ip->dst) != net_ip())
+    /* Not for this host, not our business. No forwarding -- this is a host,
+    *  and what "for this host" covers is the whole of ip_dst_is_local(). */
+    src = ntohl(ip->src);
+    dst = ntohl(ip->dst);
+
+    if (!ip_dst_is_local(dst))
         return;
 
     if (ip->protocol == IP_PROTO_ICMP)
-        icmp_receive(packet + header_len, total - header_len, ntohl(ip->src));
+    {
+        /* Echo requests are answered, and an answer names this machine as
+        *  its source -- so only requests aimed at this machine alone get
+        *  one. A broadcast ping is heard and ignored: replying to it turns
+        *  every host on the segment into an amplifier for one forged packet,
+        *  and an unconfigured machine has no source address to reply with
+        *  anyway. This is the behaviour before broadcasts were accepted at
+        *  all, kept deliberately -- the wider acceptance above exists for
+        *  DHCP and nothing here needed it. */
+        if (!ip_dst_is_ours(dst))
+            return;
 
-    /* TCP and UDP have nobody to go to yet. */
+        icmp_receive(packet + header_len, total - header_len, src);
+    }
+    else if (ip->protocol == IP_PROTO_UDP)
+    {
+        /* Both addresses, because the UDP checksum covers a pseudo header
+        *  built from them and the datagram alone does not carry them. The
+        *  destination is passed as it arrived rather than as net_ip(): a
+        *  DHCP reply is addressed to a broadcast or to an address we do not
+        *  have yet, and summing over what we wish it said would fail every
+        *  check. udp_receive() is given the UDP header onwards, so the
+        *  length is the IP payload -- total_length, not the frame length,
+        *  which may still carry ethernet padding. */
+        udp_receive(src, dst, packet + header_len, total - header_len);
+    }
+
+    /* TCP has nobody to go to. */
 }
 
 /* One ICMP message, already known to be addressed to us. */

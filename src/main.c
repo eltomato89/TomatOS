@@ -16,6 +16,7 @@
 #include <pci.h>
 #include <rtl8139.h>
 #include <net.h>
+#include <dhcp.h>
 //#include <wmessages.h>
 
 #define NULL 0
@@ -444,6 +445,38 @@ extern char usertext_end[];
 #define NET_PING_UNRESOLVED (-1)
 #define NET_PING_LOST       (-2)
 
+/* --- dhcp ----------------------------------------------------------------
+*
+*  The same shape as ping, for the same reason: dhcp_start() only puts the
+*  first message on the wire, and every answer after that arrives in an
+*  interrupt while this task sleeps. So the command is a loop that sleeps,
+*  calls dhcp_poll() -- which is the only thing that resends a message
+*  nobody answered -- and watches dhcp_state() move.
+*
+*  The upper limit is this shell's, not the client's. dhcp_poll() gives up on
+*  its own once its attempts are used up, and that is the failure worth
+*  reporting because it knows why; DHCP_WAIT exists only so that a client
+*  which never reaches a conclusion cannot hang the shell forever. It is
+*  therefore set well above any retransmission schedule the client could
+*  plausibly run -- the current one gives up after fifteen seconds -- so that
+*  it is a backstop and not a second, competing deadline that would take the
+*  reason away from the answer.
+*
+*  50 ms between two looks is fine even though a virtual network answers far
+*  faster than that: the states are ordered, so a poll that finds two of them
+*  crossed at once can still print both -- see net_dhcp_run(). */
+#define DHCP_WAIT     25000   /* ms before the shell stops waiting        */
+#define DHCP_POLL        50   /* ms between two calls to dhcp_poll()      */
+
+/* A lease of 0xFFFFFFFF seconds is the protocol's way of writing "forever",
+*  not a duration of 136 years, and printing it as one would be silly. */
+#define DHCP_LEASE_FOREVER 0xFFFFFFFFUL
+
+/* Seconds in the units a lease is worth reading in. */
+#define DHCP_SECS_PER_DAY  86400
+#define DHCP_SECS_PER_HOUR  3600
+#define DHCP_SECS_PER_MIN     60
+
 /* --- what the bootloader reported ----------------------------------------
 *
 *  kernel.c owns this record: it reads the framebuffer fields out of the
@@ -487,6 +520,7 @@ void diskfree(char *cmd);
 void graphics(char *cmd);
 void listpci(char *cmd);
 void netconfig(char *cmd);
+void dhcpclient(char *cmd);
 void arptable(char *cmd);
 void pinghost(char *cmd);
 void help(void);
@@ -565,6 +599,14 @@ static void net_show_arp(void);
 static int  net_ping_once(uint32_t dst, uint16_t sequence, uint32_t *from);
 static void net_ping(uint32_t dst);
 
+static void net_dhcp_duration(uint32_t seconds);
+static uint32_t net_dhcp_remaining(void);
+static void net_dhcp_leased_ip(const char *label, uint32_t ip);
+static void net_dhcp_step(int state);
+static const char *net_dhcp_stalled(int reached);
+static void net_dhcp_show_lease(void);
+static void net_dhcp_run(void);
+
 /* Self-test counters, maintained by mem_check(). */
 static int mem_tests_run = 0;
 static int mem_tests_ok = 0;
@@ -580,6 +622,15 @@ static int user_tests_ok = 0;
 /* And for gfx_check(). */
 static int gfx_tests_run = 0;
 static int gfx_tests_ok = 0;
+
+/* Where the address the interface carries came from, so that "ifconfig" can
+*  say. net_ip() cannot tell the two apart, and dhcp_state() only almost can:
+*  a second exchange that fails leaves the state at FAILED while the address
+*  from the first one is still configured and still working, and calling that
+*  "set by hand" would be a lie about the one thing this line is for. So the
+*  shell remembers it -- set where a lease is taken, cleared where "ifconfig"
+*  overwrites it with typed numbers. */
+static int net_address_from_lease = 0;
 
 /* The pid of the status bar task, so the graphics commands can hold it while
 *  the screen does not belong to the console -- see gfx_statusbar_hold().
@@ -628,6 +679,7 @@ void main()
 		else if(strcmp(word, "gfx") == 0) graphics(cmd);
 		else if(strcmp(word, "lspci") == 0) listpci(cmd);
 		else if(strcmp(word, "ifconfig") == 0) netconfig(cmd);
+		else if(strcmp(word, "dhcp") == 0) dhcpclient(cmd);
 		else if(strcmp(word, "arp") == 0) arptable(cmd);
 		else if(strcmp(word, "ping") == 0) pinghost(cmd);
 		else if(strcmp(word, "reboot") == 0) reboot();
@@ -3960,9 +4012,14 @@ static void net_explain_down(void)
 
 	if(net_ip() == 0)
 	{
-		printf("  The interface is up but has no address yet. Set one with\n");
-		printf("  \"ifconfig 10.0.2.15 255.255.255.0 10.0.2.2\", which is what\n");
-		printf("  QEMU's user network expects.\n");
+		/* Two ways to get one, and the first is now the one to reach for:
+		   "dhcp" asks the network, and the network is the only thing that
+		   actually knows the answer. The typed form stays in the message
+		   because it still works where nothing answers. */
+		printf("  The interface is up but has no address yet. \"dhcp\" asks the\n");
+		printf("  network for one, which is what QEMU's user network answers.\n");
+		printf("  \"ifconfig 10.0.2.15 255.255.255.0 10.0.2.2\" sets the same\n");
+		printf("  three by hand where nothing answers.\n");
 	}
 }
 
@@ -4228,6 +4285,44 @@ static void net_show_interface(void)
 	net_print_ip(net_gateway());
 	printf("\n");
 
+	/* Where the three above came from. Worth a line of its own because the
+	   two origins fail differently: numbers typed in stay wrong until they
+	   are typed again, a lease stops being true on its own when it runs
+	   out, and only the second sort has anything more to show. */
+	net_info_label("Source:");
+	if(!configured)
+	{
+		printf("none -- no address is set\n");
+	}
+	else if(net_address_from_lease)
+	{
+		printf("DHCP lease from ");
+		net_print_ip(dhcp_server());
+		if(dhcp_state() != DHCP_STATE_BOUND)
+		{
+			/* The lease is still configured and still works -- dhcp_stop()
+			   does not undo it -- but a later exchange has moved the client
+			   off it, so the two do not agree any more. */
+			printf(", client now %s", dhcp_state_name());
+		}
+		printf("\n");
+
+		net_dhcp_leased_ip("DNS server:", dhcp_dns());
+
+		net_info_label("Lease:");
+		net_dhcp_duration(dhcp_lease_seconds());
+		if(dhcp_lease_seconds() != 0
+		   && dhcp_lease_seconds() != (uint32_t)DHCP_LEASE_FOREVER)
+		{
+			printf(", ");
+			net_dhcp_duration(net_dhcp_remaining());
+			printf(" left");
+		}
+		printf("\n");
+	} else {
+		printf("set by hand with ifconfig\n");
+	}
+
 	printf("  RX packets: ");
 	mem_print_right(net_rx_packets(), 8);
 	printf("   dropped: ");
@@ -4236,6 +4331,22 @@ static void net_show_interface(void)
 
 	printf("  TX packets: ");
 	mem_print_right(net_tx_packets(), 8);
+	printf("\n");
+
+	/* The UDP counters belong here, one layer up though they are: this
+	   command is where one looks when the network does not work, and since
+	   DHCP the interesting failure is a datagram that the card counted and
+	   UDP then dropped -- a wrong checksum, a port nobody bound. Two rows of
+	   the same three columns as above show that difference at a glance, and
+	   they are cheap: four lines that are read together. */
+	printf("  UDP     rx: ");
+	mem_print_right(udp_rx_packets(), 8);
+	printf("   dropped: ");
+	mem_print_right(udp_rx_dropped(), 8);
+	printf("\n");
+
+	printf("  UDP     tx: ");
+	mem_print_right(udp_tx_packets(), 8);
 	printf("\n");
 
 	/* A row of zeroes explains nothing by itself, so when the interface
@@ -4488,6 +4599,277 @@ static void net_ping(uint32_t dst)
 	}
 }
 
+/* --- dhcp ---------------------------------------------------------------- */
+
+/* A duration in the units it is worth reading in.
+*
+*  A lease is stated in seconds and 86400 is not a number anybody converts in
+*  their head, so the seconds are printed and the same value follows in days,
+*  hours and minutes. Units that are zero are left out -- "1 d 30 min" rather
+*  than "1 d 0 h 30 min" -- and anything under a minute is already readable
+*  as it stands and gets no second form at all. */
+static void net_dhcp_duration(uint32_t seconds)
+{
+	uint32_t days;
+	uint32_t hours;
+	uint32_t minutes;
+	int written;
+
+	if(seconds == (uint32_t)DHCP_LEASE_FOREVER)
+	{
+		printf("infinite");
+		return;
+	}
+
+	printf("%u s", seconds);
+
+	if(seconds < DHCP_SECS_PER_MIN) return;
+
+	days = seconds / DHCP_SECS_PER_DAY;
+	hours = (seconds / DHCP_SECS_PER_HOUR) % 24;
+	minutes = (seconds / DHCP_SECS_PER_MIN) % 60;
+
+	printf(" (");
+	written = 0;
+
+	if(days > 0)
+	{
+		printf("%u d", days);
+		written = 1;
+	}
+
+	if(hours > 0)
+	{
+		if(written) putch(' ');
+		printf("%u h", hours);
+		written = 1;
+	}
+
+	if(minutes > 0)
+	{
+		if(written) putch(' ');
+		printf("%u min", minutes);
+	}
+
+	printf(")");
+}
+
+/* How much of the lease is left, in seconds.
+*
+*  dhcp_lease_expires() is a moment in milliseconds since boot and
+*  timer_get_ticks() is the same clock, so the difference is the answer. It
+*  is computed rather than remembered because it is different every time it
+*  is asked for, and it saturates at zero: nothing here acts on an expiry, so
+*  a lease that has run out is reported as having no time left rather than as
+*  a very large number of seconds obtained by subtracting the wrong way. */
+static uint32_t net_dhcp_remaining(void)
+{
+	uint32_t expires;
+	uint32_t now;
+
+	expires = dhcp_lease_expires();
+	now = (uint32_t)timer_get_ticks();
+
+	if(expires <= now) return 0;
+
+	return (expires - now) / 1000;
+}
+
+/* One labelled address out of the lease, where zero means the server did not
+*  send that option rather than the address 0.0.0.0. A DHCP server is not
+*  obliged to offer a DNS server, and printing 0.0.0.0 for one it withheld
+*  would look like an answer. */
+static void net_dhcp_leased_ip(const char *label, uint32_t ip)
+{
+	net_info_label(label);
+
+	if(ip == 0)
+	{
+		printf("none offered\n");
+		return;
+	}
+
+	net_print_ip(ip);
+	printf("\n");
+}
+
+/* One line per step of the exchange, named after the message that caused it.
+*
+*  The states and the messages are not the same thing and the difference is
+*  the whole reason this reads the way it does: reaching DHCP_STATE_REQUEST
+*  means an OFFER came in AND the REQUEST went back out, which is two of the
+*  four messages in one transition. Naming the line after the message that
+*  arrived is what makes the four steps recognisable to somebody watching. */
+static void net_dhcp_step(int state)
+{
+	switch(state)
+	{
+		case DHCP_STATE_DISCOVER:
+			printf("  DISCOVER  broadcast -- is there a server?\n");
+			break;
+		case DHCP_STATE_REQUEST:
+			printf("  OFFER     received -- REQUEST broadcast for it\n");
+			break;
+		case DHCP_STATE_BOUND:
+			printf("  ACK       received -- the lease is confirmed\n");
+			break;
+		default:
+			break;
+	}
+}
+
+/* What the machine was waiting for when it gave up, from the last step it
+*  did reach. This is the difference between "nothing out there answers DHCP
+*  at all" and "something answered and then went quiet", and the two point at
+*  entirely different things to go and look at. */
+static const char *net_dhcp_stalled(int reached)
+{
+	switch(reached)
+	{
+		case DHCP_STATE_IDLE:
+			return "before the DISCOVER went out";
+		case DHCP_STATE_DISCOVER:
+			return "waiting for an OFFER -- no server answered the broadcast";
+		case DHCP_STATE_REQUEST:
+			return "waiting for an ACK -- a server offered, then did not confirm";
+		default:
+			break;
+	}
+
+	return "in a state it should not have stopped in";
+}
+
+/* What the lease turned out to be, once it is one.
+*
+*  The first three are read back through net_ip() and friends rather than
+*  from the client, deliberately: they are printed to show what the interface
+*  now carries, and reading them from where the rest of the kernel reads them
+*  is what makes that claim worth anything. The last three are what DHCP
+*  knows and the IP layer has no field for. */
+static void net_dhcp_show_lease(void)
+{
+	net_info_label("Address:");
+	net_print_ip(net_ip());
+	printf("\n");
+
+	net_info_label("Netmask:");
+	net_print_ip(net_netmask());
+	printf("\n");
+
+	net_dhcp_leased_ip("Gateway:", net_gateway());
+	net_dhcp_leased_ip("DNS server:", dhcp_dns());
+	net_dhcp_leased_ip("DHCP server:", dhcp_server());
+
+	net_info_label("Lease:");
+	net_dhcp_duration(dhcp_lease_seconds());
+	printf("\n");
+}
+
+/* "dhcp": the four message exchange, watched from the outside.
+*
+*  Built like net_ping_once() and for the same reason -- nothing here can
+*  wait on a packet, because every answer arrives in interrupt context while
+*  this task sleeps. So the loop sleeps, calls dhcp_poll() (the only thing
+*  that resends a message nobody answered, and the only thing that ever gives
+*  up) and watches dhcp_state().
+*
+*  The state IS the progress report: each of the four messages moves it, so
+*  printing every change shows the exchange happening. A spinner would show
+*  only that the machine is still alive, and the question a user with no
+*  address actually has is which of the four steps it is stuck on. */
+static void net_dhcp_run(void)
+{
+	uint32_t leased;
+	const char *reason;
+	int state;
+	int shown;
+	int waited;
+	int start;
+
+	printf("DHCP on eth0: asking the network for an address.\n");
+
+	if(dhcp_start() != 0)
+	{
+		printf("dhcp: the exchange could not be started.\n");
+		reason = dhcp_last_error();
+		if(reason != 0 && reason[0] != EOS) printf("  %s\n", reason);
+		return;
+	}
+
+	start = timer_get_ticks();
+	shown = DHCP_STATE_IDLE;
+	state = DHCP_STATE_IDLE;
+
+	for(waited = 0; waited < DHCP_WAIT; waited += DHCP_POLL)
+	{
+		state = dhcp_poll();
+
+		if(state == DHCP_STATE_FAILED) break;
+
+		/* The states before BOUND are numbered in the order they happen in,
+		   which is what makes this loop safe at 50 ms: on a virtual network
+		   the OFFER and the ACK can both arrive inside one sleep, and the
+		   client would then be found two steps further on than it was left.
+		   Printing only where it is now would silently drop a step that did
+		   happen, so every step in between is printed as well. */
+		while(shown < state)
+		{
+			shown++;
+			net_dhcp_step(shown);
+		}
+
+		if(state == DHCP_STATE_BOUND) break;
+
+		sleep(DHCP_POLL);
+	}
+
+	if(state == DHCP_STATE_BOUND)
+	{
+		/* Remembered before anything is printed: this is the one place that
+		   knows the address in the interface was leased rather than typed,
+		   and "ifconfig" asks afterwards. */
+		net_address_from_lease = 1;
+
+		printf("  Bound in %i ms.\n", timer_get_ticks() - start);
+		net_dhcp_show_lease();
+
+		leased = dhcp_lease_seconds();
+		if(leased != 0 && leased != (uint32_t)DHCP_LEASE_FOREVER)
+		{
+			printf("  Nothing renews it: when the lease runs out the address\n");
+			printf("  stays configured and stops being ours. \"ifconfig\" shows\n");
+			printf("  how much of it is left.\n");
+		}
+		return;
+	}
+
+	/* Everything from here down is a failure, and the point of the next few
+	   lines is that the three kinds do not read alike. */
+	printf("dhcp: no address was obtained after %i ms.\n",
+	       timer_get_ticks() - start);
+	printf("  Stalled %s.\n", net_dhcp_stalled(shown));
+
+	if(state != DHCP_STATE_FAILED)
+	{
+		/* The loop ran out before the client did, which is not a case that
+		   should occur -- dhcp_poll() gives up long before DHCP_WAIT. Said
+		   plainly, because it means the client is not counting its own
+		   attempts rather than that the network is quiet. */
+		printf("  The client had not given up yet; the shell stopped waiting.\n");
+		dhcp_stop();
+	}
+
+	reason = dhcp_last_error();
+	if(reason != 0 && reason[0] != EOS) printf("  %s\n", reason);
+
+	if(shown == DHCP_STATE_DISCOVER)
+	{
+		printf("  A network with no DHCP server is not broken, it is just not\n");
+		printf("  answering: set the addresses by hand with\n");
+		printf("  \"ifconfig 10.0.2.15 255.255.255.0 10.0.2.2\" instead.\n");
+	}
+}
+
 /* --- the commands themselves --------------------------------------------- */
 
 void listpci(char *cmd)
@@ -4562,7 +4944,70 @@ void netconfig(char *cmd)
 	}
 
 	net_configure(address, netmask, gateway);
+
+	/* Typed numbers, whatever the interface carried before them. A lease may
+	   still be running underneath -- dhcp_stop() is not called, because the
+	   address it obtained is exactly what is being overwritten here and the
+	   conversation is over either way -- but it is no longer what the
+	   interface is using, and "ifconfig" must not go on claiming it is. */
+	net_address_from_lease = 0;
+
 	net_show_interface();
+}
+
+/* "dhcp": ask the network instead of being told.
+*
+*  What happens when there already is an address: nothing, unless -f is
+*  given. It is the conservative choice and it is the right one here, because
+*  the failure is asymmetric. Starting an exchange means the interface is
+*  committed to whatever comes back -- and if nothing comes back, the state
+*  is FAILED and the machine has spent seconds finding that out, on a machine
+*  that was reachable when the command was typed. A user who typed "dhcp"
+*  twice by accident, or who typed it on a machine somebody had already
+*  configured by hand, gets told what the address is and where it came from
+*  instead. Asking again is one flag away, and then it is deliberate. */
+void dhcpclient(char *cmd)
+{
+	int force;
+
+	force = 0;
+
+	if(prmc(cmd) == 1 && strcmp(prmv(1, cmd), "-f") == 0) force = 1;
+
+	if(prmc(cmd) > 1 || (prmc(cmd) == 1 && !force))
+	{
+		printf("Syntax: dhcp [-f]\n");
+		printf("\t          Ask the network for an address, netmask, gateway\n");
+		printf("\t          and DNS server, and configure the interface with\n");
+		printf("\t          what comes back\n");
+		printf("\t-f        Ask again although an address is already set\n");
+		return;
+	}
+
+	/* No address is wanted here -- obtaining one is the point -- but a card
+	   and a stack are, and this says which of the two is missing. */
+	if(!net_interface_ready("dhcp", 0)) return;
+
+	if(net_ip() != 0 && !force)
+	{
+		printf("dhcp: the interface already has ");
+		net_print_ip(net_ip());
+		printf(".\n");
+
+		if(net_address_from_lease)
+		{
+			printf("      It came from a lease -- \"ifconfig\" shows how much of\n");
+			printf("      it is left. \"dhcp -f\" asks for a new one.\n");
+		} else {
+			printf("      It was set by hand with \"ifconfig\". \"dhcp -f\" replaces\n");
+			printf("      it with whatever the network offers.\n");
+		}
+
+		printf("      Nothing was sent.\n");
+		return;
+	}
+
+	net_dhcp_run();
 }
 
 void arptable(char *cmd)
@@ -4716,6 +5161,8 @@ void help(void)
 	printf("\tlspci     List the devices the PCI enumeration found\n");
 	printf("\tifconfig  Show the interface and its counters,\n");
 	printf("\t          ifconfig IP NETMASK GATEWAY sets the addresses\n");
+	printf("\tdhcp      Ask the network for an address instead of typing\n");
+	printf("\t          one, dhcp -f asks again when one is already set\n");
 	printf("\tarp       Show the ARP cache, address to hardware address\n");
 	printf("\tping      ping IP sends echo requests and times the replies\n");
 	printf("\treboot    Restart the computer\n");
