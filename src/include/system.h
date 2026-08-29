@@ -25,6 +25,16 @@
 #define TASK_STATE_RUNNING 0
 #define TASK_STATE_SUSPENDED 1
 #define TASK_STATE_ABORTED 2
+/* A task that ran to its end and said so. Distinct from ABORTED on purpose:
+*  both mean "finished, the slot may be recycled", but only one of them means
+*  something went wrong. Reporting a program that returned 0 as "Aborted" is
+*  what this exists to stop -- "ps" is read precisely when somebody suspects a
+*  failure, and it should not manufacture one.
+*
+*  Anything that treats ABORTED as "this task is over" has to treat EXITED the
+*  same way; the two differ only in what they are called and in whether an
+*  error is worth printing next to them. */
+#define TASK_STATE_EXITED 3
 #define TASK_STATE_NULL -1
 
 /* This defines what the stack looks like after an ISR was running */
@@ -183,6 +193,13 @@ extern int taskmgr_task_state(int pid);
 
 extern int taskmgr_get_currpid();
 extern void taskmgr_task_abort(int pid, int error_number, const char *error_descr);
+
+/* The ordinary end of a task: it returned, or called exit(). status is what it
+*  handed back and is kept for "ps" to show. Same effect on the slot as
+*  taskmgr_task_abort() -- the task stops being scheduled and the slot is
+*  recyclable -- and the same rule about not freeing anything here, since this
+*  runs on the stack of the task it is ending. */
+extern void taskmgr_task_exit(int pid, int status);
 extern void taskmgr_task_start(int pid);
 extern void taskmgr_task_suspend(int pid);
 extern void taskmgr_killall();

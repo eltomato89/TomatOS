@@ -3067,12 +3067,15 @@ static void run_wait(int pid, const char *name)
 	{
 		state = taskmgr_task_state(pid);
 
-		/* ABORTED is where a task that called exit() ends up -- sys_exit()
-		   goes through taskmgr_task_abort(), so a clean return and a fault
-		   look the same from here, and to a caller that only has to stop
-		   waiting they are the same. NULL is a slot that names no task at
-		   all. Everything else means it is still there. */
-		if(state == TASK_STATE_ABORTED || state == TASK_STATE_NULL) return;
+		/* EXITED is where a task that returned or called exit() ends up,
+		   ABORTED where one that faulted or was killed does. The two are
+		   worth telling apart in "ps"; to a caller that only has to stop
+		   waiting they are the same thing, and both are checked here so that
+		   a shell does not sit out its full timeout on a program that
+		   finished. NULL is a slot that names no task at all. Everything
+		   else means it is still there. */
+		if(state == TASK_STATE_EXITED || state == TASK_STATE_ABORTED
+		   || state == TASK_STATE_NULL) return;
 
 		elapsed = timer_get_ticks() - start;
 		if(elapsed >= RUN_WAIT_MS || elapsed < 0) break;

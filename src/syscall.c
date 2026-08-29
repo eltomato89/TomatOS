@@ -736,8 +736,12 @@ static void sysnet_reap(void)
 	{
 		if(!sysnet_conns[i].used) continue;
 
+		/* Both endings release: a task that exited normally holds a
+		*  connection no less firmly than one that was aborted, and it is the
+		*  ordinary case -- a program that returns without closing. */
 		state = taskmgr_task_state(sysnet_conns[i].owner);
-		if(state != TASK_STATE_ABORTED && state != TASK_STATE_NULL) continue;
+		if(state != TASK_STATE_ABORTED && state != TASK_STATE_EXITED
+		   && state != TASK_STATE_NULL) continue;
 
 		tcp_abort(sysnet_conns[i].khandle);
 		sysnet_conns[i].used = 0;
@@ -746,7 +750,8 @@ static void sysnet_reap(void)
 	if(sysnet_dns_lock != 0)
 	{
 		state = taskmgr_task_state(sysnet_dns_owner);
-		if(state == TASK_STATE_ABORTED || state == TASK_STATE_NULL)
+		if(state == TASK_STATE_ABORTED || state == TASK_STATE_EXITED
+		   || state == TASK_STATE_NULL)
 		{
 			/* dns.c is still waiting for an answer nobody will collect. Cancel
 			*  it as well, or the next lookup spends its whole budget waiting
@@ -926,9 +931,11 @@ static int sys_exit(struct regs *r)
 	*  connections is few enough that leaking one matters. */
 	sysnet_release_task(pid);
 
-	/* The task is marked aborted and loses its remaining time slice, so the
-	*  search below skips it. */
-	taskmgr_task_abort(pid, status, "exit()");
+	/* The task is marked as ended and loses its remaining time slice, so the
+	*  search below skips it. Ended, not aborted: a program that returns 0 has
+	*  not failed, and "ps" saying it was aborted is read as a fault by exactly
+	*  the person who went looking for one. */
+	taskmgr_task_exit(pid, status);
 
 	settextcolor(2,0);
 	printf("Task %i exited with status %i\n", pid, status);

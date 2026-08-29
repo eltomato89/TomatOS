@@ -93,12 +93,15 @@ static addrspace_t pending_space;
 
 static struct regs* task_states[MAX_TASKS];
 
+//Indexed by TASK_STATE_*. TASK_STATE_NULL is -1 and deliberately has no entry:
+//every caller filters it out first, because an unused slot is not a task with
+//a state but the absence of one.
 char *readable_task_state[] =
 {
     "Running",
     "Suspended",
 	"Aborted",
-	"Unused"
+	"Exited"
 };
 
 //Safe copy into a fixed-size buffer: copies at most size-1 characters and always
@@ -722,10 +725,14 @@ static int find_free_slot()
 		if(tasks[i].state == TASK_STATE_NULL) return i;
 	}
 
-	//Only overwrite aborted tasks when no free task slots are available any more
+	//Only overwrite a finished task when no free slot is left. Both endings
+	//count: a task that exited normally is just as over as one that was
+	//aborted, and refusing to recycle it would make a machine run out of slots
+	//after 64 successful programs.
 	for(i=0; i <= MAX_TASKS-1; i++)
 	{
 		if(tasks[i].state == TASK_STATE_ABORTED) return i;
+		if(tasks[i].state == TASK_STATE_EXITED) return i;
 	}
 
 	return -1;
@@ -885,9 +892,15 @@ void taskmgr_list_tasks()
 		if(tasks[i].state != TASK_STATE_NULL)
 		{
 			printf(" %s (%i), Priority: %i, State: %s", tasks[i].name, tasks[i].pid, tasks[i].priority, readable_task_state[tasks[i].state]);
+			//An abort has a reason worth reading; an exit has a status, and
+			//a status of 0 is the uninteresting case that needs no ceremony.
 			if(tasks[i].state == TASK_STATE_ABORTED)
 			{
 				printf(" ( ERR %i, %s )", tasks[i].error_no, tasks[i].error);
+			}
+			else if(tasks[i].state == TASK_STATE_EXITED && tasks[i].error_no != 0)
+			{
+				printf(" ( status %i )", tasks[i].error_no);
 			}
 			printf("\n");
 		}
@@ -1048,6 +1061,33 @@ void taskmgr_task_abort(int pid, int error_number, const char *error_descr)
 		{
 			tasks[pid].cpu_time = 0;
 		}
+	}
+}
+
+//The ordinary end of a task. Everything taskmgr_task_abort() says about not
+//freeing anything here applies unchanged -- this runs on the stack of the task
+//it is ending, and that task keeps running until the next tick elects somebody
+//else -- so the two differ in exactly two things: the state, and the fact that
+//there is no error string to keep. The status goes into error_no, which is the
+//field "ps" already reads; naming it after the failure case is a leftover from
+//when a task could only end by failing.
+void taskmgr_task_exit(int pid, int status)
+{
+	if(pid < 0 || pid > MAX_TASKS-1)
+	{
+		printf("ERR: Task %i could not be found!\n", pid);
+		return;
+	}
+
+	tasks[pid].state = TASK_STATE_EXITED;
+	tasks[pid].error_no = status;
+	tasks[pid].error[0] = '\0';
+
+	//Same reason as in taskmgr_task_abort(): a task that is no longer runnable
+	//must not keep the CPU until its slice runs out.
+	if(pid == current_task)
+	{
+		tasks[pid].cpu_time = 0;
 	}
 }
 
