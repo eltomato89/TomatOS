@@ -405,6 +405,88 @@ is legal and every tool renders it; a *wrong* one is worse than none, because
 nothing flags it — and on a machine with a flat battery it would be every file
 it ever writes.
 
+### Waiting instead of polling
+
+Everything that waited in this kernel used to poll: sleep a few milliseconds,
+look again, sleep again. It was written down as a shortcoming in five places —
+the network system calls, the receive queue's drain task, `getch()`, and the
+ping, DHCP and DNS loops in the shell — and it cost what it looked like it
+cost.
+
+`task_wait(channel, timeout_ms)` and `task_wake(channel)` replace it. A channel
+is any address, usually of the thing being waited on; nothing is read through
+it. The gain is not subtle:
+
+| | before | after |
+|---|---|---|
+| `dhcp` | 105 ms | **4 ms** |
+| `nslookup`, warm ARP | 50–100 ms | **3 ms** |
+| `fetch` from the gateway | 78 ms | **31 ms** |
+| `ping example.com` | 20 ms | **14 ms** |
+
+**The race this had to survive** is the lost wakeup: a task tests its
+condition, finds it false, and before it blocks the interrupt that would have
+woken it arrives and wakes nobody. Two things close it, and both live in the
+calling idiom rather than in the implementation — the condition is tested with
+interrupts off, and it is tested *again* after every wake. A wake landing in
+the window where the task is marked blocked but still running is then not lost;
+it costs one more turn around the loop. A caller that tests once and believes
+the wake will hang, rarely, and only under load.
+
+Three things in the scheduler were less obvious than the mechanism:
+
+**Blocking has to actually give up the CPU.** `schedule()` re-elected only when
+a slice ran out, so a task blocking in the first millisecond of the console's
+twenty would have sat in its halt loop for the other nineteen. It now
+re-elects whenever the current task is not `RUNNING`, which covers BLOCKED,
+SUSPENDED, ABORTED and EXITED in one test.
+
+**A blocked task is dispatched when nothing else is runnable**, which sounds
+like the one thing a scheduler must not do. It is safe because a blocked task
+is parked in `task_wait()`'s halt loop, which re-tests its own state before
+every `hlt` — so dispatching one puts the CPU straight back to halted. It is
+also necessary: `sys_exit()` and the fault handler both get a dying task off
+the CPU by calling `schedule()` until a *different* context comes out, and a
+shell that waits for the program it spawned is very often the only other task
+and is blocked. Measured with the pass disabled, every program that ran to
+completion printed `No runnable task left - CPU HALT`.
+
+**`sti; hlt` is atomic as a pair** — `sti` holds interrupt recognition off for
+exactly one instruction — so "halted with interrupts disabled", the one state
+from which only a reset returns, is unreachable by construction rather than by
+luck.
+
+#### The bug this uncovered
+
+A general protection fault in the interrupt stub, roughly one per eighty
+thousand timer ticks, at `pop %fs` restoring a context that was not one.
+
+`irq_handler()` had a `cli`/`sti` pair around its call to `schedule()`. The
+`cli` was redundant — an interrupt gate has already cleared IF. The `sti` was
+the bug: `schedule()` commits the election before it returns, so
+`current_task` already names the *incoming* task while the CPU is still on the
+*outgoing* task's kernel stack, and stays that way until the stub reloads
+`esp` a few instructions later. Enabling interrupts inside that window, and
+then writing the EOI so the PIC may deliver again, let a tick that had become
+pending during the handler arrive exactly there. It pushed its frame onto the
+outgoing task's stack and called `schedule()` again, which filed the *outgoing*
+task's registers as the *incoming* task's context. That context was then a
+pointer into a stack whose owner kept using it, so ordinary calls overwrote it,
+and the next dispatch of it faulted.
+
+The window is old. What changed is that a task used to hold its slice for up to
+twenty ticks, so most ticks re-elected the same task and the window did not
+matter; a blocked task is descheduled on the very next tick, so nearly every
+tick now changes `current_task`. Same latent race, an order of magnitude more
+likely to land on the case that corrupts.
+
+Both halves are fixed: the `sti` is gone, and `schedule()` also detects being
+entered nested and hands the frame back untouched, so a window like this one
+cannot corrupt anything if it is ever reopened. `SCHED_DEBUG` in `tasks.c`
+traces turned-away nested elections and validates every frame before it is
+restored, writing to QEMU's debug port rather than the console — which belongs
+to whoever was interrupted, and anything that scrolls loses the record.
+
 ### Networking
 
 `ping` works, in both directions. The run targets attach an **RTL8139** to

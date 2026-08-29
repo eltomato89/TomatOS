@@ -149,11 +149,13 @@ extern int exec_spawn_path(const char *path, const char *args, int prio);
 *  knows why -- so each is set above that schedule rather than in competition
 *  with it.
 *
-*  SYS_NET_POLL is the sleep between two looks, and it is the shell's 50 ms
-*  from main.c, chosen there for the same reason: a virtual network answers far
-*  faster, but nothing is lost by looking twenty times a second, and the task is
-*  off the CPU in between (see sysnet_pump() for why that is a real yield and
-*  not a spin).
+*  SYS_NET_POLL is the LONGEST one wait may last, not the interval between two
+*  looks -- a frame that arrives sooner wakes the wait and the look happens at
+*  once. It is still the shell's 50 ms from main.c, and it is still a real
+*  number rather than a formality: it is what drives dns_poll() and tcp_poll(),
+*  and those two retransmit for connections nobody is waiting on. Nothing wakes
+*  a retransmission timer, so this bound is the timer's tick and may not grow
+*  into one. See sysnet_pump() for the whole of that argument.
 *
 *  SYS_NET_RESOLVE_MS covers our own lookup. dns.c sends at most
 *  DNS_MAX_ATTEMPTS = 3 queries with a timeout that starts at 1000 ms and
@@ -639,7 +641,32 @@ static uint32_t sysnet_ms_since(uint32_t start)
 	return (uint32_t)timer_get_ticks() - start;
 }
 
-/* One turn of every waiting loop below: drive the state machines, then sleep.
+/* Interrupts off, and back to what the caller had.
+*
+*  Every task_wait() in this file is wrapped in these two, because the idiom
+*  system.h spells out only closes the lost wakeup race if the condition is
+*  tested with interrupts already off. net.c and kb.c have a pair of these
+*  each and both are static to their file; there is no global one, so this
+*  file carries its own rather than inventing a cross-file interface for six
+*  lines of inline assembly.
+*
+*  pushfl before cli, so a caller that already held interrupts off gets them
+*  back off and one that did not gets them back on. */
+static unsigned long sysnet_irq_save(void)
+{
+	unsigned long flags;
+
+	__asm__ __volatile__ ("pushfl; popl %0; cli" : "=r" (flags) : : "memory");
+	return flags;
+}
+
+static void sysnet_irq_restore(unsigned long flags)
+{
+	__asm__ __volatile__ ("pushl %0; popfl" : : "r" (flags) : "memory", "cc");
+}
+
+/* One turn of every waiting loop below: drive the state machines, then block
+*  until a frame has been processed or the poll interval is up.
 *
 *  Both polls are called from every wait, not just from the wait that cares
 *  about them. Neither does anything when it has nothing to do -- dns_poll()
@@ -650,23 +677,57 @@ static uint32_t sysnet_ms_since(uint32_t start)
 *  segments that do arrive, and the interesting failure is the one where none
 *  does.
 *
-*  The sleep is the part that makes this a wait rather than a spin, and it is
-*  worth being precise about why. sleep() is timer_wait(), which hlts until the
-*  next interrupt instead of turning the CPU over. hlt is only safe because
-*  vector 0x80 is a TRAP gate: IF is whatever the caller had, ring 3 always
-*  arrives with it set, so the timer IRQ is still delivered. And IRQ0 is
-*  handled by irq_handler(), which calls schedule() and returns a different
-*  register frame -- so the tick that ends this sleep is the same tick that
-*  hands the CPU to somebody else. The task is descheduled by preemption for
-*  essentially the whole of a fifty millisecond wait, exactly as SYS_SLEEP and
-*  SYS_GETCH already are.
+*  WAKING AND POLLING ARE NOT THE SAME WAIT, and reconciling them is the whole
+*  design of this function. A wake says "a frame was processed, look again"; it
+*  says nothing about the timers above, and nothing ever will -- a
+*  retransmission is due precisely when NOTHING arrived. So the wait is bounded
+*  by SYS_NET_POLL and the bound is not a formality: it is the interval at
+*  which the two polls run, unchanged from the sleep it replaces. A wait with
+*  no timeout would stop retransmitting on a silent link, which is the one case
+*  the timers exist for.
 *
-*  What it is not, and for the same reason sys_getch() says so, is a blocked
-*  state: the task stays runnable and is re-elected once per time slice only to
-*  hlt again. That costs one wakeup per slice, not a busy loop, and a wait queue
-*  in tasks.c would be the right next step. */
+*  What the wake buys is the other side of the same interval. Before, a reply
+*  that landed one millisecond after a look was not noticed for another
+*  forty-nine; now it wakes the task and is noticed at once. The bound is
+*  therefore an upper limit that only quiet links reach, and the polls run at
+*  least as often as they used to -- never less, which is what would break a
+*  timer -- and more often when the network is busy, which costs two cheap
+*  calls per frame.
+*
+*  THE DRAIN COMES FIRST, and when it did something this returns without
+*  blocking at all. The caller's loop tested its condition BEFORE calling here,
+*  so a frame this call parses has not been looked at by anybody yet -- and
+*  blocking on the strength of a wake that already happened is exactly the lost
+*  wakeup the idiom exists to prevent, arrived at from inside. Handing the
+*  caller back to its own test is both the correct answer and the fast one.
+*
+*  THE WINDOW AFTER THE DRAIN is closed with a counter rather than left open.
+*  A frame that arrives once this call has drained is parsed by the drain task,
+*  which wakes the channel while this task is still RUNNING -- a wake that
+*  reaches nobody, and a wait that then sits out its whole interval although
+*  its answer has already been parsed. net_rx_packets() is incremented by the
+*  card's interrupt before anything is parsed, so reading it after the drain
+*  and comparing it with interrupts off is exactly the "test the condition
+*  again, with interrupts off" that system.h asks for, standing in for a
+*  condition this function cannot see. It cannot spin: a turn that skips the
+*  wait has a frame to show for it and the caller re-tests at once.
+*
+*  What stays open is the window before this call -- between the caller's own
+*  test and the drain below. A frame parsed in there was parsed by somebody,
+*  so the caller's next test sees it; the cost is one turn of the loop and not
+*  a wait.
+*
+*  NOT EVERY CALLER CAN BLOCK. task_wait() answers a caller with no current
+*  task with "timed out" immediately, which would turn this into a spin rather
+*  than a wait, so that case keeps the sleep it always had. It should not be
+*  reachable -- everything here runs on behalf of a ring 3 task -- and it costs
+*  one comparison to make sure. */
 static void sysnet_pump(void)
 {
+	unsigned long flags;
+	uint32_t seen;
+	int handled;
+
 	/* Drain the receive queue ourselves rather than waiting for the task that
 	*  normally does it.
 	*
@@ -683,10 +744,30 @@ static void sysnet_pump(void)
 	*  drain task stays: it is what handles everything nobody is waiting for,
 	*  an ARP request to answer or a peer's retransmission arriving while this
 	*  machine has nothing open. */
-	net_queue_drain();
+	handled = net_queue_drain();
+
+	/* Read after the drain and before anything else: see the window above. */
+	seen = net_rx_packets();
+
 	dns_poll();
 	tcp_poll();
-	sleep(SYS_NET_POLL);
+
+	/* Something was parsed that the caller has not seen. Its condition may be
+	*  true already, so the only right thing to do is let it look. */
+	if(handled > 0) return;
+
+	if(taskmgr_get_currpid() < 0)
+	{
+		sleep(SYS_NET_POLL);
+		return;
+	}
+
+	flags = sysnet_irq_save();
+
+	if(net_rx_packets() == seen)
+		task_wait(net_wait_channel(), SYS_NET_POLL);
+
+	sysnet_irq_restore(flags);
 }
 
 /* Takes the resolver, or reports that somebody else has it. */
@@ -1087,45 +1168,38 @@ static int sys_uptime(struct regs *r)
 *  would otherwise let anybody else run. The gate type is what makes this call
 *  possible at all, not a detail of it.
 *
-*  What the loop actually does while it waits is hlt, and hlt is the point.
-*  The CPU stops until the next interrupt instead of spinning, and the next
-*  interrupt is either IRQ1 with the key or IRQ0 with a tick. IRQ0 is the
-*  interesting one: irq_handler() calls schedule() for it and returns a
-*  different register frame, so the timer that fires while this task sits in
-*  hlt is the same timer that hands the CPU to another task. The waiting task
-*  is descheduled by preemption, exactly as SYS_SLEEP is -- timer_wait() waits
-*  in the same shape, and this call earns its keep from the same invariant.
+*  This used to be a hlt loop over getchn(), the non-blocking read, and it said
+*  in this comment that a wait queue in tasks.c would be the right next step.
+*  It is there now -- and the keyboard's end of it is not reachable from this
+*  file. kb.c blocks on the address of last_key, which is a file static and is
+*  in no header; system.h exports the driver's waiting read and nothing below
+*  it. So the wait is not rebuilt here out of a channel this file would have to
+*  invent, which is the one way to get a channel wrong that costs a task that
+*  never runs again: getch() IS the blocking read, it is declared in system.h,
+*  and calling it is how this call blocks.
 *
-*  What this is not is a proper blocked state. The task stays runnable, so the
-*  scheduler keeps re-electing it, and it keeps going straight back into hlt
-*  until a key arrives. That costs one wakeup per time slice, not a spin, and
-*  it does not delay anybody else. A wait queue that took the task off the run
-*  list belongs in tasks.c, and would be the right next step.
+*  What that changes is the cost of a shell sitting at its prompt. The old loop
+*  left the task TASK_STATE_RUNNING, so the scheduler kept electing it for a
+*  turn whose entire content was a read and a hlt, once per time slice for as
+*  long as nobody typed. getch() puts the task in TASK_STATE_BLOCKED and the
+*  scheduler passes it over until the keyboard handler wakes it.
 *
-*  The IF test mirrors timer_wait()'s. Ring 3 always arrives with IF set --
-*  tasks are created with eflags 0x202 and cli is privileged -- so the hlt path
-*  is the only one a user program can reach. The fallback exists for a ring 0
-*  caller that got here with interrupts off, where neither branch can make
-*  progress but at least the busy loop does not park the CPU in a state only an
-*  interrupt could leave. */
+*  Every case the old loop handled getch() handles too, and in the same shape:
+*  a caller with no task running, or one that arrived with interrupts off,
+*  falls back to exactly this hlt loop inside kb.c. It also keeps the property
+*  this call needs -- it returns only a key that is really there, never 0 --
+*  because its loop is over "last_key is empty" and it takes the key with
+*  interrupts still off.
+*
+*  Two tasks can be inside it at once, the console and a ring 3 program, and
+*  one key wakes both; the one that loses re-tests, finds nothing and blocks
+*  again. That is the same single key slot the two shared before, with the same
+*  consequence and no new one. */
 static int sys_getch(struct regs *r)
 {
-	unsigned char key;
-	unsigned long flags;
-	int irqs_enabled;
-
 	(void)r;
 
-	__asm__ __volatile__ ("pushfl; popl %0" : "=r" (flags) : : "memory");
-	irqs_enabled = (flags & 0x200) != 0;
-
-	for(;;)
-	{
-		key = getchn();
-		if(key != 0) return (int)key;
-
-		if(irqs_enabled) __asm__ __volatile__ ("hlt");
-	}
+	return (int)getch();
 }
 
 /* peekch() -- the key that is waiting, or 0 when none is.

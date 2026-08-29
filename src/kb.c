@@ -100,7 +100,56 @@ unsigned char kbdde_b[128] =
 volatile unsigned char last_key;
 volatile unsigned char special_key = EOS;
 int shift = 0;
- 
+
+/* The channel a task blocks on while it waits for a key.
+*
+*  It is the address of last_key itself: the thing that is waited for, which is
+*  what system.h asks for and what makes the pairing obvious -- the handler
+*  writes last_key and wakes the same address, and nothing ever reads through
+*  the pointer. special_key deliberately has no channel: getchs() is a
+*  non-blocking read and nobody waits on it, so a wake there would cost a walk
+*  over the task table for no waiter.
+*
+*  The cast is only about the qualifier. last_key is volatile, task_wake()
+*  takes a plain const void *, and handing one to the other without saying so
+*  is a warning about a discarded qualifier rather than a real conversion. */
+#define KB_WAIT_CHANNEL ((const void *)&last_key)
+
+/* Upper bound on one wait inside getch(), in milliseconds.
+*
+*  getch() blocks until a key arrives however long that takes -- the loop
+*  around the wait sees to that -- so this is not a deadline, it is the safety
+*  net system.h asks every waiter on hardware to carry. If a wake is ever
+*  missed the read degrades to polling five times a second instead of to a
+*  keyboard that is dead until the next keystroke that happens to land while
+*  somebody else is waiting. Five wakeups a second on an idle machine is
+*  nothing next to the thousand ticks the timer produces anyway. */
+#define KB_WAIT_MS 200
+
+/* EFLAGS.IF, tested to find out whether the caller arrived inside a critical
+*  section of its own. */
+#define KB_EFLAGS_IF 0x200
+
+/* net.c has a pair of these but they are static to that file, and there is no
+*  global one; a handful of lines is cheaper than a new cross-file interface.
+*  Saving the flags and clearing IF is the only form that is safe in a caller
+*  that may already have interrupts off -- a plain enable() at the end would
+*  hand them back on to somebody who had deliberately switched them off. */
+static unsigned long kb_irq_save(void)
+{
+    unsigned long flags;
+
+    __asm__ __volatile__ ("pushfl; popl %0; cli"
+                          : "=r" (flags) : : "memory");
+    return flags;
+}
+
+static void kb_irq_restore(unsigned long flags)
+{
+    __asm__ __volatile__ ("pushl %0; popfl"
+                          : : "r" (flags) : "memory", "cc");
+}
+
  void keyboard_handler(struct regs *r)
 {
     unsigned char scancode;
@@ -127,6 +176,20 @@ int shift = 0;
       {
          last_key = kbdde_s[scancode];
       }
+
+      /* A key is in the slot: wake whoever is waiting for one. This is
+      *  interrupt context, which is what task_wake() is built for -- it walks
+      *  the task table, stores states and returns. Nothing else may creep in
+      *  here: no printing, no drain, no switch.
+      *
+      *  Only when there really is a character. A scancode that maps to 0 -- a
+      *  modifier, a function key -- leaves last_key at EOS, so every waiter's
+      *  condition is still false and the wake would buy nothing but the walk
+      *  over the table. */
+      if (last_key != EOS)
+      {
+         task_wake(KB_WAIT_CHANNEL);
+      }
     }
 	
 
@@ -138,22 +201,79 @@ void keyboard_install()
     irq_install_handler(1, keyboard_handler);
 }
 
+/* Waits for a key and returns it.
+*
+*  This used to halt in a loop, and the loop was the problem rather than the
+*  halt: the task stayed TASK_STATE_RUNNING throughout, so the scheduler kept
+*  electing a task whose whole turn was one comparison and a hlt, once per time
+*  slice for as long as nobody typed. A shell sitting at its prompt -- which is
+*  what this machine does most of the time -- was costing a full share of the
+*  CPU to wait.
+*
+*  Now it blocks on the channel the keyboard handler wakes, in the idiom
+*  system.h spells out and for the reason it gives: interrupts are off across
+*  the test AND the block, so the keystroke that arrives in between cannot be
+*  lost, and the condition is re-tested after every wake rather than trusted.
+*  Two tasks can be in here at once -- the console and a program that reads --
+*  and both are woken by one key; the one that loses the race finds last_key
+*  back at EOS and blocks again, which is exactly what the re-test is for.
+*
+*  The key is taken with interrupts still off, so the read and the clear cannot
+*  have a second keystroke land between them.
+*
+*  TWO CALLERS CANNOT BLOCK, and both fall back to what this did before.
+*
+*    - No task is running: the boot path, before the console task exists.
+*      task_wait() answers such a caller with "timed out" at once, so the loop
+*      around it would turn into a busy spin; the hlt loop is what it was and
+*      is still right there.
+*    - Interrupts are off on entry. The caller built a critical section out of
+*      cli, and task_wait() halts with them ON -- it has to, or nothing could
+*      ever wake it -- so blocking would both break that section open and hand
+*      the CPU to a task that may walk into the data it is holding. sleep() in
+*      timer.c faced exactly this and answered it the same way: fall back to
+*      the old loop, which gets nowhere with the keyboard IRQ masked but breaks
+*      nobody's invariant. The hlt is dropped in that case for timer_wait()'s
+*      reason -- halting with IF clear is a CPU that only a reset leaves --
+*      which leaves a spin that is at least interruptible.
+*
+*  Ring 3 reaches the keyboard through SYS_GETCH and arrives with IF set (tasks
+*  start with eflags 0x202 and cli is privileged), and vector 0x80 is a trap
+*  gate, so a user program always gets the blocking path. */
 unsigned char getch()
-{   
-    char ky;
+{
+    unsigned char ky;
+    unsigned long flags;
 
-    /* last_key is volatile, so the loop must not be optimised away. Instead
-    *  of busy polling we wait power-savingly with 'hlt' for the next
-    *  interrupt - the keyboard IRQ (or, failing that, the timer) wakes us
-    *  up again. */
-    while(last_key == EOS)
+    flags = kb_irq_save();
+
+    if(taskmgr_get_currpid() < 0 || (flags & KB_EFLAGS_IF) == 0)
     {
-      __asm__ __volatile__("hlt");
+        kb_irq_restore(flags);
+
+        /* last_key is volatile, so the loop cannot be optimised away. */
+        while(last_key == EOS)
+        {
+            if(flags & KB_EFLAGS_IF)
+                __asm__ __volatile__("hlt");
+        }
+
+        flags = kb_irq_save();
+    }
+    else
+    {
+        /* KB_WAIT_MS is a bound on one wait, not on the read: a timeout only
+        *  sends the loop round again. */
+        while(last_key == EOS)
+        {
+            task_wait(KB_WAIT_CHANNEL, KB_WAIT_MS);
+        }
     }
 
     ky = last_key;
     last_key = EOS;
-    
+
+    kb_irq_restore(flags);
 
     return ky;
 }

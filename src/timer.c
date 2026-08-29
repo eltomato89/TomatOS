@@ -180,12 +180,109 @@ void pic_install()
 	irq_install_handler(0, timer_handler);
 }
 
-void sleep(int ticks)
+/* Sleeps for the given number of milliseconds.
+*
+*  This used to be one line - "timer_wait(ticks)" - and that line is why a ping
+*  took 34 milliseconds to come back. timer_wait() halts until the tick counter
+*  has moved far enough, but the task stays TASK_STATE_RUNNING while it does, so
+*  the scheduler keeps electing it, and every one of those elections is a full
+*  time slice handed to a task that has nothing to do but halt again. A task
+*  sleeping fifty milliseconds does not merely wait fifty milliseconds, it
+*  spends its whole share of the CPU waiting, and everything else on the machine
+*  waits behind it.
+*
+*  A sleep is a wait like any other; it simply has no channel, only a deadline.
+*  That is what task_wait() already does with a null channel - nothing can wake
+*  it, task_wake() refuses the null address outright - so the timeout machinery
+*  in tasks.c covers this case without a line of its own. The task goes to
+*  TASK_STATE_BLOCKED, the scheduler passes it over instead of electing it, and
+*  the deadline check in schedule() puts it back to RUNNING on the tick its time
+*  is up.
+*
+*  The loop around it is the same discipline system.h asks of every other
+*  caller: task_wait() returning 1 means "something ended your wait", not "your
+*  deadline passed", and a task can be taken out of BLOCKED from outside - a
+*  suspend and a later start does it. So the remaining time is recomputed
+*  against an absolute deadline and the wait is entered again, rather than
+*  trusting one call to have slept the whole span. Interrupts are held off
+*  around the test for the reason system.h gives: it is the condition test and
+*  the block that have to be one indivisible step.
+*
+*  TWO FALLBACKS keep the old behaviour where the new one cannot work.
+*
+*    - No task is running. disk_init() sits at the very end of the boot, behind
+*      the "sti" but in front of the console task, and a PIO driver waiting for
+*      a slow drive gets here with no task to block; so does anything the kernel
+*      does before multitasking exists. task_wait() answers such a caller with
+*      "timed out" immediately rather than halting the machine, which would turn
+*      every driver delay into no delay at all.
+*    - Interrupts are off. The caller is inside a critical section it built out
+*      of cli, and blocking would both re-enable interrupts underneath it and
+*      hand the CPU to a task that may be about to walk into the very data
+*      structure it is holding. timer_wait() is what this did before and is at
+*      least no worse: it spins, which gets nowhere with the timer masked, but
+*      it does not break anybody's invariant. It is also the exact case
+*      timer_wait() already documents its no-hlt branch for.
+*
+*  Both fall through to timer_wait(), which is now reached from nowhere else. */
+void sleep(int ms)
 {
-	timer_wait(ticks);
+	unsigned int  deadline;
+	unsigned long flags;
+	long          capped;
+	int           remaining;
+
+	if(ms <= 0)
+		return;
+
+	/* Same cap timer_wait() applies, applied here too because the deadline
+	*  below is computed before it ever reaches that function. */
+	capped = ms;
+	if(capped > TIMER_WAIT_MAX_MS)
+		capped = TIMER_WAIT_MAX_MS;
+	ms = (int) capped;
+
+	if(taskmgr_get_currpid() < 0)
+	{
+		timer_wait(ms);
+		return;
+	}
+
+	__asm__ __volatile__ ("pushfl; popl %0" : "=r" (flags) : : "memory");
+	if((flags & 0x200) == 0)
+	{
+		timer_wait(ms);
+		return;
+	}
+
+	deadline = (unsigned int) timer_get_ticks() + (unsigned int) ms;
+
+	__asm__ __volatile__ ("cli" : : : "memory");
+
+	for(;;)
+	{
+		/* Unsigned subtraction back into a signed difference: the millisecond
+		*  counter wraps, and only the difference of two snapshots stays
+		*  meaningful across the wrap. Same reason as the loop in
+		*  timer_wait(). */
+		remaining = (int) (deadline - (unsigned int) timer_get_ticks());
+		if(remaining <= 0)
+			break;
+
+		/* 0 means the deadline passed, which is the ordinary way out. */
+		if(task_wait(0, remaining) == 0)
+			break;
+	}
+
+	__asm__ __volatile__ ("pushl %0; popfl" : : "r" (flags) : "memory", "cc");
 }
 
-/* Waits for the given number of milliseconds. */
+/* Waits for the given number of milliseconds without ever giving up the CPU.
+*
+*  The primitive behind sleep()'s two fallbacks, and only reached through them:
+*  before there is a task to block, and inside a caller that is holding
+*  interrupts off. Everything with a task and with interrupts on goes through
+*  the wait in sleep() instead and leaves the processor to somebody else. */
 void timer_wait(int ticks)
 {
 	long ms;

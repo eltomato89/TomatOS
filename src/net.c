@@ -443,35 +443,37 @@ typedef char net_rxq_size_is_power_of_two
 *  an unbounded loop would be at the mercy of the wire for when it ends. */
 #define NET_DRAIN_BURST   64
 
-/* How long the drain task sleeps once the queue is empty, in milliseconds.
+/* How long the drain task waits for work before looking anyway, in
+*  milliseconds.
 *
-*  There are no wait queues in this kernel, so the task is not woken when a
-*  frame arrives: it polls. One tick is the shortest poll the 1000 Hz timer
-*  can express and it is what this uses, because the interval is pure added
-*  latency on every acknowledgement, every echo reply and every DNS answer,
-*  and one millisecond is already more than the round trip to a gateway on
-*  the same segment.
+*  The task used to poll: drain to empty, sleep a tick, look again. There were
+*  no wait queues then. Now the card's interrupt wakes it on NET_RXQ_WORK the
+*  moment a frame is published, so the ordinary path has no interval in it at
+*  all -- the drain runs when there is something to drain and does not run
+*  when there is not, which is both lower latency than one tick and cheaper
+*  than a thousand wakeups a second on a machine nobody is talking to.
 *
-*  What it costs is a wakeup per tick, and that is genuinely small: the
-*  timer interrupt happens at that rate regardless, the task's whole turn
-*  when the queue is empty is one comparison, and sleep() spends the rest of
-*  it in hlt. What the interval does NOT cost is throughput, because the
-*  task drains until the queue is empty before it sleeps at all -- only the
-*  first frame after an idle period waits, never the second and the
-*  hundredth of a burst.
+*  The bound stays regardless, and it is not belt and braces. A wake that is
+*  somehow missed -- a frame published in the window the idiom in system.h
+*  exists to close, an enqueue while the drain flag was held by another task,
+*  a bug in a future caller -- must not leave the stack dead. With a bound the
+*  worst case degrades to exactly the polling this replaced, only slower; with
+*  a wait of 0 it would degrade to a network that never comes back, and the
+*  failure would be rare and unreproducible, which is the worst kind.
 *
-*  The honest caveat, and it is the bigger half: this interval is not what
-*  decides the latency. The scheduler is round robin with a fixed slice per
-*  task and no notion of one task being more urgent than another, and a task
-*  waiting in sleep() still holds its slice to the end -- so the distance
-*  between two drains is the sum of every other runnable task's slice. With
-*  the console at 20 ticks and the status bar at 10, that is about 31 ms,
-*  and it shows: the same ping that answers in 0 ms with the protocol work
-*  in the interrupt answers in 33 ms with it in a task. That is the price of
-*  this change, it is paid to the scheduler rather than to the queue, and no
-*  sleep interval can undo it. What the interval has to do is not be the
-*  term that decides -- one tick against thirty is not. */
-#define NET_DRAIN_SLEEP_MS 1
+*  100 ms is where that trade sits. Idle it is ten wakeups a second against
+*  the thousand the old sleep cost, so the saving is real; and a missed wake
+*  delays one batch by at most a tenth of a second, which is under every
+*  retransmission timer above it -- TCP's is measured in hundreds of
+*  milliseconds, DHCP's and DNS's in seconds -- so the recovery costs latency
+*  and never a lost exchange.
+*
+*  What still does not change, and it is the bigger term: the scheduler is
+*  round robin with a fixed slice per task, so how soon a woken drain actually
+*  runs is bounded by the other runnable tasks' slices. task_wake() dropping
+*  the running task's remaining slice is what makes that a tick or two rather
+*  than the thirty milliseconds the sleeping version paid. */
+#define NET_DRAIN_WAIT_MS 100
 
 static uint8_t *rxq_buf   = 0;      /* the ring, NET_RXQ_SIZE bytes         */
 static uint8_t *rxq_frame = 0;      /* staging for one frame, behind it     */
@@ -484,6 +486,43 @@ static volatile uint32_t rxq_peak = 0;   /* irq writes                      */
 
 /* Held while a task is inside net_queue_drain(). See the note there. */
 static int rxq_draining = 0;
+
+/* --- The two channels ----------------------------------------------------
+*
+*  Two, and they must not be one. They mean opposite things and are woken by
+*  opposite ends of the queue:
+*
+*    NET_RXQ_WORK   "there are frames to process". Woken by net_receive(),
+*                   from the card's interrupt, once a record is published.
+*                   The only waiter is the drain task.
+*
+*    NET_RXQ_DONE   "frames have been processed". Woken by net_queue_drain()
+*                   after a batch, in task context, and returned to everybody
+*                   else by net_wait_channel(). The waiters are the layers
+*                   above -- ping, DHCP, DNS, TCP -- which have nothing to
+*                   look at until the parsing has happened.
+*
+*  Conflating them is the bug this pair exists to make impossible: the drain
+*  would wake itself with its own completion wake at the end of every batch,
+*  find the queue empty, block, and be woken again by the next batch it just
+*  processed -- a loop that burns a turn round the scheduler per batch and
+*  hides a missing wake from the card behind a wake that always arrives.
+*
+*  The addresses are the queue's own indices, because that is what each of the
+*  two statements is about: rxq_head moves when a frame is queued, rxq_out
+*  moves when one has been handled. Nothing is ever read through either
+*  pointer -- a channel is an identity, not a variable -- so using the indices
+*  costs nothing and adds no writer to either of them; the single writer rule
+*  above is about the values, and these are only ever addresses of. The casts
+*  are about the volatile qualifier alone. */
+#define NET_RXQ_WORK ((const void *)&rxq_head)
+#define NET_RXQ_DONE ((const void *)&rxq_out)
+
+/* One channel for the whole stack, as net.h says. */
+const void *net_wait_channel(void)
+{
+    return NET_RXQ_DONE;
+}
 
 /* The pid of the drain task, or -1. Kept so a second net_init() does not
 *  create a second drainer -- two of them would be exactly the case the
@@ -633,22 +672,59 @@ uint32_t net_rx_overrun(void)
     return stat_overrun;
 }
 
-/* The task. Drain until there is nothing left, then wait a tick.
+/* The task. Drain until there is nothing left, then block until there is.
 *
-*  Draining to empty rather than once per sleep is what keeps a burst from
-*  being paced at one frame per millisecond, which would be slower than the
+*  Draining to empty rather than once per wait is what keeps a burst from
+*  being paced at one frame per wakeup, which would be slower than the
 *  interrupt handler it replaces and would show up as a stalled download
 *  rather than as a statistic. Under a sustained flood the inner loop simply
-*  does not end and the task never sleeps -- correct, and not a hang: the
-*  timer still preempts it, and every other task keeps its share. */
+*  does not end and the task never blocks -- correct, and not a hang: the
+*  timer still preempts it, and every other task keeps its share.
+*
+*  The wait is the idiom from system.h and the condition is "the queue is not
+*  empty": head and tail are read with interrupts off, so a frame published
+*  between the test and the block cannot have its wake go nowhere, and the
+*  test is repeated after every wake and every timeout. Reading is all this
+*  does to either index -- rxq_tail is still written by this task alone inside
+*  rxq_take(), rxq_head by the interrupt alone, and the lock-free argument
+*  above is untouched.
+*
+*  THE ONE CASE THAT IS NOT A WAIT. net_queue_drain() also returns 0 when it
+*  refuses the call because another task is inside it -- sysnet_pump() drains
+*  the queue itself while a system call waits for a packet. The queue is then
+*  not empty and there is nothing to be woken BY, because the frames are
+*  already there; blocking would be waiting for an arrival that has happened
+*  and spinning would burn the slice that the other drainer needs to finish.
+*  Handing the slice on is what task_yield() is for, and the next turn round
+*  finds the work done or the flag free. */
 static void net_rx_task(void)
 {
+    uint32_t flags;
+
     for(;;)
     {
         while(net_queue_drain() > 0)
             ;
 
-        sleep(NET_DRAIN_SLEEP_MS);
+        flags = irq_save();
+
+        if(rxq_head != rxq_tail)
+        {
+            irq_restore(flags);
+            task_yield();
+            continue;
+        }
+
+        while(rxq_head == rxq_tail)
+        {
+            /* 0 is the timeout, and it is not an error here: the loop simply
+            *  looks at the queue again, which is the polling this degrades to
+            *  if a wake is ever lost. */
+            if(task_wait(NET_RXQ_WORK, NET_DRAIN_WAIT_MS) == 0)
+                break;
+        }
+
+        irq_restore(flags);
     }
 }
 
@@ -1336,6 +1412,24 @@ void net_receive(const uint8_t *frame, uint32_t len)
 
     if(used + need > rxq_peak)
         rxq_peak = used + need;
+
+    /* The frame is visible, so the drain has something to do: wake it. After
+    *  the publishing store and not before -- a drain woken while rxq_head
+    *  still names the old position would test an unchanged condition and go
+    *  straight back to sleep, which is the lost wakeup in its other form.
+    *
+    *  This is the whole of what the interrupt gains: task_wake() walks the
+    *  task table, stores states and returns. It parses nothing, sends
+    *  nothing, prints nothing and cannot switch tasks, so the boundary this
+    *  file is built around still holds -- the interrupt copies a frame, and
+    *  every byte of protocol work still happens in net_queue_drain().
+    *
+    *  Note which channel: NET_RXQ_WORK, never net_wait_channel(). A waiter up
+    *  in the stack woken here would re-test a condition that nothing has
+    *  updated yet, because the frame is queued and not yet parsed. That is
+    *  the distinction net.h draws above net_wait_channel(), and it is the
+    *  reason there are two channels at all. */
+    task_wake(NET_RXQ_WORK);
 }
 
 /* --- Receiving: the consumer ---------------------------------------------
@@ -1481,5 +1575,22 @@ int net_queue_drain(void)
     }
 
     rxq_draining = 0;
+
+    /* The batch is parsed and everything it changed -- an ARP entry, an ICMP
+    *  reply recorded, a UDP handler run, a TCP segment taken in -- is in place
+    *  before anybody is told to look. This is where the wake belongs, and it
+    *  is why it is not in net_receive(): there the frame exists, here it has
+    *  meant something.
+    *
+    *  Task context, and after the flag is dropped rather than before, so a
+    *  waiter that is woken and immediately drains the queue itself is not
+    *  turned away by a flag this call has finished with.
+    *
+    *  Only when something was handled. A drain that found the queue empty
+    *  changed nothing, so there is no condition anywhere that has become
+    *  true and nothing but the table walk to gain. */
+    if(handled > 0)
+        task_wake(NET_RXQ_DONE);
+
     return handled;
 }

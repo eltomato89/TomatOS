@@ -162,6 +162,23 @@ extern void net_receive(const uint8_t *frame, uint32_t len);
 *  preemption has to be reasoned about, not whether any does. */
 extern int net_queue_drain(void);
 
+/* The channel everything waiting for the network blocks on, for task_wait().
+*
+*  Deliberately ONE channel for the whole stack rather than one per connection
+*  or per protocol. A wake here means no more than "something arrived, look
+*  again", which is exactly what the waiting idiom in system.h already
+*  requires: the condition is re-tested after every wake, so a waiter that was
+*  not the intended recipient simply blocks again. Finer channels would buy
+*  fewer spurious wakes at the cost of every layer having to know which waiter
+*  cares about which packet -- and getting that wrong is a task that waits
+*  forever, whereas getting this wrong costs a loop.
+*
+*  net_queue_drain() wakes it after it has processed a batch, in TASK context.
+*  Waking from the card's interrupt instead would be finer grained and wrong:
+*  the frame has been queued at that point but not yet parsed, so a waiter
+*  woken then would re-test a condition that nothing has updated. */
+extern const void *net_wait_channel(void);
+
 /* What the queue is doing, for the shell to show. "used" and "peak" are in
 *  bytes; the peak is the number worth watching, because a queue that never
 *  fills is the only evidence that the drain keeps up with the wire. */

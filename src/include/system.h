@@ -35,6 +35,16 @@
 *  same way; the two differ only in what they are called and in whether an
 *  error is worth printing next to them. */
 #define TASK_STATE_EXITED 3
+
+/* Waiting for something that is not the clock: a key, a packet, a disk. The
+*  scheduler passes a blocked task over, and task_wake() puts it back to
+*  RUNNING. Distinct from SUSPENDED, which is a decision somebody made about
+*  the task from outside; this one the task made about itself and will undo
+*  itself.
+*
+*  Anything that treats RUNNING as "alive" has to count this too, and anything
+*  that treats not-RUNNING as "finished" must not. */
+#define TASK_STATE_BLOCKED 4
 #define TASK_STATE_NULL -1
 
 /* This defines what the stack looks like after an ISR was running */
@@ -190,6 +200,65 @@ extern int taskmgr_task_set_stack(int pid, uint32_t user_esp);
 *  a pid that names none. For a caller that has to wait for a task to finish
 *  rather than merely start it -- the shell running a program off the disk. */
 extern int taskmgr_task_state(int pid);
+
+/* ---------------------------------------------------------------------------
+*  Waiting and waking
+*
+*  Everything in this kernel that waits for something currently polls: it
+*  sleeps a few milliseconds, looks again, and sleeps again. That is written
+*  down as a shortcoming in five places by now -- the network system calls, the
+*  receive queue's drain task, getch(), and the ping, DHCP and DNS loops in the
+*  shell -- and it costs exactly what it looks like it costs. Moving the
+*  protocol work out of the interrupt handler took a ping's round trip from
+*  0 ms to 34 ms, and the fix at the time was to have the waiting task drain
+*  the queue itself, which works but is a workaround for the missing mechanism
+*  rather than the mechanism.
+*
+*  A CHANNEL is any address: what is waited on is identified by a pointer,
+*  usually to the thing itself -- a queue, a buffer, a connection. Nothing is
+*  ever read through it. Two waiters on the same address are woken together,
+*  and an address nobody waits on is a wake that costs a loop over the task
+*  table and does nothing.
+*
+*  THE RACE THIS MUST SURVIVE is the lost wakeup: a task tests its condition,
+*  finds it false, and before it blocks the interrupt that would have woken it
+*  arrives and wakes nobody. The task then waits for something that already
+*  happened. The idiom that avoids it is not optional and is why task_wait()
+*  takes the caller's interrupt state:
+*
+*      flags = irq_save();                        // interrupts off
+*      while(!condition)
+*          if(!task_wait(&channel, timeout_ms))
+*              break;                             // timed out
+*      irq_restore(flags);
+*
+*  Two things make that safe. The condition is tested with interrupts off, so
+*  nothing can change it between the test and the block. And it is tested
+*  AGAIN after every wake -- so a wake that arrives in the window where the
+*  task is marked blocked but has not yet stopped running is not lost, it just
+*  costs one more turn around the loop. A caller that tests once and assumes
+*  the wake means what it hoped will eventually hang, and the hang will be
+*  rare and reproducible only under load, which is the worst kind.
+*
+*  Returns 1 when woken, 0 when the timeout expired. A timeout of 0 waits
+*  forever, which is only ever right when something is guaranteed to wake it;
+*  every caller that waits on hardware should give a bound.
+*/
+extern int task_wait(const void *channel, int timeout_ms);
+
+/* Wakes everything waiting on the channel. Safe from interrupt context, and
+*  that is the normal case -- the keyboard, the card and the disk all wake
+*  from their handlers. It only changes states; the scheduler does the rest at
+*  the next tick, so nothing here can switch tasks underneath a handler. */
+extern void task_wake(const void *channel);
+
+/* Gives up the rest of the current time slice. For a task that has work left
+*  but nothing to wait for. */
+extern void task_yield(void);
+
+/* How many tasks are blocked right now, for a shell that wants to show that
+*  waiting is what they are doing rather than spinning. */
+extern int taskmgr_blocked_count(void);
 
 extern int taskmgr_get_currpid();
 extern void taskmgr_task_abort(int pid, int error_number, const char *error_descr);

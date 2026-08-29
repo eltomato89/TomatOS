@@ -94,15 +94,173 @@ static addrspace_t pending_space;
 static struct regs* task_states[MAX_TASKS];
 
 //Indexed by TASK_STATE_*. TASK_STATE_NULL is -1 and deliberately has no entry:
-//every caller filters it out first, because an unused slot is not a task with
-//a state but the absence of one.
+//every unused slot is filtered out first, because an unused slot is not a task
+//with a state but the absence of one.
+//
+//The array is indexed by a value that comes out of tasks[].state, so it has to
+//grow with every state that is added - a missing entry is not a missing word,
+//it is a read past the end of the array and a pointer made of whatever follows
+//it. TASK_STATE_BLOCKED was the fifth.
 char *readable_task_state[] =
 {
     "Running",
     "Suspended",
 	"Aborted",
-	"Exited"
+	"Exited",
+	"Blocked"
 };
+
+/* --- Waiting and waking --------------------------------------------------
+*
+*  The three arrays below are the whole of the wait state, one entry per slot,
+*  and they are only ever meaningful for a slot in TASK_STATE_BLOCKED. There is
+*  deliberately no queue: with 64 slots a wake is a walk over the table, which
+*  is a few dozen comparisons inside an interrupt handler and needs no list to
+*  be kept consistent from two contexts at once. A linked queue would be faster
+*  at a thousand tasks and is a source of dangling pointers at sixty-four.
+*
+*    wait_channel   what the task is waiting for. Any address; never read
+*                   through, only compared. 0 means "nothing" - a wait that
+*                   only its deadline can end, which is what sleep() does.
+*    wait_deadline  when the wait gives up, in milliseconds of uptime, or 0
+*                   for "never". Absolute rather than a countdown so that
+*                   nothing has to be decremented per tick per slot.
+*    wait_result    what task_wait() will return: 1 woken, 0 timed out. Set to
+*                   1 when the wait is armed, so that every way out of
+*                   TASK_STATE_BLOCKED that is not a timeout - a wake, but also
+*                   an outside taskmgr_task_start() - reports "woken" and makes
+*                   the caller re-test its condition. Guessing "timed out"
+*                   would make a caller give up on something that is about to
+*                   happen; guessing "woken" only ever costs one more turn
+*                   around the caller's loop. */
+static const void  *wait_channel[MAX_TASKS];
+static unsigned int wait_deadline[MAX_TASKS];
+static int          wait_result[MAX_TASKS];
+
+/* The earliest armed deadline, or 0 when none is armed. This is what keeps the
+*  timeout check off the per-tick bill: schedule() tests one integer, and only
+*  when that test says a deadline is actually due does anything walk the table.
+*
+*  It is a hint and is only ever wrong in the safe direction - it may name a
+*  moment EARLIER than the true earliest deadline, never a later one. A waiter
+*  that is woken normally, or killed, leaves its value behind here; the cost is
+*  one sweep of the table at that moment, and the sweep recomputes this exactly.
+*  A value that could be too late would be the other thing entirely: a timeout
+*  that never fires and a task that waits forever. */
+static unsigned int wait_deadline_next;
+
+/* Uptime in milliseconds wraps - timer_get_ticks() returns a signed int fed by
+*  a tick counter that overflows after about 25 days at 1000 Hz - and a plain
+*  "now >= then" flips its answer at the wrap, which would either fire every
+*  armed timeout at once or let none of them fire again. Comparing the
+*  DIFFERENCE against half the range instead is stable across the wrap, and is
+*  correct as long as no deadline is more than ~12 days out. sleep() caps a
+*  wait at ten minutes and every other caller is waiting on hardware, so that
+*  bound is not one anybody can reach.
+*
+*  Same reasoning as the unsigned subtraction in timer_wait(), which was
+*  written after the signed version of that loop hung on overflow. */
+static int time_reached(unsigned int now, unsigned int then)
+{
+	return (unsigned int)(now - then) < 0x80000000u;
+}
+
+/* Takes a slot out of TASK_STATE_BLOCKED. The caller sets wait_result[] first.
+*
+*  This is everything a wake does, and it is deliberately three stores: no
+*  allocation, no output, no scheduling decision, nothing that could take an
+*  unbounded amount of time. task_wake() runs in interrupt context - the
+*  keyboard, the card, the disk all wake from their handlers - and an interrupt
+*  handler that switched tasks would return onto a stack belonging to somebody
+*  else.
+*
+*  The slice is deliberately NOT touched here. A task that blocked still holds
+*  the remainder of the slice it was running on, and leaving it alone is what
+*  makes the fast path free: a wake that arrives before the next tick finds the
+*  task RUNNING again with time left, so schedule() hands it straight back and
+*  the wait costs nothing at all. A task that was blocked long enough to be
+*  descheduled had its slice refilled by schedule() on the way out. */
+static void wait_end(int slot)
+{
+	wait_channel[slot]  = 0;
+	wait_deadline[slot] = 0;
+	tasks[slot].state   = TASK_STATE_RUNNING;
+}
+
+/* Clears whatever the previous occupant of a slot was waiting for. Nothing
+*  reads these entries for a slot that is not BLOCKED, so this is hygiene
+*  rather than correctness - but a stale channel in a slot that is about to be
+*  handed to a new task is exactly the kind of leftover that turns into a wake
+*  arriving at the wrong program. */
+static void wait_forget(int slot)
+{
+	wait_channel[slot]  = 0;
+	wait_deadline[slot] = 0;
+	wait_result[slot]   = 0;
+}
+
+/* Wakes every blocked task whose deadline has passed, and recomputes the hint.
+*  Returns non-zero if it woke a task other than the current one, i.e. if the
+*  election below has a new reason to happen now rather than at the end of the
+*  running task's slice.
+*
+*  Called from schedule() and nowhere else. Putting it there rather than in
+*  timer_handler() is a deliberate choice and the cheaper of the two: both run
+*  on every tick, but schedule() is already the place that decides who runs and
+*  is already allowed to change task states, whereas a check in the timer
+*  handler would have to reach into tasks.c through an interface system.h does
+*  not declare - and it would still be a tick early or a tick late relative to
+*  the election, because timer_notify_handlers() runs before irq_handler() gets
+*  to schedule(). Here an expired task is runnable in the very tick its
+*  deadline passes.
+*
+*  What it costs: one comparison per tick while nothing has a timeout armed,
+*  which is the ordinary state of the machine. While something does, one call
+*  to timer_get_ticks() - three divisions - and one comparison per tick, and a
+*  walk over all 64 slots only on the tick a deadline actually comes due. The
+*  alternative that was rejected is the obvious one, sweeping 64 slots on every
+*  tick: correct, but 64000 comparisons a second to notice an event that
+*  happens a handful of times a second. */
+static int wait_check_timeouts(void)
+{
+	unsigned int now;
+	unsigned int earliest;
+	int          preempt;
+	int          i;
+
+	now = (unsigned int) timer_get_ticks();
+
+	if(!time_reached(now, wait_deadline_next)) return 0;
+
+	earliest = 0;
+	preempt  = 0;
+
+	for(i=0; i <= MAX_TASKS-1; i++)
+	{
+		if(tasks[i].state != TASK_STATE_BLOCKED) continue;
+		if(wait_deadline[i] == 0) continue;
+
+		if(time_reached(now, wait_deadline[i]))
+		{
+			wait_result[i] = 0;
+			wait_end(i);
+
+			if(i != current_task) preempt = 1;
+			continue;
+		}
+
+		//Still in the future, so it decides the next check. !time_reached(a,b)
+		//is "a is before b", wrap-safe in the same way.
+		if(earliest == 0 || !time_reached(wait_deadline[i], earliest))
+		{
+			earliest = wait_deadline[i];
+		}
+	}
+
+	wait_deadline_next = earliest;
+
+	return preempt;
+}
 
 //Safe copy into a fixed-size buffer: copies at most size-1 characters and always
 //terminates with '\0'. Replaces strcpy() in those places where the source comes
@@ -298,8 +456,12 @@ static uint32_t current_esp(void)
 *      failure that would follow, and refusing to free is the cheap way out.
 *
 *  Everything else is genuinely dead: an aborted task that is not the current
-*  one will never be elected again - schedule() only looks at
-*  TASK_STATE_RUNNING - so nothing will ever return onto its stack. */
+*  one will never be elected again - schedule() elects only RUNNING tasks, and
+*  the BLOCKED ones it falls back to when nothing is runnable, neither of which
+*  an aborted task is - so nothing will ever return onto its stack. A blocked
+*  task is not dead at all and never reaches this function: it is released only
+*  when its slot is recycled, and find_free_slot() does not recycle a slot that
+*  is merely waiting. */
 static int kernel_stack_in_use(uint8_t *stack)
 {
 	uint32_t base;
@@ -571,22 +733,297 @@ static struct regs* init_user_task(uint8_t* kstack, void* entry, uint32_t user_e
 }
 
 
+/* --- Proving it, rather than not seeing it -------------------------------
+*
+*  The race above fires roughly once in eighty thousand ticks on an idle
+*  machine, so "it did not happen while I watched" is not evidence of anything.
+*  Setting SCHED_DEBUG to 1 turns the two invariants this file depends on into
+*  something that reports itself the moment it is broken:
+*
+*    - every nested election that is turned away is traced, with the frame, the
+*      stack it is on, the task that owns that stack, and what the previous
+*      election decided. Seeing these appear and the machine carry on is the
+*      positive result: the condition occurs and is handled.
+*    - every frame is checked for being a frame at all just before the stub is
+*      told to restore it. That is the check that would have named this bug in
+*      one line instead of a general protection fault three tasks later.
+*
+*  Output goes to QEMU's debug console (port 0xE9), not through printf(): this
+*  runs inside the timer interrupt, where the console belongs to whoever was
+*  interrupted, and where anything that scrolls loses the record. One "out" per
+*  character, no locking, straight into a file on the host.
+*
+*  To reproduce, both halves matter -- the race needs a tick to be already
+*  pending when irq_handler() sends its EOI, so the interrupt path has to be
+*  slow relative to the tick:
+*
+*      set SCHED_DEBUG to 1
+*      set TIMER_DEFAULT_HZ in timer.c to 8000
+*      qemu-system-i386 ... -d int -D int.log -debugcon file:dbg.log
+*      then, in the shell:  hello
+*
+*  Twenty-one nested elections in one such run, every one of them interrupted
+*  at the instruction after the "out" in outportb(). With the guard removed,
+*  the same run walks a task's kernel stack downwards one interrupt frame at a
+*  time; with it, dbg.log fills up and nothing else happens. */
+#define SCHED_DEBUG 0
+
+#if SCHED_DEBUG
+#define SCHED_DEBUG_MAX 40
+
+static int sched_debug_lines;
+
+static void dbg_putc(char c)
+{
+	outportb(0xE9, (unsigned char) c);
+}
+
+static void dbg_puts(const char *t)
+{
+	while(*t) dbg_putc(*t++);
+}
+
+static void dbg_hex(uint32_t v)
+{
+	const char *digits = "0123456789abcdef";
+	int i;
+
+	dbg_puts("0x");
+	for(i = 28; i >= 0; i -= 4) dbg_putc(digits[(v >> i) & 0xF]);
+}
+
+static void dbg_dec(int v)
+{
+	char buf[12];
+	int  i = 0;
+
+	if(v < 0) { dbg_putc('-'); v = -v; }
+	if(v == 0) { dbg_putc('0'); return; }
+	while(v > 0 && i < 11) { buf[i++] = (char)('0' + (v % 10)); v /= 10; }
+	while(i > 0) dbg_putc(buf[--i]);
+}
+
+/* Does this still describe a task, or is it the memory that used to hold one?
+*  Only the selectors are worth testing: they have a tiny legal set, and they
+*  are what irq_common_stub pops straight into segment registers -- a wrong
+*  value there is precisely the general protection fault this hunts. */
+static int selector_ok(unsigned int sel, unsigned int r0, unsigned int r3)
+{
+	return sel == r0 || sel == r3;
+}
+
+static int frame_is_sane(const struct regs *f)
+{
+	if(f == 0) return 0;
+	if(((uint32_t) f & 3) != 0) return 0;
+
+	if(!selector_ok(f->ds, GDT_KERNEL_DATA, GDT_USER_DATA | GDT_RPL_USER)) return 0;
+	if(!selector_ok(f->es, GDT_KERNEL_DATA, GDT_USER_DATA | GDT_RPL_USER)) return 0;
+	if(!selector_ok(f->fs, GDT_KERNEL_DATA, GDT_USER_DATA | GDT_RPL_USER)) return 0;
+	if(!selector_ok(f->gs, GDT_KERNEL_DATA, GDT_USER_DATA | GDT_RPL_USER)) return 0;
+	if(!selector_ok(f->cs, GDT_KERNEL_CODE, GDT_USER_CODE | GDT_RPL_USER)) return 0;
+
+	/* Bit 1 of eflags reads as 1 on every x86, bits 3 and 5 as 0. */
+	if((f->eflags & 0x02) == 0) return 0;
+	if((f->eflags & 0x28) != 0) return 0;
+
+	return 1;
+}
+#endif
+
+/* --- Re-entrant elections ------------------------------------------------
+*
+*  schedule() can be entered again before the election it just made has been
+*  carried out, and the frame it is handed then belongs to a different task
+*  than the one it believes is running. Getting that wrong writes one task's
+*  saved context into another task's slot, and the machine dies later, in a
+*  place that says nothing about the cause -- so this is worth setting out in
+*  full.
+*
+*  HOW IT HAPPENS. irq_handler() ends a timer interrupt like this:
+*
+*      cli
+*      new_cpu = schedule(r);      // elects the next task, sets current_task
+*      sti                         // <- interrupts back on
+*      outportb(0x20, 0x20);       // <- EOI: the PIC may now deliver again
+*      return new_cpu;             // -> irq_common_stub: mov %eax,%esp; iret
+*
+*  Between that EOI and the stub's "mov %eax,%esp" the election has been made
+*  -- current_task already names the incoming task -- but the CPU is still
+*  running on the OUTGOING task's kernel stack. If the PIT ticked again while
+*  the handler was running, the tick is pending at the instant of the EOI and
+*  is delivered on the very next instruction. It pushes its frame onto the
+*  outgoing task's stack and calls schedule() a second time.
+*
+*  This is not theory. Under "-d int" the interrupted address in that nested
+*  frame is the instruction after the "out" in outportb() every single time --
+*  the EOI itself -- and the frame sits one interrupt frame below the outer
+*  one on the same stack.
+*
+*  WHAT GOES WRONG WITHOUT THIS. The nested call saves its frame as
+*  task_states[current_task], i.e. it files the OUTGOING task's registers under
+*  the INCOMING task's slot. The incoming task's real context is lost, and what
+*  replaces it is a pointer into a stack that its owner goes on using, so the
+*  frame is overwritten by ordinary calls. When the incoming task is next
+*  dispatched, the stub pops segment registers out of that overwritten memory:
+*  general protection fault at "pop %fs" in irq_common_stub, with a plausible
+*  gs and a data word in fs. It also runs away -- each nested election hands
+*  back the frame it just filed, so the next tick nests one interrupt frame
+*  deeper down the same stack until it reaches the guard page.
+*
+*  WHY IT SURFACED WITH BLOCKING. The window is old; what changed is how often
+*  it matters. It only bites when current_task actually changed in that window,
+*  and before there was a wait, a task kept the CPU for its whole slice, so a
+*  tick re-elected rarely. Now a task that blocks is descheduled on the very
+*  next tick, so most ticks change current_task and nearly every occurrence of
+*  the race lands on the case that corrupts.
+*
+*  THE ANSWER. An election that is already in flight must be allowed to finish.
+*  A nested call does nothing at all and hands back the frame it was given: the
+*  nested stub then returns straight to the interrupted handler, which carries
+*  on and performs its own switch with a context that is still fresh, because
+*  nothing has run in between. Saving would be wrong as well as unnecessary --
+*  the outgoing task's resume point is the OUTER frame, which the outer call
+*  already filed, not this one.
+*
+*  DETECTING IT. A frame lies on the kernel stack of the task it belongs to.
+*  So: if the frame handed in is not on current_task's stack but is on the
+*  stack of some other task that is still alive, an election is in flight and
+*  we are inside it. Live means RUNNING or BLOCKED, and the restriction is what
+*  keeps this away from the one case where a task legitimately runs on another
+*  task's stack: sys_exit() and fault_handler() switch by copying a context
+*  over their own frame, so a ring 0 task carries on for a few instructions on
+*  the stack of the task that just died -- and that task is EXITED or ABORTED,
+*  never live.
+*
+*  The cost is one range test per tick. The table walk below only runs when
+*  that test fails, which is the anomaly itself.
+*
+*  This does not repair irq_handler(). The proper fix is one line in irq.c --
+*  drop the cli/sti pair around the schedule() call, since the gate already
+*  entered with IF clear and the iret at the end of the stub restores the
+*  caller's IF anyway -- and with it the window does not exist. Until that
+*  happens, this makes the scheduler correct in spite of it. */
+
+/* Is this frame on the kernel stack of that slot? */
+static int frame_on_stack(const struct regs *cpu, int slot)
+{
+	uint32_t addr;
+	uint32_t base;
+
+	if(slot < 0 || task_kstacks[slot] == 0) return 0;
+
+	addr = (uint32_t) cpu;
+	base = (uint32_t) task_kstacks[slot];
+
+	return addr >= base && addr < base + KERNEL_STACK_SIZE;
+}
+
+/* The live task whose kernel stack this frame is on, or -1. */
+static int live_frame_owner(const struct regs *cpu)
+{
+	int i;
+
+	for(i=0; i <= MAX_TASKS-1; i++)
+	{
+		if(tasks[i].state != TASK_STATE_RUNNING
+		   && tasks[i].state != TASK_STATE_BLOCKED) continue;
+
+		if(frame_on_stack(cpu, i)) return i;
+	}
+
+	return -1;
+}
+
+/* How many nested elections have been turned away. Nothing reads it -- it
+*  exists so that the condition can be confirmed to occur, and confirmed to be
+*  handled, with a debugger or a watch expression rather than by waiting for
+*  the crash it used to cause. */
+static uint32_t sched_nested_elections;
+
 struct regs* schedule(struct regs* cpu)
 {
 	int i;
 	int slot;
 	int next;
 	int start;
+	int expired;
 	addrspace_t space;
+
+	//Is an election already in flight? See the block above schedule(): a frame
+	//that is not on the current task's stack, but is on the stack of another
+	//task that is still alive, means this call is nested inside an interrupt
+	//handler that has already elected somebody and has not yet switched to it.
+	//Do nothing and hand the frame straight back, so that handler resumes and
+	//completes its own switch.
+	//
+	//The test is inside "current_task >= 0" because before the first task
+	//exists there is no election to be nested inside, and no stack to compare
+	//against either.
+	if(current_task >= 0 && !frame_on_stack(cpu, current_task))
+	{
+		int owner = live_frame_owner(cpu);
+
+		if(owner >= 0)
+		{
+			sched_nested_elections++;
+#if SCHED_DEBUG
+			if(sched_debug_lines < SCHED_DEBUG_MAX)
+			{
+				sched_debug_lines++;
+				dbg_puts("[sched] nested election #");
+				dbg_dec((int) sched_nested_elections);
+				dbg_puts(": frame "); dbg_hex((uint32_t) cpu);
+				dbg_puts(" is on the stack of task "); dbg_dec(owner);
+				dbg_puts(" (state "); dbg_dec(tasks[owner].state);
+				dbg_puts("), current_task="); dbg_dec(current_task);
+				dbg_puts(", interrupted at "); dbg_hex(cpu->eip);
+				dbg_puts(", int_no="); dbg_hex(cpu->int_no);
+				dbg_puts("\n");
+			}
+#endif
+			return cpu;
+		}
+	}
 
 	//If a task is running, save its state.
     if (current_task >= 0) {
         task_states[current_task] = cpu;
     }
 
+	//Deadlines first, so that a task whose timeout came due this tick is
+	//runnable in time for the election a few lines down instead of a whole
+	//round of slices later. One integer comparison when nothing is armed.
+	expired = 0;
+	if(wait_deadline_next != 0) expired = wait_check_timeouts();
+
+	//A task that just became runnable again must not have to sit out the rest
+	//of somebody else's slice. Dropping the running task's remainder makes the
+	//election below happen now; it costs the interrupted task the tail of its
+	//slice and nothing more, because schedule() refills the slice of whoever it
+	//deschedules. Same reasoning as in task_wake(), and the same trade: under a
+	//storm of wakeups a compute bound task is cut back towards one tick per
+	//turn, which is slower but never starvation.
+	if(expired && current_task >= 0) tasks[current_task].cpu_time = 0;
+
 	//On the very first call current_task is still -1, so look for a task right away
 	//(no access to tasks[-1]).
-	if(current_task < 0 || tasks[current_task].cpu_time <= 0)
+	//
+	//The state test is the second half of this condition and it is what makes
+	//blocking cost a tick instead of a full slice. Marking a task
+	//TASK_STATE_BLOCKED takes it out of the running for future elections, but
+	//without this line it would keep the CPU it already has: the else branch
+	//below hands the same context straight back until cpu_time runs out, so a
+	//task that blocks in the first millisecond of a twenty millisecond slice
+	//would sit in its halt loop for the other nineteen while other tasks are
+	//ready to run. Re-electing whenever the current task is not RUNNING covers
+	//BLOCKED, SUSPENDED, ABORTED and EXITED in one test - the three "cpu_time
+	//= 0" lines further down in this file each patch one of those cases from
+	//the outside, and this is the same rule stated once, in the one place that
+	//actually makes the decision.
+	if(current_task < 0
+	   || tasks[current_task].state != TASK_STATE_RUNNING
+	   || tasks[current_task].cpu_time <= 0)
 	{
 		if(current_task >= 0)
 		{
@@ -607,7 +1044,60 @@ struct regs* schedule(struct regs* cpu)
 			}
 		}
 
-		//No runnable task found: keep using the previous context unchanged
+		//Nothing is runnable. Before giving up, look for a task that is merely
+		//BLOCKED - and elect it.
+		//
+		//That sounds like the one thing a scheduler must not do, and it is safe
+		//for a specific reason: a blocked task is not parked in some arbitrary
+		//place, it is parked inside the halt loop in task_wait(), which tests
+		//its own state before every hlt. Dispatching it puts the CPU back on
+		//that loop, it finds itself still blocked, and it halts again with
+		//interrupts on. So a blocked task is a perfectly good idle task, and it
+		//is the only idle task this kernel has.
+		//
+		//Without this the machine dies in two ways that are easy to reach.
+		//
+		//  - Everything is blocked at once - every task waiting for a key, a
+		//    packet or a deadline. The first pass finds nothing, and the plain
+		//    "return cpu" below hands back the context that was interrupted.
+		//    That is survivable while that context happens to be a blocked
+		//    task's own halt loop, which is the usual case, but it is survival
+		//    by luck rather than by construction, and it is not the case that
+		//    matters.
+		//  - The one that is not survivable: sys_exit() and the page fault
+		//    handler both get a dying task off the CPU by calling schedule()
+		//    until it returns a context different from the one they passed in,
+		//    and both print "No runnable task left - CPU HALT" and stop the
+		//    machine when it never does. A shell that waits for the program it
+		//    spawned now waits by blocking, so at the moment that program
+		//    exits the shell is very often the only other task and it is
+		//    BLOCKED. Without this pass, every single program that runs to
+		//    completion while the shell waits for it would halt the machine.
+		//
+		//The search starts at current_task rather than one past it, so a
+		//blocked task that is already the current one is picked first and no
+		//context is switched at all; that is the all-blocked idle, and it costs
+		//one table walk per tick on a CPU that is halted anyway. For a dying
+		//task the filter skips it - it is EXITED or ABORTED, not BLOCKED - so a
+		//different context comes out and the callers above get what they need.
+		if(next < 0)
+		{
+			start = current_task;
+			if(start < 0) start = 0;
+
+			for(i=0; i <= MAX_TASKS-1; i++)
+			{
+				slot = (start + i) % MAX_TASKS;
+				if(tasks[slot].state == TASK_STATE_BLOCKED && task_states[slot] != 0)
+				{
+					next = slot;
+					break;
+				}
+			}
+		}
+
+		//Not one task left that could hold a CPU: keep using the previous
+		//context unchanged. There is nothing else to hand back.
 		if(next < 0) return cpu;
 
 		//Point the TSS at the incoming task's kernel stack. From here on any
@@ -681,6 +1171,24 @@ struct regs* schedule(struct regs* cpu)
 
     cpu = task_states[current_task];
 
+#if SCHED_DEBUG
+    /* The last thing before the stub is told to restore this. Anything that
+    *  reaches here and is not a frame is a lost context, and saying so now
+    *  names the task; letting it through faults in irq_common_stub instead,
+    *  with nothing left to say which slot it came from. */
+    if(!frame_is_sane(cpu) && sched_debug_lines < SCHED_DEBUG_MAX)
+    {
+        sched_debug_lines++;
+        dbg_puts("[sched] LOST CONTEXT: task "); dbg_dec(current_task);
+        dbg_puts(" frame "); dbg_hex((uint32_t) cpu);
+        dbg_puts(" cs="); dbg_hex(cpu ? cpu->cs : 0);
+        dbg_puts(" ds="); dbg_hex(cpu ? cpu->ds : 0);
+        dbg_puts(" fs="); dbg_hex(cpu ? cpu->fs : 0);
+        dbg_puts(" eflags="); dbg_hex(cpu ? cpu->eflags : 0);
+        dbg_puts("\n");
+    }
+#endif
+
     return cpu;
 }
 
@@ -729,6 +1237,13 @@ static int find_free_slot()
 	//count: a task that exited normally is just as over as one that was
 	//aborted, and refusing to recycle it would make a machine run out of slots
 	//after 64 successful programs.
+	//
+	//TASK_STATE_BLOCKED is deliberately not in this list and must never be. A
+	//blocked task is alive - it is sitting inside task_wait() waiting for a key
+	//or a packet - and recycling its slot would hand its kernel stack, its
+	//address space and its saved context to a new program while the old one is
+	//still standing on all three. "Not RUNNING" is not "finished"; the two
+	//endings are, and they are named here one by one for that reason.
 	for(i=0; i <= MAX_TASKS-1; i++)
 	{
 		if(tasks[i].state == TASK_STATE_ABORTED) return i;
@@ -740,6 +1255,14 @@ static int find_free_slot()
 
 static void occupy_slot(int slot, const char *name, int prio)
 {
+	//The previous occupant may have been killed while it was blocked, in which
+	//case it never got to clear its own wait entry on the way out of
+	//task_wait(). Nothing reads those entries for a slot that is not BLOCKED,
+	//so this is not what keeps a wake from going astray - but a channel left
+	//behind in a slot that is being handed to a new program is exactly the kind
+	//of leftover that becomes one later.
+	wait_forget(slot);
+
 	tasks[slot].pid = slot;
 	copy_bounded(tasks[slot].name, name, sizeof(tasks[slot].name));
 	tasks[slot].priority = prio;
@@ -907,21 +1430,260 @@ void taskmgr_list_tasks()
 	}
 }
 
+//How many tasks are alive, which is what the status bar shows.
+//
+//BLOCKED counts. A task waiting for a key or a packet has not gone anywhere -
+//it will run again the moment its wake arrives - and a task counter that made
+//the number in the status bar drop every time the shell waited for a keystroke
+//would be reporting the opposite of what is happening. This is the rule
+//system.h states next to TASK_STATE_BLOCKED: anything that treats RUNNING as
+//"alive" has to count this too.
 int taskmgr_get_taskcount()
 {
 	int i;
 	int count = 0;
 	for(i=0; i <= MAX_TASKS-1; i++)
 	{
-		if(tasks[i].state != TASK_STATE_NULL)
+		if(tasks[i].state == TASK_STATE_RUNNING
+		   || tasks[i].state == TASK_STATE_BLOCKED)
 		{
-			if(tasks[i].state == TASK_STATE_RUNNING)
-			{
-				count++;
-			}
+			count++;
 		}
 	}
 	return count;
+}
+
+//How many of them are waiting rather than running, so that a shell can say so.
+int taskmgr_blocked_count(void)
+{
+	int i;
+	int count = 0;
+	for(i=0; i <= MAX_TASKS-1; i++)
+	{
+		if(tasks[i].state == TASK_STATE_BLOCKED) count++;
+	}
+	return count;
+}
+
+/* Blocks the calling task until somebody wakes the channel or the timeout
+*  runs out. 1 for a wake, 0 for a timeout. See system.h for what a channel is
+*  and for the loop every caller has to be written as; what follows is how the
+*  three hard parts of that promise are actually kept.
+*
+*  HOW THE TASK STOPS RUNNING. It marks itself blocked and then halts, in a
+*  loop, until its own state says otherwise. It does not switch tasks itself.
+*  The timer IRQ arrives within one tick, schedule() sees a current task that is
+*  no longer TASK_STATE_RUNNING and elects somebody else, and the halted task's
+*  context is saved exactly where it stands - between the hlt and the cli. Later
+*  a wake, or an expired deadline, puts the state back to RUNNING; the scheduler
+*  elects the task in the normal way, the iret lands on the instruction after
+*  the hlt, and the loop falls out.
+*
+*  The cost of that is at most one tick - one millisecond at 1000 Hz - of a CPU
+*  that is halted rather than spinning, once per block, before another task gets
+*  it. The alternative was a software interrupt vector that switches on the spot
+*  instead of at the next tick, and it is the wrong trade here: it buys back a
+*  millisecond of idle CPU in exchange for an IDT entry, an assembly stub and a
+*  second path into the scheduler that has to get the saved frame exactly right.
+*  It would also be no help at all in the case that matters most - when every
+*  task is blocked there is nothing to switch TO, and the halt loop is then not
+*  a fallback but the entire idle mechanism. The scheduler elects a blocked task
+*  when it can find nothing else precisely because this loop is safe to be
+*  dispatched into at any time: it re-tests before every hlt.
+*
+*  It is also worth being clear that "one tick" is the cost of BLOCKING, not the
+*  latency of a WAKE. A wake that arrives before the next tick finds the task
+*  still current with slice left, and the task simply carries on - the whole
+*  wait costs nothing.
+*
+*  INTERRUPTS. The caller arrives with IF clear; that is what closes the lost
+*  wakeup race, because it means nothing can change the condition between the
+*  caller's test and the state change below. But a task that is not running must
+*  have interrupts on or nothing will ever wake it, and "hlt with IF clear" is
+*  a CPU that only a reset leaves. The loop body is therefore the one form that
+*  makes that state unreachable: "sti; hlt" as a single instruction pair, which
+*  the hardware guarantees is atomic - sti holds interrupt recognition off for
+*  exactly one instruction, so no interrupt can be taken in the gap and the hlt
+*  is always entered with IF already set. The cli that follows puts the state
+*  back before the loop condition is read again, so every test of the state
+*  happens with interrupts off, exactly as the first one did.
+*
+*  The caller's flags are saved and restored around the whole thing rather than
+*  relying on that trailing cli, so a caller that did not arrive with IF clear -
+*  which is a caller with a lost-wakeup bug, but still - gets back what it had.
+*
+*  NOT FROM INTERRUPT CONTEXT. There is no current task inside a handler, only
+*  a task that was interrupted, and blocking it here would leave a half finished
+*  interrupt on its kernel stack and re-enable interrupts inside a handler that
+*  was entered with them off. There is no cheap way to detect that from here, so
+*  it is a rule rather than a check: wake from handlers, wait from tasks. */
+int task_wait(const void *channel, int timeout_ms)
+{
+	unsigned long flags;
+	unsigned int  deadline;
+	int           slot;
+	int           result;
+
+	slot = current_task;
+
+	/* No task is running: the boot path, before the console task exists, or
+	*  the kernel itself. There is nothing for the scheduler to take the CPU
+	*  away from, so blocking would be halting the machine. Reporting a timeout
+	*  is the honest answer - the caller's loop gives up and carries on, which
+	*  is what every one of these call sites did before there was a wait at
+	*  all. */
+	if(slot < 0) return 0;
+
+	/* No channel and no deadline is a wait nothing can end. It is always a
+	*  caller bug, and the symptom would be a task that never runs again and
+	*  possibly a machine with nothing left to run, so it is refused here where
+	*  it is still one wrong argument rather than a hang. */
+	if(channel == 0 && timeout_ms <= 0) return 0;
+
+	__asm__ __volatile__ ("pushfl; popl %0" : "=r" (flags) : : "memory");
+
+	wait_result[slot]   = 1;
+	wait_channel[slot]  = channel;
+	wait_deadline[slot] = 0;
+
+	if(timeout_ms > 0)
+	{
+		/* Absolute, in milliseconds of uptime, which is the unit the timeout
+		*  is given in and the unit timer_get_ticks() answers in - no
+		*  conversion, and nothing to keep in step with the tick frequency.
+		*  0 is the "no deadline" marker, so a deadline that lands exactly on
+		*  the wrap is nudged by one millisecond rather than losing its
+		*  timeout. */
+		deadline = (unsigned int) timer_get_ticks() + (unsigned int) timeout_ms;
+		if(deadline == 0) deadline = 1;
+
+		wait_deadline[slot] = deadline;
+
+		if(wait_deadline_next == 0 || !time_reached(deadline, wait_deadline_next))
+		{
+			wait_deadline_next = deadline;
+		}
+	}
+
+	tasks[slot].state = TASK_STATE_BLOCKED;
+
+	while(tasks[slot].state == TASK_STATE_BLOCKED)
+	{
+		/* The "memory" clobber is load bearing twice over: it stops the
+		*  compiler from hoisting the state read out of the loop - tasks[] is
+		*  ordinary memory written by an interrupt handler - and it keeps the
+		*  three instructions in this order. */
+		__asm__ __volatile__ ("sti; hlt; cli" : : : "memory");
+	}
+
+	result = wait_result[slot];
+
+	/* The state can leave BLOCKED without going through wait_end(): an outside
+	*  taskmgr_task_start(), or a suspend followed by a start. Clearing here as
+	*  well means no slot is ever left naming a channel it is not waiting on,
+	*  whichever way the wait ended. */
+	wait_channel[slot]  = 0;
+	wait_deadline[slot] = 0;
+
+	__asm__ __volatile__ ("pushl %0; popfl" : : "r" (flags) : "memory", "cc");
+
+	return result;
+}
+
+/* Wakes everything waiting on a channel.
+*
+*  Two waiters on the same address are both woken, and that is the intended
+*  behaviour rather than a simplification: the idiom in system.h has every
+*  waiter re-test its own condition, so waking one too many costs a turn around
+*  a loop while waking one too few costs a task that never runs again.
+*
+*  Safe from interrupt context, which is the normal case. All it does is walk
+*  the table and store states - no allocation, no printing, no scheduling, and
+*  above all no task switch, which in a handler would mean returning onto a
+*  stack that belongs to a different task than the one that was interrupted.
+*
+*  The one thing it does beyond changing states is drop the RUNNING task's
+*  remaining slice, and that is what decides how long a wake takes to arrive.
+*  Without it a task woken by a keystroke waits for the task that happens to be
+*  running to use up its slice first - up to twenty milliseconds with the
+*  console's realtime priority - and a shell that is woken twenty milliseconds
+*  after the key was pressed is exactly the latency this whole mechanism exists
+*  to remove. With it the next tick re-elects, so a wake reaches the woken task
+*  within a tick or two on a machine with a handful of tasks. It is still a
+*  round robin: with many runnable tasks in between, the bound is the sum of
+*  their slices, which is what a scheduler without priorities can promise.
+*
+*  It is one integer store, it cannot switch anything, and it is skipped when
+*  the woken task is the one already running - that task needs its slice, not
+*  a preemption. What it costs is fairness under a storm of wakeups: a compute
+*  bound task loses the tail of its slice each time and is cut back towards one
+*  tick per turn. It is never starved, because schedule() gives it a full fresh
+*  slice every time it deschedules it. */
+void task_wake(const void *channel)
+{
+	int i;
+	int preempt;
+
+	/* 0 is not an address. It is also the value sleep() blocks on - a wait with
+	*  no channel, only a deadline - so answering a null wake would wake every
+	*  sleeping task on the machine at once. */
+	if(channel == 0) return;
+
+	preempt = 0;
+
+	for(i=0; i <= MAX_TASKS-1; i++)
+	{
+		if(tasks[i].state != TASK_STATE_BLOCKED) continue;
+		if(wait_channel[i] != channel) continue;
+
+		wait_result[i] = 1;
+		wait_end(i);
+
+		if(i != current_task) preempt = 1;
+	}
+
+	if(preempt && current_task >= 0) tasks[current_task].cpu_time = 0;
+}
+
+/* Gives up the rest of the current time slice.
+*
+*  For a task that has work left but nothing to wait for, so there is no state
+*  to change and nothing to be woken by: it drops its slice and halts until the
+*  tick that hands the CPU on. The loop is there because hlt returns on ANY
+*  interrupt - a keystroke, a packet - and only the timer runs the scheduler, so
+*  a yield that stopped at the first interrupt would often not have yielded at
+*  all. Waiting for the millisecond counter to move is waiting for exactly the
+*  interrupt that matters.
+*
+*  Costs at most one tick even when nothing else wants the CPU: with no other
+*  runnable task the scheduler re-elects this one on that tick and the loop
+*  falls out immediately.
+*
+*  The flags are saved and restored for the same reason as in task_wait() -
+*  interrupts have to be on across the hlt, and a caller that had them off is
+*  entitled to have them off again on return. */
+void task_yield(void)
+{
+	unsigned long flags;
+	int           start;
+	int           slot;
+
+	slot = current_task;
+	if(slot < 0) return;
+
+	__asm__ __volatile__ ("pushfl; popl %0" : "=r" (flags) : : "memory");
+
+	tasks[slot].cpu_time = 0;
+
+	start = timer_get_ticks();
+
+	do
+	{
+		__asm__ __volatile__ ("sti; hlt" : : : "memory");
+	}
+	while(timer_get_ticks() == start);
+
+	__asm__ __volatile__ ("pushl %0; popfl" : : "r" (flags) : "memory", "cc");
 }
 
 int taskmgr_get_currpid()

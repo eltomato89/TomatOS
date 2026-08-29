@@ -478,12 +478,17 @@ extern char usertext_end[];
 #define NET_ARP_TRIES    50
 #define NET_ARP_WAIT     20   /* ms between two attempts -> 1000 ms total */
 
-/* One request, and how long its reply may take. Polled in 10 ms steps
-*  because icmp_last_reply() is a mailbox the interrupt writes into, not
-*  something that can be waited on. */
+/* One request, and how long its reply may take.
+*
+*  icmp_last_reply() is a mailbox that the stack writes into, so it is looked
+*  at rather than waited on -- but the wait between two looks is now a real
+*  wait on the network, and NET_PING_POLL is the longest ONE of them may last
+*  rather than the interval between two. A reply that is parsed wakes the task
+*  and is read at once; the bound is what catches a wake that was missed, and
+*  ten milliseconds keeps that miss invisible in a measurement. */
 #define NET_PING_COUNT    4   /* echo requests per run                    */
 #define NET_PING_WAIT  1000   /* ms to wait for one reply                 */
-#define NET_PING_POLL    10   /* ms between two looks at the mailbox      */
+#define NET_PING_POLL    10   /* ms one wait for the mailbox may last     */
 #define NET_PING_GAP    300   /* ms between two requests, as ping does    */
 
 /* The identifier carried in every echo this shell sends, so a reply meant
@@ -499,10 +504,11 @@ extern char usertext_end[];
 /* --- dhcp ----------------------------------------------------------------
 *
 *  The same shape as ping, for the same reason: dhcp_start() only puts the
-*  first message on the wire, and every answer after that arrives in an
-*  interrupt while this task sleeps. So the command is a loop that sleeps,
-*  calls dhcp_poll() -- which is the only thing that resends a message
-*  nobody answered -- and watches dhcp_state() move.
+*  first message on the wire, and every answer after that is parsed while this
+*  task waits. So the command is a loop that drains the queue, calls
+*  dhcp_poll() -- which is the only thing that resends a message nobody
+*  answered -- watches dhcp_state() move, and then blocks on the network until
+*  the next message has been processed or the interval below is up.
 *
 *  The upper limit is this shell's, not the client's. dhcp_poll() gives up on
 *  its own once its attempts are used up, and that is the failure worth
@@ -513,11 +519,16 @@ extern char usertext_end[];
 *  it is a backstop and not a second, competing deadline that would take the
 *  reason away from the answer.
 *
-*  50 ms between two looks is fine even though a virtual network answers far
-*  faster than that: the states are ordered, so a poll that finds two of them
-*  crossed at once can still print both -- see net_dhcp_run(). */
+*  DHCP_POLL is the longest ONE wait may last, not the interval between two
+*  looks: a message that is parsed wakes the loop and the state is read at
+*  once. The bound stays because nothing wakes a retransmission -- dhcp_poll()
+*  resends a message nobody answered, and "nobody answered" is precisely the
+*  case in which no wake will ever come. It also still has to be a length at
+*  which two steps can be crossed inside one wait, because the states are
+*  ordered and a look that finds two of them crossed prints both -- see
+*  net_dhcp_run(). */
 #define DHCP_WAIT     25000   /* ms before the shell stops waiting        */
-#define DHCP_POLL        50   /* ms between two calls to dhcp_poll()      */
+#define DHCP_POLL        50   /* ms one wait for a message may last       */
 
 /* A lease of 0xFFFFFFFF seconds is the protocol's way of writing "forever",
 *  not a duration of 136 years, and printing it as one would be silly. */
@@ -533,10 +544,10 @@ extern char usertext_end[];
 *
 *  The third command in this file that watches a state machine somebody else
 *  drives, and the shape is the one "dhcp" established: dns_resolve() puts a
-*  query on the wire and returns, the answer arrives in the card's interrupt
-*  while this task sleeps, so the command is a loop that sleeps, calls
-*  dns_poll() -- the only thing that resends and the only thing that ever
-*  gives up -- and watches dns_state().
+*  query on the wire and returns, the answer is parsed while this task waits,
+*  so the command is a loop that drains the queue, calls dns_poll() -- the
+*  only thing that resends and the only thing that ever gives up -- watches
+*  dns_state(), and blocks on the network in between.
 *
 *  Unlike DHCP there are no steps worth printing: one query, one answer, and
 *  the states in between say nothing a user could act on. So the loop is
@@ -547,9 +558,14 @@ extern char usertext_end[];
 *  is the failure worth reporting because it knows why; this limit exists so
 *  that a resolver which never concludes cannot hang the shell, and it is set
 *  well above any retransmission schedule a resolver could plausibly run so
-*  that it is a backstop rather than a second, competing deadline. */
+*  that it is a backstop rather than a second, competing deadline.
+*
+*  DNS_POLL, like DHCP_POLL, is the longest one wait may last rather than the
+*  interval between two looks: the answer wakes the loop. The bound stays for
+*  the same reason -- dns_poll() is what retransmits, and a query that needs
+*  retransmitting is one nothing answered, so no wake is coming. */
 #define DNS_WAIT      15000   /* ms before the shell stops waiting        */
-#define DNS_POLL         50   /* ms between two calls to dns_poll()       */
+#define DNS_POLL         50   /* ms one wait for the answer may last      */
 
 /* As long a name as can be typed. prmv() hands back at most 100 bytes, so a
 *  longer one cannot reach these commands however long DNS_NAME_MAX is. */
@@ -734,6 +750,9 @@ static uint16_t net_pci_io_base(const pci_device *dev);
 static void net_show_pci(void);
 static void net_show_interface(void);
 static void net_show_arp(void);
+static unsigned long net_irq_save(void);
+static void net_irq_restore(unsigned long flags);
+static void net_wait_turn(uint32_t seen, int timeout_ms);
 static int  net_ping_once(uint32_t dst, uint16_t sequence, uint32_t *from);
 static void net_ping(uint32_t dst, const char *name);
 
@@ -3103,6 +3122,23 @@ static const char *run_arguments(char *cmd)
 *  loop here would work -- the timer preempts -- but would burn every slice
 *  the scheduler hands the shell on asking the same question again.
 *
+*  THIS ONE IS NOT CONVERTED to the wait in system.h, and the reason is that
+*  there is nothing to wait ON. A channel is only worth blocking on if
+*  something wakes it, and a task that ends wakes nothing: taskmgr_task_exit()
+*  and taskmgr_task_abort() change a state and no more, and no address that
+*  stands for "this pid finished" is exported. Blocking on an address nobody
+*  ever wakes is sleep() with a longer name and a false promise in it -- every
+*  wait would run to its timeout, the loop would poll exactly as it does now,
+*  and the next reader would have to work out that the wake is imaginary.
+*
+*  What it would take is one line in tasks.c: those two functions waking a
+*  channel that stands for the slot, and system.h saying which address that
+*  is. Then this becomes the same three lines the network loops use, with
+*  RUN_POLL_MS as the backstop rather than as the interval. Until then the
+*  poll is the honest version, and at 10 ms against a 30 second bound it is
+*  three thousand looks at one integer, which is not what makes this machine
+*  slow.
+*
 *  A program that never ends is the case worth deciding rather than
 *  discovering. The shell stops waiting after RUN_WAIT_MS and says so; the
 *  program is left running and can be looked at with "ps" and stopped with
@@ -5420,6 +5456,114 @@ static void net_show_arp(void)
 	printf("  %i of %i cache entries in use.\n", shown, ARP_CACHE_SIZE);
 }
 
+/* --- waiting for the network --------------------------------------------- */
+
+/* Interrupts off, and back to what the caller had.
+*
+*  The wait in system.h only closes the lost wakeup race if the condition is
+*  tested with interrupts already off, so every task_wait() below is wrapped in
+*  these two. net.c, kb.c and syscall.c each have a pair and every one of them
+*  is static to its file; there is no global one, and six lines of inline
+*  assembly are cheaper than a new cross-file interface for them.
+*
+*  pushfl before cli, so a caller that already held interrupts off gets them
+*  back off and one that did not gets them back on. */
+static unsigned long net_irq_save(void)
+{
+	unsigned long flags;
+
+	__asm__ __volatile__ ("pushfl; popl %0; cli" : "=r" (flags) : : "memory");
+	return flags;
+}
+
+static void net_irq_restore(unsigned long flags)
+{
+	__asm__ __volatile__ ("pushl %0; popfl" : : "r" (flags) : "memory", "cc");
+}
+
+/* The end of one turn of the three loops below: block until the stack has
+*  processed something, or until the turn's own interval is up.
+*
+*  This is what the sleep at the end of each of those loops became. Every one
+*  of them is written the same way and has to stay that way:
+*
+*      net_queue_drain();           -- take what arrived out of the queue
+*      seen = net_rx_packets();     -- what the card had taken in by now
+*      test the condition           -- against what the drain just parsed
+*      net_wait_turn(seen, ms)      -- and block until there is more
+*
+*  THE DRAIN COMES FIRST and the test comes second, which is the one thing the
+*  old comments here got exactly right and the wait must not undo: the answer
+*  arrives while this task is blocked, so draining after the test would leave
+*  it in the queue for another whole interval. Nothing about waking changes
+*  that -- a wake means "a frame has been processed", so the very first thing
+*  to do on the way round is look at what came of it.
+*
+*  WHY THERE IS STILL A TIMEOUT. A wake tells a task that something arrived and
+*  nothing else. It cannot tell it that dhcp_poll() is due to resend a DISCOVER
+*  nobody answered, or that dns_poll() has a query to retransmit -- those fall
+*  due precisely when nothing arrives, so nothing will ever wake them. The
+*  bound is therefore the interval at which the loop's own poll runs, unchanged
+*  from the sleep it replaces, and it is what keeps a silent network from
+*  turning these loops into a wait with no retries in it. What the wake buys is
+*  the other end: a reply that lands a millisecond after a look is acted on at
+*  once instead of at the end of the interval. Polls happen at least as often
+*  as before and usually more often, which is the direction that cannot break a
+*  timer.
+*
+*  SEEN IS WHAT CLOSES THE LOST WAKEUP, and it is why this takes a count
+*  rather than only an interval. The wake is sent by whoever drains the queue,
+*  and that can be the dedicated drain task -- so it can arrive in the window
+*  between this task's test and its block, find this task RUNNING rather than
+*  BLOCKED, and wake nobody. The condition has then already come true and the
+*  wait sits out its whole interval regardless. That is not a hang, but it is
+*  not rare either: it is what happens every time a network answers faster
+*  than this task can get from its drain to its block, which on this one is
+*  most of the time. It was measured at a whole interval on the first lookup
+*  after an ARP entry expires, where the reply comes back in fifty
+*  MICROseconds.
+*
+*  net_rx_packets() closes it because the card's interrupt increments that
+*  counter before anything is parsed. The caller reads it immediately after
+*  its drain; if it has moved by the time interrupts are off here, a frame
+*  came in during the turn and this task must look again rather than wait for
+*  a wake that has already been spent. The test is made with interrupts off
+*  and the counter is only ever written from the interrupt, so there is no
+*  window left between the test and the block -- which is exactly what
+*  system.h asks of every caller, with net_rx_packets() standing in for a
+*  condition this function cannot see.
+*
+*  It cannot spin: a turn that skips the wait has a frame to show for it, and
+*  the caller drains and re-tests before it comes back. What it costs on a
+*  busy segment is one extra turn per frame that was not ours, which is two
+*  cheap calls, and the wake would have cost that anyway.
+*
+*  A missed wake would still cost only one interval, because the timeout ends
+*  the wait and the loop tests again. That is the backstop, not the mechanism.
+*
+*  NO TASK TO BLOCK means task_wait() reports a timeout at once and the loop
+*  would spin, so that case keeps the sleep. It should not happen -- the shell
+*  is a task -- and one comparison makes sure of it. */
+static void net_wait_turn(uint32_t seen, int timeout_ms)
+{
+	unsigned long flags;
+
+	if(timeout_ms <= 0) return;
+
+	if(taskmgr_get_currpid() < 0)
+	{
+		sleep(timeout_ms);
+		return;
+	}
+
+	flags = net_irq_save();
+
+	if(net_rx_packets() == seen)
+		task_wait(net_wait_channel(), timeout_ms);
+
+	net_irq_restore(flags);
+}
+
 /* --- ping ---------------------------------------------------------------- */
 
 /* Sequence numbers are handed out from here and never handed out twice for
@@ -5449,19 +5593,20 @@ static uint16_t net_next_sequence = 1;
 *     milliseconds apart, one second in total, and it usually succeeds on the
 *     second attempt.
 *
-*  2. The reply is not returned by anything. It arrives in interrupt context
-*     while this task sleeps and is left in icmp_last_reply(), which is
-*     therefore polled -- and matched on both the identifier and the sequence
-*     number that were sent, so that neither somebody else's ping nor an old
-*     reply of our own is counted as an answer to this request. */
+*  2. The reply is not returned by anything. It is parsed while this task is
+*     blocked and left in icmp_last_reply(), which is therefore read after
+*     every wake -- and matched on both the identifier and the sequence number
+*     that were sent, so that neither somebody else's ping nor an old reply of
+*     our own is counted as an answer to this request. */
 static int net_ping_once(uint32_t dst, uint16_t sequence, uint32_t *from)
 {
 	uint32_t reply_from;
+	uint32_t seen;
 	uint16_t reply_id;
 	uint16_t reply_sequence;
 	int start;
-	int waited;
 	int elapsed;
+	int remaining;
 	int tries;
 	int rc;
 
@@ -5477,6 +5622,17 @@ static int net_ping_once(uint32_t dst, uint16_t sequence, uint32_t *from)
 
 	rc = icmp_send_echo(dst, NET_PING_ID, sequence);
 
+	/* The ARP retries keep their fixed sleep, and that is a decision rather
+	*  than an omission. Every turn of this loop puts a packet on the wire, so
+	*  the sleep is not only a wait, it is what spaces the attempts out -- and
+	*  a wake means "some frame was processed", not "the ARP reply arrived".
+	*  On a segment with other traffic on it, waking here would spend all
+	*  NET_ARP_TRIES attempts on somebody else's frames within a few
+	*  milliseconds and report a destination as unresolved that had simply not
+	*  answered yet. The whole of what waking could save is the tail of one
+	*  twenty millisecond sleep, once per run, against a retry schedule that
+	*  would no longer be a schedule. The wait below is where the interval
+	*  actually costs something. */
 	for(tries = 0; rc != 0 && tries < NET_ARP_TRIES; tries++)
 	{
 		if(tries == 0)
@@ -5495,19 +5651,31 @@ static int net_ping_once(uint32_t dst, uint16_t sequence, uint32_t *from)
 
 	start = timer_get_ticks();
 
-	for(waited = 0; waited < NET_PING_WAIT; waited += NET_PING_POLL)
+	/* The bound is read off the clock rather than added up from the waits,
+	*  and that is what the wait below made necessary. A turn that is cut
+	*  short by a reply is no longer NET_PING_POLL long, so counting turns
+	*  would end the wait after a thousand of them however little time they
+	*  took -- NET_PING_WAIT would stop meaning a second and start meaning
+	*  whatever the traffic made of it. run_wait() reads its deadline off the
+	*  clock for the same reason. */
+	for(;;)
 	{
 		/* Take the frame out of the receive queue ourselves, and do it
 		*  BEFORE looking at the mailbox rather than after -- the reply
-		*  arrives during the sleep at the end of the loop, so draining
-		*  afterwards would leave it sitting there for one more round and
-		*  add a whole poll interval to every measurement.
+		*  arrives while this task is blocked at the end of the loop, so
+		*  draining afterwards would leave it sitting there for one more
+		*  round and add a whole interval to every measurement. Waking
+		*  changes nothing about that order: a wake says a frame was
+		*  processed, so looking at what came of it is the first thing to do.
 		*
 		*  The drain task would get to it a full trip round the scheduler
 		*  later, and a ping that reports the scheduler instead of the
 		*  network is worthless. net_queue_drain() refuses re-entry, so
 		*  doing it here alongside that task is safe. */
 		net_queue_drain();
+
+		/* Read after the drain and before the mailbox: see net_wait_turn(). */
+		seen = net_rx_packets();
 
 		if(icmp_last_reply(&reply_from, &reply_id, &reply_sequence)
 		   && reply_id == (uint16_t)NET_PING_ID
@@ -5523,7 +5691,16 @@ static int net_ping_once(uint32_t dst, uint16_t sequence, uint32_t *from)
 			return elapsed;
 		}
 
-		sleep(NET_PING_POLL);
+		elapsed = timer_get_ticks() - start;
+		if(elapsed < 0 || elapsed >= NET_PING_WAIT) break;
+
+		/* Never past the deadline: the last wait of a run that is about to
+		*  give up is however much of the second is left, not a whole
+		*  interval more. */
+		remaining = NET_PING_WAIT - elapsed;
+		if(remaining > NET_PING_POLL) remaining = NET_PING_POLL;
+
+		net_wait_turn(seen, remaining);
 	}
 
 	return NET_PING_LOST;
@@ -5790,11 +5967,11 @@ static void net_dhcp_show_lease(void)
 
 /* "dhcp": the four message exchange, watched from the outside.
 *
-*  Built like net_ping_once() and for the same reason -- nothing here can
-*  wait on a packet, because every answer arrives in interrupt context while
-*  this task sleeps. So the loop sleeps, calls dhcp_poll() (the only thing
-*  that resends a message nobody answered, and the only thing that ever gives
-*  up) and watches dhcp_state().
+*  Built like net_ping_once() and for the same reason -- nothing here parses a
+*  packet, because that happens in the drain while this task waits. So the
+*  loop drains the queue, calls dhcp_poll() (the only thing that resends a
+*  message nobody answered, and the only thing that ever gives up), watches
+*  dhcp_state(), and blocks on the network in between.
 *
 *  The state IS the progress report: each of the four messages moves it, so
 *  printing every change shows the exchange happening. A spinner would show
@@ -5803,10 +5980,12 @@ static void net_dhcp_show_lease(void)
 static void net_dhcp_run(void)
 {
 	uint32_t leased;
+	uint32_t seen;
 	const char *reason;
 	int state;
 	int shown;
-	int waited;
+	int elapsed;
+	int remaining;
 	int start;
 
 	printf("DHCP on eth0: asking the network for an address.\n");
@@ -5823,28 +6002,62 @@ static void net_dhcp_run(void)
 	shown = DHCP_STATE_IDLE;
 	state = DHCP_STATE_IDLE;
 
-	for(waited = 0; waited < DHCP_WAIT; waited += DHCP_POLL)
+	/* Read off the clock rather than added up from the waits, because a wait
+	*  that a reply cuts short is no longer DHCP_POLL long -- see the same
+	*  argument in net_ping_once(). */
+	for(;;)
 	{
+		/* The OFFER and the ACK are in the queue, and taking them out has to
+		   happen BEFORE dhcp_poll() is asked where the exchange has got to,
+		   not after. Draining afterwards -- which is what this loop did --
+		   means the state the drain produced is not looked at until the next
+		   turn, so every message of the four cost a whole interval that was
+		   not the network's. */
+		net_queue_drain();
+
+		/* Read after the drain and before the state is asked for: see
+		   net_wait_turn(). */
+		seen = net_rx_packets();
+
 		state = dhcp_poll();
 
 		if(state == DHCP_STATE_FAILED) break;
 
 		/* The states before BOUND are numbered in the order they happen in,
 		   which is what makes this loop safe at 50 ms: on a virtual network
-		   the OFFER and the ACK can both arrive inside one sleep, and the
+		   the OFFER and the ACK can both arrive inside one wait, and the
 		   client would then be found two steps further on than it was left.
 		   Printing only where it is now would silently drop a step that did
 		   happen, so every step in between is printed as well. */
-		while(shown < state)
+		if(shown < state)
 		{
-			shown++;
-			net_dhcp_step(shown);
+			while(shown < state)
+			{
+				shown++;
+				net_dhcp_step(shown);
+			}
+
+			/* Printing three lines to a console that may have to scroll takes
+			   milliseconds, and milliseconds are several timer ticks: the
+			   drain task can process the next message inside them and wake
+			   nobody, because this task is running rather than blocked. So
+			   the exchange is looked at again before this turn commits to a
+			   wait, instead of blocking on a state that has already moved.
+			   Measured, this was worth a whole DHCP_POLL on a network that
+			   answers a rebind in a tenth of a millisecond -- 54 ms to bind
+			   against 5 -- and it costs one extra turn per step printed. */
+			if(state != DHCP_STATE_BOUND) continue;
 		}
 
 		if(state == DHCP_STATE_BOUND) break;
 
-		net_queue_drain();     /* the OFFER and the ACK are in there */
-		sleep(DHCP_POLL);
+		elapsed = timer_get_ticks() - start;
+		if(elapsed < 0 || elapsed >= DHCP_WAIT) break;
+
+		remaining = DHCP_WAIT - elapsed;
+		if(remaining > DHCP_POLL) remaining = DHCP_POLL;
+
+		net_wait_turn(seen, remaining);
 	}
 
 	if(state == DHCP_STATE_BOUND)
@@ -5953,8 +6166,10 @@ static void net_dns_explain_error(void)
 static int net_dns_resolve(const char *what, const char *name,
                            net_dns_answer *answer)
 {
+	uint32_t seen;
 	int state;
-	int waited;
+	int elapsed;
+	int remaining;
 	int start;
 
 	answer->ip = 0;
@@ -5972,14 +6187,32 @@ static int net_dns_resolve(const char *what, const char *name,
 	start = timer_get_ticks();
 	state = DNS_STATE_QUERY;
 
-	for(waited = 0; waited < DNS_WAIT; waited += DNS_POLL)
+	/* Read off the clock rather than added up from the waits: a wait the
+	*  answer cuts short is not DNS_POLL long -- see net_ping_once(). */
+	for(;;)
 	{
+		/* The answer is in the queue, and it is taken out BEFORE dns_poll()
+		   is asked what became of the query rather than after. The other
+		   order -- which is what this loop did -- leaves the state the drain
+		   produced unread until the next turn, and every lookup on a network
+		   that answers instantly then costs an interval it did not need. */
+		net_queue_drain();
+
+		/* Read after the drain and before the state is asked for: see
+		   net_wait_turn(). */
+		seen = net_rx_packets();
+
 		state = dns_poll();
 
 		if(state == DNS_STATE_DONE || state == DNS_STATE_FAILED) break;
 
-		net_queue_drain();     /* the answer is in there */
-		sleep(DNS_POLL);
+		elapsed = timer_get_ticks() - start;
+		if(elapsed < 0 || elapsed >= DNS_WAIT) break;
+
+		remaining = DNS_WAIT - elapsed;
+		if(remaining > DNS_POLL) remaining = DNS_POLL;
+
+		net_wait_turn(seen, remaining);
 	}
 
 	if(state == DNS_STATE_DONE)
