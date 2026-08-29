@@ -12,6 +12,7 @@
 #include <fat.h>
 #include <vga.h>
 #include <fbcon.h>
+#include <fbdraw.h>
 #include <multiboot.h>
 #include <pci.h>
 #include <rtl8139.h>
@@ -336,8 +337,28 @@ extern char usertext_end[];
 #define GFX_TOMATO_CY    80
 #define GFX_TOMATO_R     34
 
-/* Size of the title, in whole font pixels per glyph pixel. */
+/* Size of the title, in whole font pixels per glyph pixel. On a framebuffer
+*  it is multiplied by the same unit every other weight in the picture is,
+*  see gfx_unit. */
 #define GFX_TITLE_SCALE  3
+
+/* What the line under the title says the mode offers. Mode 13h has 256
+*  colours out of its DAC; the framebuffer has no palette and prints its
+*  depth instead, so this number is only ever used on the one path. */
+#define GFX_VGA_COLOURS  256
+
+/* The buffer gfx_mode_text() builds into. "1024x768x32" and its terminator
+*  are twelve bytes; the rest is headroom, because the two numbers come from
+*  the surface at runtime and a stack buffer sized to exactly the mode that
+*  happens to be on the screen is a buffer sized to today's boot. */
+#define GFX_MODE_TEXT    24
+
+/* gfx_enter() returns this rather than a vga_set_mode() code when the console
+*  is on a framebuffer that fbdraw reports no surface for. It is not an error
+*  from the mode switch -- there is no mode switch on that path, and taking
+*  one would be the mistake -- so it must not be mistaken for one: -1 is what
+*  vga_set_mode() itself returns for a mode it does not know. */
+#define GFX_NO_SURFACE   (-2)
 
 /* --- the graphics self-test --------------------------------------------- */
 
@@ -362,6 +383,27 @@ extern char usertext_end[];
 #define GFX_CLIP_X       (-40)
 #define GFX_CLIP_W       100
 #define GFX_CLIP_COLOUR  100
+
+/* The colours the framebuffer half of the self-test paints its three test
+*  indices with, and a fourth it recolours one of them to afterwards.
+*
+*  Full eight bit channels, because fbdraw_palette() takes 0..255 where the
+*  DAC takes 0..63 -- see gfx_palette(). They are far apart so that a
+*  mistranslated entry cannot pass by accident, and none of them is a grey,
+*  so the last check can tell a repainted console from a framebuffer that
+*  still holds the test picture. */
+#define GFX_FB_TEST_R    0x20
+#define GFX_FB_TEST_G    0xA0
+#define GFX_FB_TEST_B    0xF0
+#define GFX_FB_GUARD_R   0xF0
+#define GFX_FB_GUARD_G   0x10
+#define GFX_FB_GUARD_B   0x30
+#define GFX_FB_CLIP_R    0x10
+#define GFX_FB_CLIP_G    0xE0
+#define GFX_FB_CLIP_B    0x40
+#define GFX_FB_OTHER_R   0xC0
+#define GFX_FB_OTHER_G   0xC0
+#define GFX_FB_OTHER_B   0x10
 
 /* The text screen is 80 by 25 cells of one character plus one attribute. */
 #define GFX_TEXT_CELLS   (80 * 25)
@@ -645,16 +687,33 @@ static void gfx_statusbar_hold(void);
 static void gfx_statusbar_release(void);
 static void gfx_text_store(void);
 static void gfx_text_recall(void);
+static void gfx_pick_surface(void);
 static int  gfx_enter(void);
 static int  gfx_leave(void);
+static int  gfx_sx(int value);
+static int  gfx_sy(int value);
+static int  gfx_fit_scale(int chars, int width, int most);
+static void gfx_palette(uint8_t index, uint8_t r, uint8_t g, uint8_t b);
 static void gfx_setup_palette(void);
 static void gfx_char_scaled(int x, int y, char c, int scale, uint8_t colour);
 static void gfx_string_scaled(int x, int y, const char *s, int scale,
                               uint8_t colour);
-static void gfx_string_centred(int cx, int y, const char *s, uint8_t colour);
-static void gfx_panel(int x, const char *label);
+static void gfx_text(int x, int y, const char *s, int scale, uint8_t colour);
+static void gfx_text_centred(int cx, int y, const char *s, int scale,
+                             uint8_t colour);
+static void gfx_text_clamped(int x, int y, const char *s, int scale,
+                             int right, uint8_t colour);
+static void gfx_frame(int x, int y, int w, int h, int thick, uint8_t colour);
+static void gfx_thick_line(int x0, int y0, int x1, int y1, int thick,
+                           uint8_t colour);
+static void gfx_ring(int cx, int cy, int radius, int thick, uint8_t colour);
+static void gfx_mode_text(char *out);
+static void gfx_panel(int x, const char *label, int scale);
 static void gfx_draw_picture(void);
 static void gfx_show(void);
+static uint32_t gfx_fb_read(int x, int y);
+static void gfx_selftest_vga(void);
+static void gfx_selftest_fb(void);
 static void gfx_selftest(void);
 static void gfx_check(int ok);
 static const char *gfx_mode_kind(void);
@@ -3165,38 +3224,110 @@ static void run_program(const char *word, char *cmd)
 
 /* --- gfx ----------------------------------------------------------------
 *
-*  What leaving text mode really costs, and how the two halves of this
-*  section pay for it.
+*  Two surfaces, one picture.
 *
-*  1. The video RAM is one memory. In mode 13h the framebuffer at 0xA0000 is
-*     chained across all four planes, so the first eight thousand pixels of
-*     the picture land on exactly the bytes that hold the characters and the
-*     attributes of the 80x25 screen. Drawing anything at all therefore
-*     destroys the console. vga_set_mode() saves and restores the font (see
-*     the header), which is a different plane and a different problem; the
-*     visible text is this file's to keep, so gfx_text_store() takes a copy of
-*     the 2000 cells before the switch and gfx_text_recall() writes it back
-*     after the way home. That is what makes the shell come back with its
-*     scrollback rather than with the rubble of the picture.
+*  A machine that booted into text mode has no graphics mode until this
+*  command makes one: vga_set_mode() programs the registers, 320x200x256
+*  appears, and it goes away again afterwards. A machine that booted with
+*  "make run-bootdisk" is already in a graphics mode -- a 1024x768 linear
+*  framebuffer our own stage 2 negotiated -- and that one must NOT be
+*  switched to mode 13h. VBE is a real mode BIOS interface, so the switch
+*  would be one way: nothing in protected mode can put 1024x768 back. See
+*  the header comment of fbdraw.h, which is the contract for drawing into
+*  the framebuffer that is already there.
 *
-*  2. The status bar task keeps running. It writes 80 cells into 0xB8000
-*     every ten ticks, and 0xB8000 is not part of the framebuffer: mode 13h
-*     leaves the graphics controller's memory map at "0xA0000, 64 KiB", so
-*     the hardware discards those writes outright. The picture is safe from
-*     the bar even if nothing is done about it -- but the bar is not safe
-*     from the picture: its output during that window is simply lost, and
-*     the moment the memory map were ever set to the 128 KiB window instead,
-*     the same writes would land in video RAM behind the visible page. The
-*     task is therefore suspended for the duration and started again
-*     afterwards; it repaints itself within ten ticks on its own.
+*  So the command asks fbcon_active() which machine it is on and paints
+*  through the matching surface. Everything below the surface -- the layout,
+*  the palette, every shape of the picture -- exists once.
 *
-*  3. The same trap catches printf(). Anything printed between the two mode
-*     switches goes to 0xB8000, is thrown away by the hardware, and still
-*     advances the console cursor and scrolls the screen the copy in
-*     gfx_text_page[] no longer matches. So neither half of this section
-*     prints a single character while the picture is up: the self-test
-*     collects its results in local variables and reports them once the mode
-*     is back. */
+*  What leaving the console costs, and how this section pays for it.
+*
+*  1. Mode 13h destroys the console. The video RAM is one memory: the
+*     framebuffer at 0xA0000 is chained across all four planes, so the first
+*     eight thousand pixels of the picture land on exactly the bytes that
+*     hold the characters and the attributes of the 80x25 screen.
+*     vga_set_mode() saves and restores the font (see vga.h), which is a
+*     different plane and a different problem; the visible text is this
+*     file's to keep, so gfx_text_store() takes a copy of the 2000 cells
+*     before the switch and gfx_text_recall() writes it back after.
+*
+*     The framebuffer path has the same problem and a better answer. The
+*     picture covers the console because there is only one screen, but
+*     fbcon keeps a shadow buffer of every character it ever printed, so
+*     nothing has to be copied out first: fbcon_repaint() draws the console
+*     back from that buffer. gfx_leave() calls it, and the console returns
+*     with its scrollback and its cursor.
+*
+*  2. The status bar task keeps running, and on the framebuffer it would
+*     draw straight into the picture -- its output goes through fbcon like
+*     any other printing. In mode 13h it is harmless by accident: it writes
+*     80 cells into 0xB8000, which is not part of the 64 KiB window mode 13h
+*     maps, so the hardware discards them. Harmless by accident is not a
+*     reason to leave it running, and on the other path it is not harmless
+*     at all, so the task is suspended for the duration on BOTH paths and
+*     started again afterwards. It repaints itself within ten ticks.
+*
+*  3. The same trap catches printf(), on both paths and for two different
+*     reasons: in mode 13h the characters are thrown away by the hardware
+*     while the console cursor still advances and scrolls the screen the
+*     copy in gfx_text_page[] no longer matches, and on the framebuffer they
+*     land in the middle of the picture and scroll fbcon's shadow buffer, so
+*     that what comes back is not what was there. Neither half of this
+*     section prints a single character while the picture is up: the
+*     self-tests collect their results in local variables and report once the
+*     console is back. */
+
+/* The drawing surface, as a table of the primitives vga.h and fbdraw.h both
+*  offer. The two headers were written to mirror each other down to the
+*  argument order and to taking a palette INDEX rather than an RGB triple, so
+*  these nine signatures are identical on both sides and the table can hold
+*  either set unchanged.
+*
+*  A table rather than nine wrapper functions, because a wrapper would be
+*  nine bodies that each say the same "if framebuffer, else" -- nine places
+*  to forget one. Here the choice is made once, in gfx_pick_surface(), and
+*  everything above it simply draws. Two things are deliberately NOT in the
+*  table: the palette and the text, because they are the only two calls whose
+*  arguments actually differ between the paths, and gfx_palette() and
+*  gfx_text() adapt them in one place each. */
+typedef struct
+{
+	void (*clear)(uint8_t colour);
+	void (*pixel)(int x, int y, uint8_t colour);
+	void (*hline)(int x, int y, int len, uint8_t colour);
+	void (*vline)(int x, int y, int len, uint8_t colour);
+	void (*line)(int x0, int y0, int x1, int y1, uint8_t colour);
+	void (*rect)(int x, int y, int w, int h, uint8_t colour);
+	void (*fill)(int x, int y, int w, int h, uint8_t colour);
+	void (*circle)(int cx, int cy, int radius, uint8_t colour);
+	void (*disc)(int cx, int cy, int radius, uint8_t colour);
+} gfx_surface;
+
+static const gfx_surface gfx_vga_ops =
+{
+	vga_clear, vga_pixel, vga_hline, vga_vline,
+	vga_line, vga_rect, vga_fill, vga_circle, vga_disc
+};
+
+static const gfx_surface gfx_fb_ops =
+{
+	fbdraw_clear, fbdraw_pixel, fbdraw_hline, fbdraw_vline,
+	fbdraw_line, fbdraw_rect, fbdraw_fill, fbdraw_circle, fbdraw_disc
+};
+
+/* The surface in use and its geometry, all set by gfx_pick_surface(). The
+*  defaults are mode 13h, which is what a machine without a framebuffer has
+*  and the only thing that is true before anything has been asked. */
+static const gfx_surface *gfx_surf = &gfx_vga_ops;
+static int gfx_on_fb = 0;
+static int gfx_w = VGA_WIDTH;
+static int gfx_h = VGA_HEIGHT;
+
+/* Line weights and text sizes are multiples of this rather than fixed pixel
+*  counts, so a feature keeps its visual weight instead of thinning to a hair
+*  as the surface grows. One at 320x200, two at 640x480 and 800x600, three at
+*  1024x768 -- see gfx_pick_surface(). */
+static int gfx_unit = 1;
 
 /* Suspends the status bar task, if there is one. taskmgr_task_suspend()
 *  complains about pid 0 -- the system task -- so the check is for a pid that
@@ -3218,7 +3349,8 @@ static void gfx_statusbar_release(void)
 }
 
 /* Takes the copy of the visible text screen. Read through the direct mapping
-*  like every other access to that buffer in the kernel. */
+*  like every other access to that buffer in the kernel. Only the mode 13h
+*  path needs this; the framebuffer path has fbcon's shadow buffer. */
 static void gfx_text_store(void)
 {
 	volatile unsigned short *screen;
@@ -3247,15 +3379,66 @@ static void gfx_text_recall(void)
 	}
 }
 
-/* Everything that has to happen before the first pixel: nothing else may
-*  write to the screen, and the screen has to be saved. Returns what
-*  vga_set_mode() returned, and on failure leaves the system exactly as it
-*  was found. */
+/* Decides which surface this machine has and records its geometry. Called
+*  before anything is drawn and before "gfx -i" reports, so both answer from
+*  the same place.
+*
+*  fbcon_active() is the question, not fb_base(): what matters is whether the
+*  screen the user is looking at is a framebuffer, and that is the decision
+*  fbcon_activate() made, not what the bootloader reported. A mode that was
+*  reported and then not taken over leaves the VGA text console in charge,
+*  and mode 13h is then both available and correct.
+*
+*  Nothing is assumed about the size. fbdraw_width() and fbdraw_height()
+*  report the surface that boot actually negotiated, and 800x600 and 640x480
+*  come out of that negotiation just as readily as 1024x768. */
+static void gfx_pick_surface(void)
+{
+	gfx_on_fb = (fbcon_active() && fbdraw_available());
+
+	if(gfx_on_fb)
+	{
+		gfx_surf = &gfx_fb_ops;
+		gfx_w = fbdraw_width();
+		gfx_h = fbdraw_height();
+	} else {
+		gfx_surf = &gfx_vga_ops;
+		gfx_w = VGA_WIDTH;
+		gfx_h = VGA_HEIGHT;
+	}
+
+	gfx_unit = gfx_w / VGA_WIDTH;
+	if(gfx_unit < 1) gfx_unit = 1;
+}
+
+/* Everything that has to happen before the first pixel: the surface is
+*  chosen, nothing else may write to the screen, and whatever the screen
+*  holds has to be recoverable. Returns 0 on success, and on failure leaves
+*  the system exactly as it was found.
+*
+*  The framebuffer path has no mode to enter -- the mode is already there,
+*  which is the whole point -- so there is nothing here that can fail on it.
+*  The one case it refuses is a framebuffer console whose fbdraw reports no
+*  surface: falling back to mode 13h there would be the exact mistake
+*  fbdraw.h warns about, a switch away from a mode nothing can switch back
+*  to. Drawing nothing is the only safe answer. */
 static int gfx_enter(void)
 {
 	int rc;
 
+	if(fbcon_active() && !fbdraw_available())
+	{
+		return GFX_NO_SURFACE;
+	}
+
+	gfx_pick_surface();
 	gfx_statusbar_hold();
+
+	if(gfx_on_fb)
+	{
+		return 0;
+	}
+
 	gfx_text_store();
 
 	rc = vga_set_mode(VGA_MODE_GRAPHICS);
@@ -3268,17 +3451,115 @@ static int gfx_enter(void)
 	return rc;
 }
 
-/* And the way back, in the opposite order: the mode first, because the
+/* And the way back. On the framebuffer that is fbcon_repaint(), which draws
+*  the console -- text, colours and cursor -- back out of the shadow buffer
+*  that was being kept all along; no mode is touched, because none was. In
+*  mode 13h it is the mode first and the saved cells after, because the
 *  console buffer can only be written once it is a console buffer again. */
 static int gfx_leave(void)
 {
 	int rc;
+
+	if(gfx_on_fb)
+	{
+		fbcon_repaint();
+		gfx_statusbar_release();
+		return 0;
+	}
 
 	rc = vga_set_mode(VGA_MODE_TEXT);
 	gfx_text_recall();
 	gfx_statusbar_release();
 
 	return rc;
+}
+
+/* --- the layout ----------------------------------------------------------
+*
+*  Every GFX_* position and size in the constants at the top of this file is
+*  a number in a 320x200 reference layout, and these two turn one into a
+*  position on the surface actually in use. At 320x200 they are the identity,
+*  which is what keeps the mode 13h picture exactly the picture it was.
+*
+*  Why scale the LAYOUT and not the picture. Blowing a finished 320x200 image
+*  up by three would put a 960x600 postage stamp on a 1024x768 screen with a
+*  64 by 168 pixel dead margin, and every circle and every line in it would
+*  be three pixels wide because it was one pixel wide before. Deriving each
+*  position from the surface instead fills the screen, uses the mode's own
+*  aspect ratio -- 4:3 here, where mode 13h is 16:10 -- and draws every shape
+*  at the resolution the surface really has, which is the only way a picture
+*  can show what the mode can do rather than what mode 13h could do. It is
+*  also the only version that works at all on the other two sizes the boot
+*  negotiation can produce: an integer factor of three is wrong for 800x600
+*  and wrong again for 640x480, and there is no factor that is right for all
+*  three.
+*
+*  Horizontal and vertical are scaled separately because the aspect ratios
+*  differ. Anything radial -- a circle's radius, an offset from a centre --
+*  goes through gfx_sx(), since the horizontal ratio is the smaller of the
+*  two on every mode the bootloader can set, so a circle sized by it stays
+*  inside the box that was drawn for it. */
+static int gfx_sx(int value)
+{
+	return (value * gfx_w) / VGA_WIDTH;
+}
+
+static int gfx_sy(int value)
+{
+	return (value * gfx_h) / VGA_HEIGHT;
+}
+
+/* The largest text scale in 1..most at which a string of that many
+*  characters still fits into width pixels. The reference layout was drawn
+*  around strings of a known length at scale 1; on a wider surface the
+*  strings are not only bigger but sometimes different -- "fbdraw_circle" is
+*  three characters longer than "vga_circle" -- so the size that fits is
+*  worked out rather than assumed. Never returns less than 1: a label that
+*  overhangs its panel is bad, a label that is not drawn at all is worse. */
+static int gfx_fit_scale(int chars, int width, int most)
+{
+	int scale;
+
+	for(scale = most; scale > 1; scale--)
+	{
+		if(chars * FONT_WIDTH * scale <= width) break;
+	}
+
+	return scale;
+}
+
+/* One palette entry into whichever surface is in use.
+*
+*  The components are the DAC's six bits, 0..63, because that is what mode
+*  13h can store and there is no point in carrying precision one of the two
+*  paths has to throw away. fbdraw_palette() takes full 0..255 channels --
+*  it has no DAC, it fills a translation table -- so the six bits are spread
+*  over eight here, the usual way: the top two bits repeated into the bottom,
+*  so 63 becomes 255 and 0 stays 0 rather than 63 becoming 252.
+*
+*  The other difference is one of timing and is why every caller must set the
+*  palette BEFORE it draws. In mode 13h the screen holds indices, so changing
+*  an entry changes pixels that are already on it; on the framebuffer the
+*  translation happened when the pixel was written and changing the entry
+*  afterwards does nothing. gfx -t checks exactly that.
+*
+*  Indices 0..15 are left alone on both paths, and for a reason that only
+*  applies to one of them: the DAC is one piece of hardware shared with text
+*  mode, so a vga_palette(1, ...) here would come back as a shell whose blue
+*  is no longer blue, long after the mode switch is over. fbdraw's table is
+*  private and could not do that -- but the picture is one picture and its
+*  colours are one set of indices, so the rule is kept on both. */
+static void gfx_palette(uint8_t index, uint8_t r, uint8_t g, uint8_t b)
+{
+	if(gfx_on_fb)
+	{
+		fbdraw_palette(index,
+		               (uint8_t)((r << 2) | (r >> 4)),
+		               (uint8_t)((g << 2) | (g >> 4)),
+		               (uint8_t)((b << 2) | (b >> 4)));
+	} else {
+		vga_palette(index, r, g, b);
+	}
 }
 
 /* Loads the palette the picture is painted with. Three ramps and a handful of
@@ -3293,23 +3574,23 @@ static void gfx_setup_palette(void)
 	int g;
 	int b;
 
-	vga_palette(GFX_BLACK,      0,  0,  0);
-	vga_palette(GFX_WHITE,     63, 63, 63);
-	vga_palette(GFX_TEXT,      44, 46, 54);
-	vga_palette(GFX_AMBER,     63, 46, 12);
-	vga_palette(GFX_SHADOW,     6,  5, 12);
-	vga_palette(GFX_FRAME,     26, 30, 46);
-	vga_palette(GFX_PANEL,      8,  9, 20);
-	vga_palette(GFX_LEAF,      26, 50, 22);
-	vga_palette(GFX_LEAF_DARK, 12, 32, 14);
-	vga_palette(GFX_STEM,      18, 40, 16);
+	gfx_palette(GFX_BLACK,      0,  0,  0);
+	gfx_palette(GFX_WHITE,     63, 63, 63);
+	gfx_palette(GFX_TEXT,      44, 46, 54);
+	gfx_palette(GFX_AMBER,     63, 46, 12);
+	gfx_palette(GFX_SHADOW,     6,  5, 12);
+	gfx_palette(GFX_FRAME,     26, 30, 46);
+	gfx_palette(GFX_PANEL,      8,  9, 20);
+	gfx_palette(GFX_LEAF,      26, 50, 22);
+	gfx_palette(GFX_LEAF_DARK, 12, 32, 14);
+	gfx_palette(GFX_STEM,      18, 40, 16);
 
 	/* The background: night blue at the top, warming towards the bottom.
 	   All integer -- there is no floating point in this kernel, and a ramp
 	   never needs any: the step is start + i * span / steps. */
 	for(i = 0; i < GFX_SKY_STEPS; i++)
 	{
-		vga_palette((uint8_t)(GFX_SKY_FIRST + i),
+		gfx_palette((uint8_t)(GFX_SKY_FIRST + i),
 		            (uint8_t)(3 + (i * 18) / GFX_SKY_STEPS),
 		            (uint8_t)(4 + (i * 10) / GFX_SKY_STEPS),
 		            (uint8_t)(12 + (i * 14) / GFX_SKY_STEPS));
@@ -3318,7 +3599,7 @@ static void gfx_setup_palette(void)
 	/* The tomato, from a nearly black rim to a lit skin. */
 	for(i = 0; i < GFX_TOMATO_STEPS; i++)
 	{
-		vga_palette((uint8_t)(GFX_TOMATO_FIRST + i),
+		gfx_palette((uint8_t)(GFX_TOMATO_FIRST + i),
 		            (uint8_t)(22 + (i * 41) / (GFX_TOMATO_STEPS - 1)),
 		            (uint8_t)(2 + (i * 40) / (GFX_TOMATO_STEPS - 1)),
 		            (uint8_t)(2 + (i * 32) / (GFX_TOMATO_STEPS - 1)));
@@ -3345,14 +3626,16 @@ static void gfx_setup_palette(void)
 			default: r = 63;     g = 0;      b = 63 - f; break;
 		}
 
-		vga_palette((uint8_t)(GFX_SPECTRUM_FIRST + i),
+		gfx_palette((uint8_t)(GFX_SPECTRUM_FIRST + i),
 		            (uint8_t)r, (uint8_t)g, (uint8_t)b);
 	}
 }
 
 /* One glyph of the built-in font, blown up by an integer factor. The font is
 *  part of the contract in vga.h -- one byte per row, most significant bit
-*  leftmost -- so a set bit simply becomes a scale by scale block. */
+*  leftmost -- so a set bit simply becomes a scale by scale block. This is
+*  what the mode 13h path draws text with; vga_string() has no scale of its
+*  own, and at scale 1 this produces exactly what it would have. */
 static void gfx_char_scaled(int x, int y, char c, int scale, uint8_t colour)
 {
 	unsigned char index;
@@ -3371,8 +3654,8 @@ static void gfx_char_scaled(int x, int y, char c, int scale, uint8_t colour)
 		{
 			if(bits & (0x80 >> col))
 			{
-				vga_fill(x + col * scale, y + row * scale,
-				         scale, scale, colour);
+				gfx_surf->fill(x + col * scale, y + row * scale,
+				               scale, scale, colour);
 			}
 		}
 	}
@@ -3389,149 +3672,346 @@ static void gfx_string_scaled(int x, int y, const char *s, int scale,
 	}
 }
 
+/* A string on whichever surface is in use. The framebuffer has a scaled text
+*  routine of its own and draws its glyphs a pixel at a time rather than as a
+*  fill per pixel, which on a screen this size is the difference between a
+*  caption and a wait; mode 13h has no scale in its API, so it goes through
+*  the loop above. Both advance FONT_WIDTH * scale per glyph, which is what
+*  the width calculations below rely on. */
+static void gfx_text(int x, int y, const char *s, int scale, uint8_t colour)
+{
+	if(gfx_on_fb)
+	{
+		fbdraw_string(x, y, s, scale, colour);
+	}
+	else if(scale == 1)
+	{
+		/* vga_string() has no scale of its own, so it can only serve this
+		   one case -- but it is the primitive the picture is there to show
+		   off, and at scale 1 it draws exactly what the loop below would. */
+		vga_string(x, y, s, colour, GFX_TRANSPARENT);
+	} else {
+		gfx_string_scaled(x, y, s, scale, colour);
+	}
+}
+
 /* Draws a string so that its middle sits on cx. The same hand counting the
 *  tables in this file do, only in pixels instead of columns. */
-static void gfx_string_centred(int cx, int y, const char *s, uint8_t colour)
+static void gfx_text_centred(int cx, int y, const char *s, int scale,
+                             uint8_t colour)
 {
 	int width;
 
-	width = (int)strlen(s) * FONT_WIDTH;
+	width = (int)strlen(s) * FONT_WIDTH * scale;
 
-	vga_string(cx - width / 2, y, s, colour, GFX_TRANSPARENT);
+	gfx_text(cx - width / 2, y, s, scale, colour);
+}
+
+/* Draws a string at x unless that would run it past right, in which case it
+*  ends there instead. The reference positions were measured against strings
+*  of a fixed length in a 320 pixel wide layout; the framebuffer path prints
+*  its own resolution, which is a different number of characters, and a
+*  header that overhangs the screen edge is not worth a second constant. */
+static void gfx_text_clamped(int x, int y, const char *s, int scale,
+                             int right, uint8_t colour)
+{
+	int width;
+
+	width = (int)strlen(s) * FONT_WIDTH * scale;
+
+	if(x + width > right) x = right - width;
+	if(x < 0) x = 0;
+
+	gfx_text(x, y, s, scale, colour);
+}
+
+/* An outline of a given thickness, drawn as nested rectangles. A rect is one
+*  pixel thin on every surface, and one pixel on 1024x768 is a third of what
+*  it was on 320x200 -- the frames would fade out exactly where the picture
+*  got bigger. At thickness 1 this is the single rect it always was. */
+static void gfx_frame(int x, int y, int w, int h, int thick, uint8_t colour)
+{
+	int i;
+
+	for(i = 0; i < thick; i++)
+	{
+		gfx_surf->rect(x + i, y + i, w - 2 * i, h - 2 * i, colour);
+	}
+}
+
+/* A line of a given thickness, as parallel Bresenham lines offset across the
+*  direction it runs in: a shallow line is thickened downwards, a steep one
+*  sideways, so the weight stays the same whichever way it points. */
+static void gfx_thick_line(int x0, int y0, int x1, int y1, int thick,
+                           uint8_t colour)
+{
+	int dx;
+	int dy;
+	int i;
+
+	dx = (x1 > x0) ? (x1 - x0) : (x0 - x1);
+	dy = (y1 > y0) ? (y1 - y0) : (y0 - y1);
+
+	for(i = 0; i < thick; i++)
+	{
+		if(dx >= dy)
+		{
+			gfx_surf->line(x0, y0 + i, x1, y1 + i, colour);
+		} else {
+			gfx_surf->line(x0 + i, y0, x1 + i, y1, colour);
+		}
+	}
+}
+
+/* A ring of a given thickness, as concentric circles grown outwards from the
+*  nominal radius. Same reason as gfx_frame(). */
+static void gfx_ring(int cx, int cy, int radius, int thick, uint8_t colour)
+{
+	int i;
+
+	for(i = 0; i < thick; i++)
+	{
+		gfx_surf->circle(cx, cy, radius + i, colour);
+	}
+}
+
+/* The line under the title: "320x200x256" in mode 13h, and the surface's own
+*  numbers with its depth on the framebuffer, e.g. "1024x768x32". Built here
+*  because there is no sprintf() in this kernel and printf() cannot be used
+*  while the picture is up. */
+static void gfx_mode_text(char *out)
+{
+	char *p;
+
+	p = out;
+	p = net_put_uint(p, (uint32_t)gfx_w);
+	*p++ = 'x';
+	p = net_put_uint(p, (uint32_t)gfx_h);
+	*p++ = 'x';
+
+	/* The last field is what the mode offers: mode 13h has 256 colours out
+	   of a six bit DAC, the framebuffer has no palette at all and its depth
+	   is the honest number to print. */
+	p = net_put_uint(p, gfx_on_fb ? fbcon_bpp() : (uint32_t)GFX_VGA_COLOURS);
+
+	*p = EOS;
 }
 
 /* The background and the outline of one of the three panels, with its label
 *  centred along the bottom edge. */
-static void gfx_panel(int x, const char *label)
+static void gfx_panel(int x, const char *label, int scale)
 {
-	vga_fill(x, GFX_PANEL_Y, GFX_PANEL_W, GFX_PANEL_H, GFX_PANEL);
-	vga_rect(x, GFX_PANEL_Y, GFX_PANEL_W, GFX_PANEL_H, GFX_FRAME);
+	int y;
+	int w;
+	int h;
 
-	gfx_string_centred(x + GFX_PANEL_W / 2, GFX_PANEL_Y + GFX_LABEL_DY,
-	                   label, GFX_TEXT);
+	y = gfx_sy(GFX_PANEL_Y);
+	w = gfx_sx(GFX_PANEL_W);
+	h = gfx_sy(GFX_PANEL_H);
+
+	gfx_surf->fill(x, y, w, h, GFX_PANEL);
+	gfx_frame(x, y, w, h, gfx_unit, GFX_FRAME);
+
+	gfx_text_centred(x + w / 2, y + gfx_sy(GFX_LABEL_DY), label, scale,
+	                 GFX_TEXT);
 }
 
 static void gfx_draw_picture(void)
 {
+	char mode_line[GFX_MODE_TEXT];
+	const char *label1;
+	const char *label2;
+	const char *label3;
+	const char *caption;
+	const char *kind;
+	const char *foot;
 	int i;
+	int t;
 	int cx;
 	int cy;
+	int x0;
+	int x1;
+	int bx;
+	int by;
+	int bw;
+	int bh;
+	int margin;
+	int right;
+	int text_scale;
+	int title_scale;
+	int label_scale;
+
+	/* The panels are labelled with the routines they demonstrate, which is
+	   not the same set of routines on the two paths -- that is the point of
+	   the label. The longest of the three decides the size all three are
+	   drawn at, so they stay one size rather than one of them shrinking. */
+	if(gfx_on_fb)
+	{
+		label1 = "fbdraw_disc";
+		label2 = "fbdraw_line";
+		label3 = "fbdraw_circle";
+		caption = "Direct colour, 144-step hue sweep";
+		kind = "VBE LFB";
+	} else {
+		label1 = "vga_disc";
+		label2 = "vga_line";
+		label3 = "vga_circle";
+		caption = "256-colour DAC, 144-step hue sweep";
+		kind = "MODE 13H";
+	}
+
+	foot = "Press any key to return to the shell";
+
+	gfx_mode_text(mode_line);
+
+	margin = gfx_sx(GFX_PANEL1_X);
+	right = gfx_w - margin;
+
+	text_scale = gfx_unit;
+	title_scale = GFX_TITLE_SCALE * gfx_unit;
+	label_scale = gfx_fit_scale((int)strlen(label3), gfx_sx(GFX_PANEL_W),
+	                            gfx_unit);
 
 	/* Background: one horizontal line per row, one palette entry per band.
-	   64 entries over 200 rows means each colour covers three or four rows,
-	   which at this size reads as a smooth wash. */
-	for(i = 0; i < VGA_HEIGHT; i++)
+	   64 entries over the height means each colour covers a few rows, which
+	   at any of these sizes reads as a smooth wash. */
+	for(i = 0; i < gfx_h; i++)
 	{
-		vga_hline(0, i, VGA_WIDTH,
-		          (uint8_t)(GFX_SKY_FIRST + (i * GFX_SKY_STEPS) / VGA_HEIGHT));
+		gfx_surf->hline(0, i, gfx_w,
+		                (uint8_t)(GFX_SKY_FIRST + (i * GFX_SKY_STEPS) / gfx_h));
 	}
 
 	/* Header bar and the title, with a drop shadow behind it. */
-	vga_fill(0, 0, VGA_WIDTH, GFX_HEAD_H, GFX_PANEL);
-	vga_hline(0, GFX_HEAD_H, VGA_WIDTH, GFX_AMBER);
-	vga_hline(0, GFX_HEAD_H + 1, VGA_WIDTH, GFX_SHADOW);
+	gfx_surf->fill(0, 0, gfx_w, gfx_sy(GFX_HEAD_H), GFX_PANEL);
+	gfx_surf->fill(0, gfx_sy(GFX_HEAD_H), gfx_w, gfx_unit, GFX_AMBER);
+	gfx_surf->fill(0, gfx_sy(GFX_HEAD_H) + gfx_unit, gfx_w, gfx_unit,
+	               GFX_SHADOW);
 
-	gfx_string_scaled(13, 4, "TomatOS", GFX_TITLE_SCALE, GFX_SHADOW);
-	gfx_string_scaled(11, 2, "TomatOS", GFX_TITLE_SCALE, GFX_AMBER);
+	gfx_text(gfx_sx(13), gfx_sy(4), "TomatOS", title_scale, GFX_SHADOW);
+	gfx_text(gfx_sx(11), gfx_sy(2), "TomatOS", title_scale, GFX_AMBER);
 
-	vga_string(222, 5, "320x200x256", GFX_TEXT, GFX_TRANSPARENT);
-	vga_string(246, 15, "MODE 13H", GFX_AMBER, GFX_TRANSPARENT);
+	gfx_text_clamped(gfx_sx(222), gfx_sy(5), mode_line, text_scale, right,
+	                 GFX_TEXT);
+	gfx_text_clamped(gfx_sx(246), gfx_sy(15), kind, text_scale, right,
+	                 GFX_AMBER);
 
 	/* --- panel 1: a shaded ball out of nested discs ---------------------
 	   Each disc is a little smaller than the last and its centre moves up
 	   and to the left, so the ramp lays itself down as light falling from
-	   that corner. Sixteen steps of two pixels cover the radius. */
-	gfx_panel(GFX_PANEL1_X, "vga_disc");
+	   that corner. Sixteen steps cover the radius. */
+	gfx_panel(margin, label1, label_scale);
 
-	cx = GFX_TOMATO_CX;
-	cy = GFX_TOMATO_CY;
+	cx = gfx_sx(GFX_TOMATO_CX);
+	cy = gfx_sy(GFX_TOMATO_CY);
 
 	for(i = 0; i < GFX_TOMATO_STEPS; i++)
 	{
-		vga_disc(cx - i / 2, cy - i / 2, GFX_TOMATO_R - 2 * i,
-		         (uint8_t)(GFX_TOMATO_FIRST + i));
+		gfx_surf->disc(cx - gfx_sx(i / 2), cy - gfx_sx(i / 2),
+		               gfx_sx(GFX_TOMATO_R - 2 * i),
+		               (uint8_t)(GFX_TOMATO_FIRST + i));
 	}
 
-	vga_circle(cx, cy, GFX_TOMATO_R, GFX_TOMATO_FIRST);
-	vga_disc(cx - 12, cy - 12, 3, GFX_WHITE);
+	gfx_ring(cx, cy, gfx_sx(GFX_TOMATO_R), gfx_unit, GFX_TOMATO_FIRST);
+	gfx_surf->disc(cx - gfx_sx(12), cy - gfx_sx(12), gfx_sx(3), GFX_WHITE);
 
-	/* Stem and calyx on top of the finished ball. Every leaf is drawn twice,
-	   one pixel apart, because a single Bresenham line is one pixel thin and
-	   disappears against the skin at this size. */
-	vga_vline(cx, cy - 44, 14, GFX_STEM);
-	vga_vline(cx + 1, cy - 44, 14, GFX_LEAF_DARK);
-	vga_disc(cx, cy - 30, 6, GFX_LEAF_DARK);
+	/* Stem and calyx on top of the finished ball. Every leaf is drawn as a
+	   band of lines rather than one, because a single Bresenham line is one
+	   pixel thin and disappears against the skin at this size. */
+	gfx_surf->fill(cx, cy - gfx_sx(44), gfx_unit, gfx_sx(14), GFX_STEM);
+	gfx_surf->fill(cx + gfx_unit, cy - gfx_sx(44), gfx_unit, gfx_sx(14),
+	               GFX_LEAF_DARK);
+	gfx_surf->disc(cx, cy - gfx_sx(30), gfx_sx(6), GFX_LEAF_DARK);
 
-	for(i = 0; i < 2; i++)
+	for(i = 0; i < 2 * gfx_unit; i++)
 	{
-		vga_line(cx, cy - 30 + i, cx - 15, cy - 36 + i, GFX_LEAF);
-		vga_line(cx, cy - 30 + i, cx + 15, cy - 36 + i, GFX_LEAF);
-		vga_line(cx, cy - 30 + i, cx - 11, cy - 21 + i, GFX_LEAF);
-		vga_line(cx, cy - 30 + i, cx + 11, cy - 21 + i, GFX_LEAF);
+		gfx_surf->line(cx, cy - gfx_sx(30) + i,
+		               cx - gfx_sx(15), cy - gfx_sx(36) + i, GFX_LEAF);
+		gfx_surf->line(cx, cy - gfx_sx(30) + i,
+		               cx + gfx_sx(15), cy - gfx_sx(36) + i, GFX_LEAF);
+		gfx_surf->line(cx, cy - gfx_sx(30) + i,
+		               cx - gfx_sx(11), cy - gfx_sx(21) + i, GFX_LEAF);
+		gfx_surf->line(cx, cy - gfx_sx(30) + i,
+		               cx + gfx_sx(11), cy - gfx_sx(21) + i, GFX_LEAF);
 	}
 
 	/* --- panel 2: a fan of lines and a pair of rectangles ---------------
 	   The fan starts in one corner and ends on the opposite two edges, so
 	   the slopes run from steeper than vertical round to shallower than
 	   horizontal -- every case a line routine has to get right. */
-	gfx_panel(GFX_PANEL2_X, "vga_line");
+	gfx_panel(gfx_sx(GFX_PANEL2_X), label2, label_scale);
 
 	for(i = 0; i < 9; i++)
 	{
-		vga_line(118, 100, 118 + i * 11, 40,
-		         (uint8_t)(GFX_SPECTRUM_FIRST + i * 16));
+		gfx_thick_line(gfx_sx(118), gfx_sy(100),
+		               gfx_sx(118 + i * 11), gfx_sy(40), gfx_unit,
+		               (uint8_t)(GFX_SPECTRUM_FIRST + i * 16));
 	}
 
 	for(i = 1; i < 6; i++)
 	{
-		vga_line(118, 100, 206, 40 + i * 11,
-		         (uint8_t)(GFX_SPECTRUM_FIRST + GFX_SPECTRUM_STEPS - i * 16));
+		gfx_thick_line(gfx_sx(118), gfx_sy(100),
+		               gfx_sx(206), gfx_sy(40 + i * 11), gfx_unit,
+		               (uint8_t)(GFX_SPECTRUM_FIRST + GFX_SPECTRUM_STEPS
+		                         - i * 16));
 	}
 
-	/* Filled next to outlined, the same size, so the difference between
-	   vga_fill() and vga_rect() is there to be seen. */
-	vga_fill(122, 106, 36, 16, GFX_AMBER);
-	vga_rect(166, 106, 36, 16, GFX_WHITE);
+	/* Filled next to outlined, the same size, so the difference between a
+	   fill and a rect is there to be seen. */
+	gfx_surf->fill(gfx_sx(122), gfx_sy(106), gfx_sx(36), gfx_sy(16),
+	               GFX_AMBER);
+	gfx_frame(gfx_sx(166), gfx_sy(106), gfx_sx(36), gfx_sy(16), gfx_unit,
+	          GFX_WHITE);
 
 	/* --- panel 3: rings and discs --------------------------------------- */
-	gfx_panel(GFX_PANEL3_X, "vga_circle");
+	gfx_panel(gfx_sx(GFX_PANEL3_X), label3, label_scale);
 
 	for(i = 5; i >= 1; i--)
 	{
-		vga_circle(264, 74, i * 6,
-		           (uint8_t)(GFX_SPECTRUM_FIRST + (5 - i) * 28));
+		gfx_ring(gfx_sx(264), gfx_sy(74), gfx_sx(i * 6), gfx_unit,
+		         (uint8_t)(GFX_SPECTRUM_FIRST + (5 - i) * 28));
 	}
 
 	for(i = 0; i < 3; i++)
 	{
-		vga_disc(240 + i * 24, 114, 8,
-		         (uint8_t)(GFX_SPECTRUM_FIRST + 20 + i * 44));
+		gfx_surf->disc(gfx_sx(240 + i * 24), gfx_sy(114), gfx_sx(8),
+		               (uint8_t)(GFX_SPECTRUM_FIRST + 20 + i * 44));
 	}
 
 	/* --- the palette band ------------------------------------------------
-	   144 entries, two pixels each, framed. This is the part that shows at
-	   a glance that there really are more than sixteen colours here. */
-	vga_rect(GFX_BAND_X - 1, GFX_BAND_Y - 1, GFX_BAND_W + 2, GFX_BAND_H + 2,
-	         GFX_FRAME);
+	   144 entries, framed, tiled across the band so that the last one ends
+	   exactly on its right edge whatever the band is wide -- at 320 that
+	   comes out at the two pixels each it always was. This is the part that
+	   shows at a glance that there really are more than sixteen colours. */
+	bx = gfx_sx(GFX_BAND_X);
+	by = gfx_sy(GFX_BAND_Y);
+	bw = gfx_sx(GFX_BAND_W);
+	bh = gfx_sy(GFX_BAND_H);
+
+	gfx_frame(bx - gfx_unit, by - gfx_unit, bw + 2 * gfx_unit,
+	          bh + 2 * gfx_unit, gfx_unit, GFX_FRAME);
 
 	for(i = 0; i < GFX_SPECTRUM_STEPS; i++)
 	{
-		vga_fill(GFX_BAND_X + i * 2, GFX_BAND_Y, 2, GFX_BAND_H,
-		         (uint8_t)(GFX_SPECTRUM_FIRST + i));
+		x0 = bx + (i * bw) / GFX_SPECTRUM_STEPS;
+		x1 = bx + ((i + 1) * bw) / GFX_SPECTRUM_STEPS;
+
+		gfx_surf->fill(x0, by, x1 - x0, bh,
+		               (uint8_t)(GFX_SPECTRUM_FIRST + i));
 	}
 
-	gfx_string_centred(VGA_WIDTH / 2, GFX_CAPTION_Y,
-	                   "256-colour DAC, 144-step hue sweep", GFX_TEXT);
+	t = gfx_fit_scale((int)strlen(caption), gfx_w - 2 * margin, gfx_unit);
+	gfx_text_centred(gfx_w / 2, gfx_sy(GFX_CAPTION_Y), caption, t, GFX_TEXT);
 
 	/* --- footer ---------------------------------------------------------- */
-	vga_fill(0, GFX_FOOT_Y, VGA_WIDTH, VGA_HEIGHT - GFX_FOOT_Y, GFX_PANEL);
-	vga_hline(0, GFX_FOOT_Y, VGA_WIDTH, GFX_AMBER);
+	gfx_surf->fill(0, gfx_sy(GFX_FOOT_Y), gfx_w, gfx_h - gfx_sy(GFX_FOOT_Y),
+	               GFX_PANEL);
+	gfx_surf->fill(0, gfx_sy(GFX_FOOT_Y), gfx_w, gfx_unit, GFX_AMBER);
 
-	gfx_string_centred(VGA_WIDTH / 2, GFX_FOOT_TEXT_Y,
-	                   "Press any key to return to the shell", GFX_WHITE);
+	t = gfx_fit_scale((int)strlen(foot), gfx_w - 2 * margin, gfx_unit);
+	gfx_text_centred(gfx_w / 2, gfx_sy(GFX_FOOT_TEXT_Y), foot, t, GFX_WHITE);
 
 	/* Border last, so nothing drawn over it can eat the corners. */
-	vga_rect(0, 0, VGA_WIDTH, VGA_HEIGHT, GFX_FRAME);
+	gfx_frame(0, 0, gfx_w, gfx_h, gfx_unit, GFX_FRAME);
 }
 
 static void gfx_show(void)
@@ -3547,6 +4027,14 @@ static void gfx_show(void)
 
 	rc = gfx_enter();
 
+	if(rc == GFX_NO_SURFACE)
+	{
+		printf("The console is on a framebuffer that fbdraw cannot draw on.\n");
+		printf("Switching to mode 13h would lose it for good, so nothing "
+		       "was drawn.\n");
+		return;
+	}
+
 	if(rc != 0)
 	{
 		printf("Graphics mode could not be entered, vga_set_mode() = %i\n", rc);
@@ -3556,9 +4044,9 @@ static void gfx_show(void)
 	gfx_setup_palette();
 	gfx_draw_picture();
 
-	/* The keyboard IRQ carries on running in graphics mode -- nothing about
-	   the mode touches the PIC or the controller -- so the ordinary blocking
-	   read is all that is needed here. */
+	/* The keyboard IRQ carries on running while the picture is up -- nothing
+	   about either path touches the PIC or the controller -- so the ordinary
+	   blocking read is all that is needed here. */
 	getch();
 
 	rc = gfx_leave();
@@ -3569,8 +4057,13 @@ static void gfx_show(void)
 		return;
 	}
 
-	printf("Back in text mode, %i by %i pixels drawn.\n",
-	       VGA_WIDTH, VGA_HEIGHT);
+	if(gfx_on_fb)
+	{
+		printf("Console repainted, %i by %i pixels drawn into the "
+		       "framebuffer.\n", gfx_w, gfx_h);
+	} else {
+		printf("Back in text mode, %i by %i pixels drawn.\n", gfx_w, gfx_h);
+	}
 }
 
 /* --- gfx -i: the mode the machine actually came up in ---------------------
@@ -3582,7 +4075,8 @@ static void gfx_show(void)
 *  decision fbcon_activate() made afterwards, and it can perfectly well have
 *  gone the other way -- a mode was reported and the mapping failed, or the
 *  mode is the EGA text buffer and there was never anything to take over.
-*  Both halves are printed, and the last line says how they came out.
+*  Both halves are printed, and the last lines say how they came out and what
+*  the picture would therefore be drawn into.
 *
 *  It reads on a text mode boot too, which is still the normal case for
 *  "make run" and for the GRUB path: the framebuffer block is simply left
@@ -3719,6 +4213,35 @@ static void gfx_show_mode(void)
 	gfx_info_label("fbcon:");
 	printf("%s\n", info);
 
+	/* Which of the two surfaces "gfx" would use, and how big the picture
+	   would be. This is the line the whole command exists to answer, and it
+	   is deliberately asked of the same routine the drawing asks, so that
+	   what is reported here cannot drift from what actually happens. */
+	gfx_pick_surface();
+
+	gfx_info_label("Picture into:");
+
+	if(gfx_on_fb)
+	{
+		printf("the framebuffer already on the screen,\n");
+		gfx_info_label("");
+		mem_print_right((uint32_t)gfx_w, 5);
+		printf(" x ");
+		mem_print_right((uint32_t)gfx_h, 5);
+		printf(" pixels through fbdraw\n");
+	}
+	else if(fbcon_active())
+	{
+		printf("nothing, fbdraw reports no surface\n");
+	} else {
+		printf("VGA mode 13h,\n");
+		gfx_info_label("");
+		mem_print_right((uint32_t)gfx_w, 5);
+		printf(" x ");
+		mem_print_right((uint32_t)gfx_h, 5);
+		printf(" pixels, entered and left again\n");
+	}
+
 	/* The marker only appears where there is a pass and a fail to tell
 	   apart. A text mode boot is the normal case for "make run" and for the
 	   GRUB path, not a failure, so it gets no [FAILED]. A graphics mode that
@@ -3750,7 +4273,54 @@ static void gfx_check(int ok)
 	}
 }
 
-static void gfx_selftest(void)
+/* --- gfx -t --------------------------------------------------------------
+*
+*  Two self-tests, because the two paths do not share a single assertion
+*  worth making. Mode 13h is a mode this command enters and leaves, and half
+*  of what is worth checking there is that the switch happened and came back;
+*  on the framebuffer there is no switch at all, and asserting one -- or
+*  asserting that vga_framebuffer() became non-zero, or that vga_mode() moved
+*  -- would be asserting something the path deliberately does not do. The
+*  framebuffer test asserts the opposite of that instead, which is the real
+*  invariant: the mode on the screen is still exactly the mode that was
+*  there.
+*
+*  What both do check, and by the same means, is that a pixel written is a
+*  pixel present and that a shape hanging off the left edge is clipped rather
+*  than wrapped onto the row above. Mode 13h reads it back with
+*  vga_pixel_at(). fbdraw.h offers no read-back at all -- it is a write-only
+*  contract, and rightly so, since reading a framebuffer over the bus is slow
+*  enough that no drawing routine should ever do it -- so the framebuffer
+*  test reads the handful of pixels it needs out of fbcon_pixels() itself,
+*  which is the memory fbdraw just wrote into. */
+
+/* One pixel straight out of the mapped framebuffer, assembled little endian
+*  from however many bytes the mode's depth takes. Only the self-test calls
+*  this, and only a few times: see the note in fbcon.h about reads. */
+static uint32_t gfx_fb_read(int x, int y)
+{
+	volatile uint8_t *p;
+	uint32_t value;
+	uint32_t bytes;
+	uint32_t i;
+
+	p = (volatile uint8_t *)fbcon_pixels();
+	bytes = fbcon_bpp() / 8;
+
+	if(p == 0 || bytes == 0 || bytes > 4) return 0;
+
+	p = p + (uint32_t)y * fbcon_pitch() + (uint32_t)x * bytes;
+
+	value = 0;
+	for(i = 0; i < bytes; i++)
+	{
+		value = value | (((uint32_t)p[i]) << (i * 8));
+	}
+
+	return value;
+}
+
+static void gfx_selftest_vga(void)
 {
 	uint8_t *fb_text;
 	uint8_t *fb_graphics;
@@ -3765,9 +4335,6 @@ static void gfx_selftest(void)
 	int edge_right;
 	int guard;
 	int wrap;
-
-	gfx_tests_run = 0;
-	gfx_tests_ok = 0;
 
 	/* Everything is measured first and printed afterwards: see point 3 of
 	   the section comment -- a printf() between the two mode switches is
@@ -3815,7 +4382,7 @@ static void gfx_selftest(void)
 	mode_back = vga_mode();
 	fb_back = vga_framebuffer();
 
-	printf("Graphics self-test:\n");
+	printf("Graphics self-test, VGA mode 13h:\n");
 	printf("  Text mode is %i, graphics mode is %i\n",
 	       VGA_MODE_TEXT, VGA_MODE_GRAPHICS);
 
@@ -3852,6 +4419,180 @@ static void gfx_selftest(void)
 	gfx_check(rc_out == 0 && mode_back == VGA_MODE_TEXT && fb_back == 0);
 	printf("vga_set_mode(%i) = %i, vga_mode() = %i, framebuffer 0x%X\n",
 	       VGA_MODE_TEXT, rc_out, mode_back, (int)fb_back);
+}
+
+static void gfx_selftest_fb(void)
+{
+	uint32_t want;
+	uint32_t written;
+	uint32_t recoloured;
+	uint32_t edge_left;
+	uint32_t edge_right;
+	uint32_t guard;
+	uint32_t wrap;
+	uint32_t guard_want;
+	uint32_t clip_want;
+	uint32_t restored;
+	uint32_t pitch;
+	uint32_t least;
+	int width;
+	int height;
+	int rc_in;
+	int rc_out;
+	int mode_after;
+	int active_after;
+	uint8_t *vga_fb_after;
+
+	written = 1;
+	recoloured = 0;
+	edge_left = 1;
+	edge_right = 1;
+	guard = 0;
+	wrap = 0;
+	restored = 0;
+	rc_out = -1;
+
+	width = fbdraw_width();
+	height = fbdraw_height();
+	pitch = fbcon_pitch();
+	least = (uint32_t)width * (fbcon_bpp() / 8);
+
+	/* What the three test colours have to look like in memory once fbdraw
+	   has translated them. fbcon_rgb() is the mode's own packing, so the
+	   comparison holds at 32, 24 and 16 bits alike -- at 16 both sides lose
+	   the same low bits. */
+	want = fbcon_rgb(GFX_FB_TEST_R, GFX_FB_TEST_G, GFX_FB_TEST_B);
+	guard_want = fbcon_rgb(GFX_FB_GUARD_R, GFX_FB_GUARD_G, GFX_FB_GUARD_B);
+	clip_want = fbcon_rgb(GFX_FB_CLIP_R, GFX_FB_CLIP_G, GFX_FB_CLIP_B);
+
+	rc_in = gfx_enter();
+
+	if(rc_in == 0)
+	{
+		fbdraw_palette(GFX_TEST_COLOUR, GFX_FB_TEST_R, GFX_FB_TEST_G,
+		               GFX_FB_TEST_B);
+		fbdraw_palette(GFX_GUARD_COLOUR, GFX_FB_GUARD_R, GFX_FB_GUARD_G,
+		               GFX_FB_GUARD_B);
+		fbdraw_palette(GFX_CLIP_COLOUR, GFX_FB_CLIP_R, GFX_FB_CLIP_G,
+		               GFX_FB_CLIP_B);
+
+		fbdraw_clear(GFX_BLACK);
+
+		/* One pixel, written and read straight back out of the mapped
+		   framebuffer. The test point is neither on row 0 nor in column 0,
+		   so a row offset computed from the width instead of the pitch
+		   lands somewhere else and this fails. */
+		fbdraw_pixel(GFX_TEST_X, GFX_TEST_Y, GFX_TEST_COLOUR);
+		written = gfx_fb_read(GFX_TEST_X, GFX_TEST_Y);
+
+		/* The documented difference from mode 13h, and the reason the
+		   palette must be programmed before anything is drawn: the screen
+		   holds colours here, not indices, so changing the entry now must
+		   leave the pixel exactly as it is. In mode 13h the same two lines
+		   would repaint it. */
+		fbdraw_palette(GFX_TEST_COLOUR, GFX_FB_OTHER_R, GFX_FB_OTHER_G,
+		               GFX_FB_OTHER_B);
+		recoloured = gfx_fb_read(GFX_TEST_X, GFX_TEST_Y);
+
+		/* The two guards, then the shape that hangs off the left edge. */
+		fbdraw_pixel(GFX_GUARD_X, GFX_GUARD_Y, GFX_GUARD_COLOUR);
+		fbdraw_pixel(width - 1, GFX_GUARD_Y - 1, GFX_GUARD_COLOUR);
+
+		fbdraw_fill(GFX_CLIP_X, GFX_GUARD_Y, GFX_CLIP_W, 1,
+		            GFX_CLIP_COLOUR);
+
+		edge_left = gfx_fb_read(0, GFX_GUARD_Y);
+		edge_right = gfx_fb_read(GFX_GUARD_X - 1, GFX_GUARD_Y);
+		guard = gfx_fb_read(GFX_GUARD_X, GFX_GUARD_Y);
+		wrap = gfx_fb_read(width - 1, GFX_GUARD_Y - 1);
+
+		rc_out = gfx_leave();
+
+		/* After the repaint the test pixel has to be console again. The
+		   colour it was painted is nothing the console draws with, so a
+		   framebuffer that still holds it is a framebuffer nobody put
+		   back. */
+		restored = gfx_fb_read(GFX_TEST_X, GFX_TEST_Y);
+	}
+
+	mode_after = vga_mode();
+	vga_fb_after = vga_framebuffer();
+	active_after = fbcon_active();
+
+	printf("Graphics self-test, framebuffer:\n");
+	printf("  Drawing through fbdraw, no mode is switched\n");
+
+	/* 1. The surface fbdraw draws on is the surface the console is on.
+	      Two different answers here would mean the picture goes somewhere
+	      other than the screen, and the pitch is checked with them because
+	      it is the one number that cannot be derived from the other two. */
+	gfx_check(rc_in == 0 && fbdraw_available() && width > 0 && height > 0
+	          && (uint32_t)width == fbcon_width()
+	          && (uint32_t)height == fbcon_height()
+	          && pitch >= least);
+	printf("fbdraw %i x %i, fbcon %i x %i, pitch %i >= %i bytes\n",
+	       width, height, (int)fbcon_width(), (int)fbcon_height(),
+	       (int)pitch, (int)least);
+
+	/* 2. A pixel that is written has to be there afterwards, carrying the
+	      colour the palette entry was given. */
+	gfx_check(written == want);
+	printf("Pixel (%i,%i): index %i wanted 0x%X, framebuffer holds 0x%X\n",
+	       GFX_TEST_X, GFX_TEST_Y, GFX_TEST_COLOUR, (int)want, (int)written);
+
+	/* 3. The palette is a translation table, not a hardware DAC. */
+	gfx_check(recoloured == written);
+	printf("Entry %i changed after drawing: pixel 0x%X -> 0x%X, unchanged\n",
+	       GFX_TEST_COLOUR, (int)written, (int)recoloured);
+
+	/* 4. The clipped shape has to draw the part that is on the screen ... */
+	gfx_check(edge_left == clip_want && edge_right == clip_want);
+	printf("Fill x %i..%i drew (0,%i) = 0x%X and (%i,%i) = 0x%X\n",
+	       GFX_CLIP_X, GFX_CLIP_X + GFX_CLIP_W - 1, GFX_GUARD_Y,
+	       (int)edge_left, GFX_GUARD_X - 1, GFX_GUARD_Y, (int)edge_right);
+
+	/* 5. ... and nothing beyond it: neither the next pixel to the right nor
+	      the end of the row above, where an unclipped negative start column
+	      would have wrapped to. */
+	gfx_check(guard == guard_want && wrap == guard_want);
+	printf("Guard (%i,%i) = 0x%X, wrap guard (%i,%i) = 0x%X, both 0x%X\n",
+	       GFX_GUARD_X, GFX_GUARD_Y, (int)guard, width - 1, GFX_GUARD_Y - 1,
+	       (int)wrap, (int)guard_want);
+
+	/* 6. The way back, which on this path is two claims at once: the console
+	      was repainted over the picture, and the mode on the screen was
+	      never touched -- no VGA mode switch, no mode 13h framebuffer, and
+	      fbcon still in charge. That last part is the one thing this path
+	      must never get wrong, because it could not be undone. */
+	gfx_check(rc_out == 0 && restored != want && active_after
+	          && mode_after == VGA_MODE_TEXT && vga_fb_after == 0);
+	printf("Repainted (%i,%i) = 0x%X, vga_mode() = %i, VGA framebuffer 0x%X\n",
+	       GFX_TEST_X, GFX_TEST_Y, (int)restored, mode_after,
+	       (int)vga_fb_after);
+}
+
+static void gfx_selftest(void)
+{
+	gfx_tests_run = 0;
+	gfx_tests_ok = 0;
+
+	gfx_pick_surface();
+
+	if(fbcon_active() && !fbdraw_available())
+	{
+		printf("Graphics self-test:\n");
+		printf("  The console is on a framebuffer that fbdraw cannot draw\n");
+		printf("  on, and mode 13h would be a one way trip off it. There\n");
+		printf("  is nothing here that can be tested without a surface.\n");
+		return;
+	}
+
+	if(gfx_on_fb)
+	{
+		gfx_selftest_fb();
+	} else {
+		gfx_selftest_vga();
+	}
 
 	printf("  Result: %i of %i checks passed\n",
 	       gfx_tests_ok, gfx_tests_run);
@@ -3881,7 +4622,7 @@ void graphics(char *cmd)
 	} else {
 		printf("Syntax: gfx [-t] [-i]\n");
 		printf("\t          Draw the demo picture, any key returns\n");
-		printf("\t-t        Run the graphics mode self-test\n");
+		printf("\t-t        Run the self-test for the surface in use\n");
 		printf("\t-i        Show the mode the machine booted into\n");
 	}
 }
@@ -6060,8 +6801,8 @@ void help(void)
 	printf("\tps        List the loaded modules and the running tasks\n");
 	printf("\texec      exec NAME runs the module NAME as a ring 3 task\n");
 	printf("\tdf        Show the mounted filesystem and the drives found\n");
-	printf("\tgfx       Draw the graphics demo, gfx -t tests mode 13h,\n");
-	printf("\t          gfx -i shows the mode the machine booted into\n");
+	printf("\tgfx       Draw the graphics demo, gfx -t tests the surface\n");
+	printf("\t          it draws on, gfx -i shows the mode booted into\n");
 	printf("\tlspci     List the devices the PCI enumeration found\n");
 	printf("\tifconfig  Show the interface and its counters, ifconfig -q\n");
 	printf("\t          shows the receive queue the card's interrupt fills,\n");

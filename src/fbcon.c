@@ -401,7 +401,26 @@ static void draw_cell(int col, int row, unsigned char c, int attrib)
 /* The cursor is an underline in the bottom two rows of the cell, the shape
 *  the VGA has by default, drawn in the character's own foreground colour.
 *  Erasing it is a redraw of the cell from the shadow buffer -- there is
-*  nothing to save and restore, and nothing is read back from the screen. */
+*  nothing to save and restore, and nothing is read back from the screen.
+*
+*  Drawing it is a function of its own because there are two callers:
+*  fbcon_cursor(), which moves it, and fbcon_repaint(), which has just painted
+*  over it and has to put it back where it was. */
+static void draw_cursor(void)
+{
+	uint16_t cell;
+
+	if(fb_mem == 0)
+		return;
+
+	cell = shadow[csr_row][csr_col];
+	fill_rect(csr_col * FBCON_CELL_W,
+		  csr_row * FBCON_CELL_H + FBCON_CELL_H - 2,
+		  FBCON_CELL_W, 2,
+		  palette[(cell >> 8) & 0x0F]);
+	csr_drawn = 1;
+}
+
 static void erase_cursor(void)
 {
 	uint16_t cell;
@@ -537,13 +556,53 @@ static int fbcon_give_up(void)
 	return -1;
 }
 
+/* Paints the whole screen from the shadow buffer. Two callers want exactly
+*  this and it must not exist twice: fbcon_activate(), where it is the moment
+*  everything printed before the mapping appears, and fbcon_repaint(), where it
+*  is how the console comes back after something drew over it. A second copy
+*  would drift -- and the two would then disagree about what the console looks
+*  like, which is the one thing the shadow buffer exists to settle.
+*
+*  The screen is painted black first, in one pass, which also covers the margin
+*  a mode whose size is not a multiple of the cell leaves on the right and at
+*  the bottom. Then only the cells that are not already black are drawn -- a
+*  cell holding a space (or the zero a .bss buffer starts out as) on a black
+*  background is already on the screen. On a boot screen that is most of it.
+*
+*  This is the one place that assumes something about the font, namely that
+*  glyph 0x20 and glyph 0 are blank. Every 8x16 CP437 font has them blank; a
+*  font that did not would lose its spaces here, and nowhere else.
+*
+*  The cursor is NOT drawn: it has just been painted over, and whether it
+*  should come back is a question only the caller can answer. Both of them
+*  leave csr_drawn correct on their own way out. */
+static void paint_all(void)
+{
+	int col;
+	int row;
+
+	fill_rect(0, 0, (int)fb_width, (int)fb_height, palette[0]);
+
+	for(row = 0; row < fb_rows; row++)
+	{
+		for(col = 0; col < fb_cols; col++)
+		{
+			uint16_t cell = shadow[row][col];
+			unsigned char c = (unsigned char)(cell & 0xFF);
+			int attrib = (int)(cell >> 8);
+
+			if((attrib & 0xF0) == 0 && (c == 0 || c == ' '))
+				continue;
+			draw_cell(col, row, c, attrib);
+		}
+	}
+}
+
 int fbcon_activate(void)
 {
 	uint32_t size;
 	void *virt;
 	int i;
-	int col;
-	int row;
 
 	if(fb_mem != 0)
 		return 0;                       /* already running */
@@ -603,37 +662,39 @@ int fbcon_activate(void)
 		program_dac();
 
 	/* Now the point of the whole exercise: everything printed before this
-	*  moment appears.
-	*
-	*  The screen is painted black first, in one pass, which also covers the
-	*  margin a mode whose size is not a multiple of the cell leaves on the
-	*  right and at the bottom. Then only the cells that are not already
-	*  black are drawn -- a cell holding a space (or the zero a .bss buffer
-	*  starts out as) on a black background is already on the screen. On a
-	*  boot screen that is most of it.
-	*
-	*  This is the one place that assumes something about the font, namely
-	*  that glyph 0x20 and glyph 0 are blank. Every 8x16 CP437 font has them
-	*  blank; a font that did not would lose its spaces here, and nowhere
-	*  else. */
-	fill_rect(0, 0, (int)fb_width, (int)fb_height, palette[0]);
+	*  moment appears. */
+	paint_all();
 
-	for(row = 0; row < fb_rows; row++)
-	{
-		for(col = 0; col < fb_cols; col++)
-		{
-			uint16_t cell = shadow[row][col];
-			unsigned char c = (unsigned char)(cell & 0xFF);
-			int attrib = (int)(cell >> 8);
-
-			if((attrib & 0xF0) == 0 && (c == 0 || c == ' '))
-				continue;
-			draw_cell(col, row, c, attrib);
-		}
-	}
-
+	/* Nothing has drawn a cursor yet, and paint_all() draws none. */
 	csr_drawn = 0;
 	return 0;
+}
+
+/* The console, back on the screen after somebody else used it.
+*
+*  The shadow buffer is the only record of what the console showed, so this is
+*  the whole of the recovery: no saved pixels, nothing read back from the card.
+*
+*  The cursor is the one piece of state paint_all() cannot work out for itself,
+*  because it is not in the shadow buffer. It has been painted over either way,
+*  so csr_drawn is cleared BEFORE the paint -- if anything below faulted, the
+*  flag would still describe the screen truthfully -- and the block is then put
+*  back only if it was on the screen to begin with. Leaving a cursor visible
+*  where there was none would be as wrong as losing one. */
+void fbcon_repaint(void)
+{
+	int had_cursor;
+
+	if(fb_mem == 0)
+		return;
+
+	had_cursor = csr_drawn;
+	csr_drawn = 0;
+
+	paint_all();
+
+	if(had_cursor)
+		draw_cursor();
 }
 
 int fbcon_active(void)
@@ -755,8 +816,6 @@ void fbcon_scroll(int attrib)
 
 void fbcon_cursor(int col, int row)
 {
-	uint16_t cell;
-
 	if(col < 0 || row < 0 || col >= fb_cols || row >= fb_rows)
 		return;
 
@@ -768,15 +827,101 @@ void fbcon_cursor(int col, int row)
 	csr_col = col;
 	csr_row = row;
 
-	if(fb_mem == 0)
-		return;
+	draw_cursor();
+}
 
-	cell = shadow[row][col];
-	fill_rect(col * FBCON_CELL_W,
-		  row * FBCON_CELL_H + FBCON_CELL_H - 2,
-		  FBCON_CELL_W, 2,
-		  palette[(cell >> 8) & 0x0F]);
-	csr_drawn = 1;
+/* --- The surface, for code that draws rather than prints ------------------
+*
+*  fbdraw.c is the caller these exist for. Everything it needs to put a pixel
+*  somewhere is here and nothing else is: the console keeps its shadow buffer,
+*  its palette and its cell arithmetic to itself.
+*
+*  All five report the MAPPED framebuffer, so they answer 0 in three different
+*  situations that come to the same thing for a caller -- a machine that booted
+*  into text mode, a graphics mode described but not yet activated, and one the
+*  vmm could not map. In none of them is there an address a drawing routine may
+*  write to, and a geometry without an address would only invite one to be
+*  computed. fbcon_pixels() is therefore the single test worth making. */
+
+uint32_t fbcon_width(void)
+{
+	return (fb_mem != 0) ? fb_width : 0;
+}
+
+uint32_t fbcon_height(void)
+{
+	return (fb_mem != 0) ? fb_height : 0;
+}
+
+uint32_t fbcon_pitch(void)
+{
+	/* The row stride as the card reported it, never width * bytes. See the
+	*  note at row_ptr(): a 1024 pixel wide 32 bpp mode may perfectly well
+	*  have a pitch of 4224, and computing it instead of asking is what makes
+	*  a picture shear across the screen. */
+	return (fb_mem != 0) ? fb_pitch : 0;
+}
+
+uint32_t fbcon_bpp(void)
+{
+	return (fb_mem != 0) ? fb_bpp : 0;
+}
+
+uint8_t *fbcon_pixels(void)
+{
+	return fb_mem;
+}
+
+/* Nearest of the sixteen colours program_dac() actually put in the DAC.
+*
+*  An indexed mode has no pixel format to pack a colour into -- a pixel is an
+*  index and nothing else -- so the only truthful answer is the index whose
+*  programmed colour is closest to the one asked for. Sixteen entries is all
+*  this file ever programs, so sixteen is all that may be named.
+*
+*  Plain squared distance in RGB. It is not perceptually right, and for a
+*  choice between sixteen widely separated colours it does not need to be. The
+*  largest possible sum is 3 * 255^2 = 195075, so nothing here comes near
+*  overflowing an int. */
+static uint32_t nearest_console_colour(uint8_t r, uint8_t g, uint8_t b)
+{
+	int best = 0;
+	int best_d = 0x7FFFFFFF;
+	int i;
+
+	for(i = 0; i < 16; i++)
+	{
+		int dr = (int)r - (int)console_rgb[i][0];
+		int dg = (int)g - (int)console_rgb[i][1];
+		int db = (int)b - (int)console_rgb[i][2];
+		int d = dr * dr + dg * dg + db * db;
+
+		if(d < best_d)
+		{
+			best_d = d;
+			best = i;
+		}
+	}
+
+	return (uint32_t)best;
+}
+
+uint32_t fbcon_rgb(uint8_t r, uint8_t g, uint8_t b)
+{
+	/* Before activation there is no format to pack into: ch_pos and ch_size
+	*  are still zero, and rgb_to_pixel() would shift every channel out of
+	*  existence and hand back a plausible looking black. Saying 0 here is the
+	*  same value, but it is the answer to a question that was asked too
+	*  early rather than a colour. */
+	if(fb_mem == 0)
+		return 0;
+
+	if(fb_type == MULTIBOOT_FRAMEBUFFER_INDEXED)
+		return nearest_console_colour(r, g, b);
+
+	/* The channel positions the mode reports, via format_from_depth(), and
+	*  not an assumption about 32 bpp being 0x00RRGGBB. */
+	return rgb_to_pixel(r, g, b);
 }
 
 /* --- Description for the shell -------------------------------------------

@@ -80,4 +80,36 @@ extern void fbcon_cursor(int col, int row);
 /* Description for the shell: resolution, depth and where it is mapped. */
 extern const char *fbcon_info(void);
 
+/* Paints the whole console from the shadow buffer. fbcon_activate() has always
+*  done this once; it is a function of its own now because something else needs
+*  it: a program that drew over the screen has to put the console back, and the
+*  shadow buffer is the only record of what was on it. Safe to call at any
+*  time, and a no-op when the console is not on a framebuffer. */
+extern void fbcon_repaint(void);
+
+/* The framebuffer's geometry, for code that wants to draw into it rather than
+*  print into it. Width and height are pixels, not characters -- fbcon_cols()
+*  and fbcon_rows() are the character counts. All return 0 when there is no
+*  framebuffer, which is the case a caller has to check before using any of
+*  them: on a machine booted into text mode there is nothing here to draw on.
+*
+*  The pitch is the byte distance between two rows and is NOT width * bytes per
+*  pixel. A card is free to pad a row, and several do; computing it instead of
+*  reading it is the classic way to get a picture that shears diagonally. */
+extern uint32_t fbcon_width(void);
+extern uint32_t fbcon_height(void);
+extern uint32_t fbcon_pitch(void);
+extern uint32_t fbcon_bpp(void);
+
+/* The mapped framebuffer, as the kernel sees it, or 0 if there is none. This
+*  is a window onto the card. Writes go straight to the screen, and reads are
+*  slow enough that nothing here should ever do one. */
+extern uint8_t *fbcon_pixels(void);
+
+/* Packs a colour into whatever the mode's pixel format is. The channel
+*  positions come from the mode, not from an assumption -- 32 bit is usually
+*  but not always 0x00RRGGBB, and 16 bit is 5-6-5 rather than 5-5-5 on most
+*  cards but not all. */
+extern uint32_t fbcon_rgb(uint8_t r, uint8_t g, uint8_t b);
+
 #endif

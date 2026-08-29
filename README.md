@@ -232,6 +232,51 @@ the cluster chain, unlike every subdirectory.
 
 ### Graphics
 
+`gfx` draws a demonstration picture, and **which surface it draws into depends
+on how the machine booted** — because the two graphics paths on this machine
+have almost nothing in common.
+
+Mode 13h (320x200, 256 palette entries) is reached at *runtime* by programming
+the VGA registers, which is all `src/vga.c` needs and why it works from the
+text console. The VBE framebuffer (1024x768x32) is established by our own
+stage 2 *before the kernel starts*, and cannot be entered later: VBE is a real
+mode BIOS interface and is out of reach once the kernel is in protected mode.
+
+That asymmetry decides the design. A machine booted with `make run-bootdisk` is
+already in the better mode, and switching it to 13h would be a one-way trip —
+there would be no way back to 1024x768. So on that path the picture is drawn
+into the framebuffer that is already there (`src/fbdraw.c`) and the console is
+restored afterwards from `fbcon`'s shadow buffer, which is the only record of
+what was on the screen.
+
+`fbdraw.h` mirrors `vga.h` down to the argument order, including taking a
+**palette index** rather than an RGB triple — mode 13h has no choice about
+that, its hardware palette *is* what colour means there, and RGB on the other
+side would have meant two copies of every drawing routine above it. `gfx`
+picks between them with a function-pointer table chosen once, so there is one
+copy of the picture and one of the layout. Two calls need adapters and are
+worth knowing about: `fbdraw_palette()` takes 0..255 per channel where
+`vga_palette()` takes the DAC's 0..63, and a table programmed into both without
+scaling comes out at a quarter brightness.
+
+The layout is **proportional, not scaled**. Every constant maps from the
+320x200 reference onto the real surface, which is the identity at 320x200 so
+mode 13h is untouched. Scaling by three would put a 960x600 stamp on a
+1024x768 screen with a dead margin, and no integer factor is right for 800x600
+*and* 640x480 *and* 1024x768 — all three are possible outcomes of the boot
+negotiation, so nothing is hardcoded to any of them.
+
+`gfx -t` self-tests both paths with six checks each, and they are not the same
+six: half of what mode 13h asserts has no meaning on a framebuffer. The
+framebuffer's include the one difference that is visible to a user — changing
+a palette entry after drawing leaves the pixels alone, because the screen holds
+colours there rather than indices — and the invariant this path must never
+break: that `vga_mode()` is still text and no mode was switched.
+
+`gfx -i` reports which surface the machine has, answered by the same function
+the drawing uses so the report cannot drift from the behaviour.
+
+
 `gfx` switches to VGA mode 13h — 320x200 at 256 colours — draws a picture
 with the built-in primitives, and returns to the shell on a keypress.
 There is no BIOS to call from protected mode, so the mode is set by writing
