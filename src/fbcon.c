@@ -767,6 +767,22 @@ void fbcon_scroll(int attrib)
 
 	blank = (uint16_t)(' ' | ((attrib & 0xFF) << 8));
 
+	/* The cursor comes off the screen first, and this is not tidiness: the
+	*  redraw below is a DIFFERENTIAL one, and its comparison is only valid
+	*  while the screen actually shows what the shadow buffer says.
+	*
+	*  The cursor is the one thing that breaks that. It is painted over a
+	*  cell without being recorded in the shadow buffer, so for the
+	*  comparison the cell is unchanged -- the cell is skipped as "already
+	*  correct", and the underline stays where it was. The csr_drawn = 0 at
+	*  the end then tells everything afterwards that there is no cursor to
+	*  erase, so it is never cleaned up: a permanent mark, one per scroll,
+	*  accumulating along the bottom row for as long as the machine runs.
+	*
+	*  erase_cursor() redraws the cell underneath and clears the flag, which
+	*  restores the invariant the comparison needs. */
+	erase_cursor();
+
 	if(fb_rows < 2)
 	{
 		fbcon_clear(attrib);
@@ -811,6 +827,11 @@ void fbcon_scroll(int attrib)
 	       (size_t)((fb_rows - 1) * FBCON_MAX_COLS * (int)sizeof(uint16_t)));
 	memsetw(&shadow[fb_rows - 1][0], blank, FBCON_MAX_COLS);
 
+	/* erase_cursor() at the top already cleared it, and it did so having
+	*  actually taken the cursor off the screen -- which this assignment on
+	*  its own never did. Kept as a statement of the postcondition rather
+	*  than because anything still needs it: after a scroll there is no
+	*  cursor on the screen, and scrn.c draws a new one at the new position. */
 	csr_drawn = 0;
 }
 

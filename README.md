@@ -343,7 +343,13 @@ page table would otherwise live only in whichever directory was active — and
 the console would fault the moment the scheduler switched tasks.
 
 **Scrolling re-rasterises from the shadow buffer** rather than moving pixels,
-and only where cells actually differ. Measured: 0.27 ms against 1.16 ms for a
+and only where cells actually differ. That last clause has a trap in it, and
+it bit: the comparison is only valid while the screen shows what the shadow
+buffer says, and the cursor is the one thing painted over a cell *without*
+being recorded there. So its cell compared equal, was skipped as already
+correct, and the underline stayed behind — one mark per scroll, accumulating
+along the bottom row for as long as the machine ran. The cursor is taken off
+the screen before the comparison now. Measured: 0.27 ms against 1.16 ms for a
 pixel move at 1024x768x32 — and the real margin is wider, because moving
 pixels means *reading* an uncached framebuffer. The framebuffer is never read.
 
