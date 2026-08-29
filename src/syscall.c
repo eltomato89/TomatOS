@@ -268,12 +268,17 @@ extern int exec_spawn_path(const char *path, const char *args, int prio);
 *  the program to find that out. */
 #define SYS_FB_MAX_BYTES  0x00800000u
 
-/* How often the reclaim task looks for a screen whose owner has died, in
-*  milliseconds. See sysfb_reclaim_task() for why the task exists at all. 250
-*  is a quarter of a second of a black screen in the worst case -- fast enough
-*  that a killed program looks like it took the console with it and gave it
-*  straight back, and slow enough that four state lookups a second is not a
-*  cost worth discussing. */
+/* The backstop on the reclaim task's wait, in milliseconds.
+*
+*  It used to be a polling interval: the task looked four times a second for a
+*  screen whose owner had died, because nothing told it when one did.
+*  taskmgr_exit_channel() tells it now, so this is the bound on the wait rather
+*  than its period -- see sysfb_reclaim_task() for what it still buys.
+*
+*  A quarter of a second is what a missed wake would cost, and that is the only
+*  case it covers now. Fast enough that a killed program would look like it
+*  took the console and gave it straight back, and slow enough that the task
+*  costs nothing while nothing is dying. */
 #define SYS_FB_REAP_MS    250
 
 /* Longest ONE wait inside SYS_INPUT may last, in milliseconds.
@@ -1266,7 +1271,24 @@ static void sysfb_reclaim_task(void)
 {
 	for(;;)
 	{
-		sleep(SYS_FB_REAP_MS);
+		/* Woken when a task ends, rather than looking four times a second for
+		*  one that has. taskmgr_exit_channel() is woken by both
+		*  taskmgr_task_exit() and taskmgr_task_abort(), which between them
+		*  cover every way the screen's owner can stop existing -- a normal
+		*  return, exit(), a page fault, "taskmgr -k" and taskmgr_killall().
+		*
+		*  The timeout stays, and is not a formality. It is one channel for
+		*  every death, so this is woken by deaths that have nothing to do with
+		*  the screen and must look anyway; and if a wake were ever missed the
+		*  console would come back a quarter of a second late instead of never.
+		*  A missed wake here is a black screen that nothing recovers from,
+		*  which is worth a bounded wait even though the bound should not fire.
+		*
+		*  There is no condition to test in the system.h idiom's sense: the
+		*  work IS the test. sysfb_reap() looks at the owner and does nothing
+		*  when it is still alive, so a spurious wake costs one comparison and
+		*  a wake arriving before the block costs one turn of the loop. */
+		task_wait(taskmgr_exit_channel(), SYS_FB_REAP_MS);
 		sysfb_reap();
 	}
 }

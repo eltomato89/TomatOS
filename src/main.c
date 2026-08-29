@@ -3235,13 +3235,12 @@ static const char *run_arguments(char *cmd)
 *  wait would run to its timeout, the loop would poll exactly as it does now,
 *  and the next reader would have to work out that the wake is imaginary.
 *
-*  What it would take is one line in tasks.c: those two functions waking a
-*  channel that stands for the slot, and system.h saying which address that
-*  is. Then this becomes the same three lines the network loops use, with
-*  RUN_POLL_MS as the backstop rather than as the interval. Until then the
-*  poll is the honest version, and at 10 ms against a 30 second bound it is
-*  three thousand looks at one integer, which is not what makes this machine
-*  slow.
+*  That is what taskmgr_exit_channel() now is: taskmgr_task_exit() and
+*  taskmgr_task_abort() both wake it, so this waits instead of polling and
+*  RUN_POLL_MS is the backstop rather than the interval. One channel serves
+*  every death, so a wake means "some task ended" and the state is re-tested --
+*  which is the idiom anyway, and it is what makes a shared channel correct
+*  rather than merely convenient.
 *
 *  A program that never ends is the case worth deciding rather than
 *  discovering. The shell stops waiting after RUN_WAIT_MS and says so; the
@@ -3259,6 +3258,7 @@ static void run_wait(int pid, const char *name)
 	int start;
 	int state;
 	int elapsed;
+	unsigned long flags;
 
 	/* The deadline is read off the clock rather than added up from the sleeps
 	   below, and the difference is not academic. sleep() rounds up to whole
@@ -3271,6 +3271,12 @@ static void run_wait(int pid, const char *name)
 
 	for(;;)
 	{
+		/* Tested with interrupts off and tested again after every wake, per
+		   the idiom above task_wait() in system.h. The state is what the wake
+		   is about, so reading it inside the critical section is not caution
+		   for its own sake: an exit landing between the read and the block is
+		   exactly the wake that would otherwise be lost. */
+		flags = net_irq_save();
 		state = taskmgr_task_state(pid);
 
 		/* EXITED is where a task that returned or called exit() ends up,
@@ -3281,12 +3287,21 @@ static void run_wait(int pid, const char *name)
 		   finished. NULL is a slot that names no task at all. Everything
 		   else means it is still there. */
 		if(state == TASK_STATE_EXITED || state == TASK_STATE_ABORTED
-		   || state == TASK_STATE_NULL) return;
+		   || state == TASK_STATE_NULL)
+		{
+			net_irq_restore(flags);
+			return;
+		}
 
 		elapsed = timer_get_ticks() - start;
-		if(elapsed >= RUN_WAIT_MS || elapsed < 0) break;
+		if(elapsed >= RUN_WAIT_MS || elapsed < 0)
+		{
+			net_irq_restore(flags);
+			break;
+		}
 
-		sleep(RUN_POLL_MS);
+		task_wait(taskmgr_exit_channel(), RUN_POLL_MS);
+		net_irq_restore(flags);
 	}
 
 	printf("\n[%s is still running as pid %i after %i seconds. The prompt is\n",

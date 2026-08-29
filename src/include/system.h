@@ -260,6 +260,27 @@ extern void task_yield(void);
 *  waiting is what they are doing rather than spinning. */
 extern int taskmgr_blocked_count(void);
 
+/* The channel woken whenever a task ends, whether it exited or was aborted.
+*
+*  One channel for every death rather than one per pid, for the same reason
+*  net_wait_channel() is one for the whole stack: a wake here means no more
+*  than "a task ended, look again", and the waiting idiom above task_wait()
+*  already requires the condition to be re-tested afterwards. A waiter that was
+*  not waiting for this particular task simply blocks again. Per-pid channels
+*  would buy fewer spurious wakes at the price of every waiter having to name
+*  the task it cares about -- and a task that dies without waking the right
+*  channel is a waiter that hangs, whereas an extra wake costs a loop.
+*
+*  Woken from taskmgr_task_exit() and taskmgr_task_abort(), which means it can
+*  come from interrupt context -- the exception handler aborts through the same
+*  path. Waking only changes states, so that is safe.
+*
+*  Before this existed, anything waiting for a task to finish polled: the
+*  shell's wait for a program it started, and the reclaim task that takes the
+*  screen back from a program that died holding it. Both are written down as
+*  such in their own comments. */
+extern const void *taskmgr_exit_channel(void);
+
 extern int taskmgr_get_currpid();
 extern void taskmgr_task_abort(int pid, int error_number, const char *error_descr);
 

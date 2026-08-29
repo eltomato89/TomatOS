@@ -1619,6 +1619,17 @@ int task_wait(const void *channel, int timeout_ms)
 *  bound task loses the tail of its slice each time and is cut back towards one
 *  tick per turn. It is never starved, because schedule() gives it a full fresh
 *  slice every time it deschedules it. */
+/* The address woken whenever a task ends. Its value is never read -- only its
+*  address is, as a channel -- so one byte is enough and what it holds is
+*  irrelevant. See the declaration in system.h for why there is one of these
+*  rather than one per pid. */
+static char task_exit_channel_marker;
+
+const void *taskmgr_exit_channel(void)
+{
+	return (const void *)&task_exit_channel_marker;
+}
+
 void task_wake(const void *channel)
 {
 	int i;
@@ -1823,6 +1834,12 @@ void taskmgr_task_abort(int pid, int error_number, const char *error_descr)
 		{
 			tasks[pid].cpu_time = 0;
 		}
+
+		//Same wake, same ordering rule, as taskmgr_task_exit(): the state is
+		//set above and the wake comes after it. An abort reaches here from the
+		//exception handler as well, i.e. from interrupt context -- which is
+		//safe because waking only changes states and never switches tasks.
+		task_wake(taskmgr_exit_channel());
 	}
 }
 
@@ -1851,6 +1868,13 @@ void taskmgr_task_exit(int pid, int status)
 	{
 		tasks[pid].cpu_time = 0;
 	}
+
+	//Tell whoever was waiting for this. The state is set FIRST and the wake
+	//comes after, which is the order that matters: a waiter re-tests its
+	//condition when it wakes, and waking before the state changed would have
+	//it look, see the task still alive, and go back to sleep - having used up
+	//the one wake it was going to get.
+	task_wake(taskmgr_exit_channel());
 }
 
 //Makes a task eligible for the scheduler. This is the one place where the
