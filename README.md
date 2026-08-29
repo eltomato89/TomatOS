@@ -328,6 +328,16 @@ then what the lease says. `ifconfig 10.0.2.15 255.255.255.0 10.0.2.2` still
 works and still wins; `ifconfig` afterwards shows which of the two the address
 came from.
 
+The lease also names a DNS server, so names work:
+
+```
+nslookup example.com
+ping example.com
+```
+
+`ping` takes a name or an address. `nslookup` alone shows the cache; `-f`
+empties it.
+
 `lspci` lists what the bus enumeration found — the command to run when the
 card is not detected. `arp` shows the cache, `ifconfig` without arguments the
 interface and its counters.
@@ -419,8 +429,51 @@ anywhere but loopback — a relay agent, or a switch running spanning tree on a
 port that just came up, takes longer — and a flat retry would put fifteen
 broadcasts on a segment that has already shown nobody is listening.
 
-Deliberately absent: renewing a lease before it expires, RELEASE, DECLINE,
-TCP, and any form of fragment reassembly.
+#### DNS
+
+The resolver is small except for one function, and that function is the reason
+this is not just filling in a struct.
+
+**A name on the wire is not a string.** It is length-prefixed labels ending in
+a zero byte — and a label whose top two bits are set is not a label at all but
+a **pointer** to an earlier offset in the same message. That is what keeps a
+reply with several answers small, and it means the decoder follows offsets that
+arrived from the network. A pointer to itself, or two pointing at each other,
+is an infinite loop **inside an interrupt handler**, which on this kernel is a
+hung machine rather than a hung process.
+
+The bound is arithmetic rather than a counter, which is what makes it
+trustworthy. A pointer target must be strictly *before* the pointer itself, and
+also strictly before the *previous* target. The second rule is the load-bearing
+one: going backwards is not enough, because a pointer at 300→100 whose labels
+run forward into a pointer at 400→200 whose labels run forward to 300 again is
+a cycle in which every jump goes backwards. With targets strictly decreasing
+and all below the 512-byte message limit, there can be at most 512 of them —
+termination follows from the arithmetic and not from the data being friendly.
+It refuses no legal message either, since a compressor can only point at a name
+it has already emitted. A jump cap bounds the *work* on top of that.
+
+That claim was checked by mutation: remove either rule alone and the tests
+still pass, because another catches it; remove all three and the test **hangs**
+— so the suite genuinely exercises the case.
+
+**A CNAME chain is the ordinary case**, not an exception. Each pass looks for
+an A record whose owner is the name currently being chased, and only follows a
+CNAME if there is none — taking any A record in the message would mean
+accepting an address for a name nobody asked about. The reported TTL is the
+minimum along the chain.
+
+**A truncated reply is reported, not used.** The TC bit means the answer did
+not fit and the protocol wants the query repeated over TCP; there is no TCP
+here, and what arrived is the beginning of an answer rather than a short one.
+
+Matching a reply uses the id, the ephemeral source port, the server address and
+the echoed question. With no random source on this machine that is roughly 30
+bits of material, and the code says so plainly rather than implying more.
+
+Deliberately absent: renewing a lease before it expires, RELEASE, DECLINE, TCP,
+AAAA and everything but A records, reverse lookups, and any form of fragment
+reassembly.
 
 ### What is in the kernel, and what is not
 

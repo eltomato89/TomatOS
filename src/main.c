@@ -17,6 +17,7 @@
 #include <rtl8139.h>
 #include <net.h>
 #include <dhcp.h>
+#include <dns.h>
 //#include <wmessages.h>
 
 #define NULL 0
@@ -472,10 +473,53 @@ extern char usertext_end[];
 *  not a duration of 136 years, and printing it as one would be silly. */
 #define DHCP_LEASE_FOREVER 0xFFFFFFFFUL
 
-/* Seconds in the units a lease is worth reading in. */
+/* Seconds in the units a lease is worth reading in. Used for a DNS TTL as
+*  well as for a lease -- see net_duration(). */
 #define DHCP_SECS_PER_DAY  86400
 #define DHCP_SECS_PER_HOUR  3600
 #define DHCP_SECS_PER_MIN     60
+
+/* --- dns -----------------------------------------------------------------
+*
+*  The third command in this file that watches a state machine somebody else
+*  drives, and the shape is the one "dhcp" established: dns_resolve() puts a
+*  query on the wire and returns, the answer arrives in the card's interrupt
+*  while this task sleeps, so the command is a loop that sleeps, calls
+*  dns_poll() -- the only thing that resends and the only thing that ever
+*  gives up -- and watches dns_state().
+*
+*  Unlike DHCP there are no steps worth printing: one query, one answer, and
+*  the states in between say nothing a user could act on. So the loop is
+*  silent and only the conclusion is printed.
+*
+*  DNS_WAIT is this shell's backstop and nothing else, exactly as DHCP_WAIT
+*  is. dns_poll() gives up on its own once its attempts are used up, and that
+*  is the failure worth reporting because it knows why; this limit exists so
+*  that a resolver which never concludes cannot hang the shell, and it is set
+*  well above any retransmission schedule a resolver could plausibly run so
+*  that it is a backstop rather than a second, competing deadline. */
+#define DNS_WAIT      15000   /* ms before the shell stops waiting        */
+#define DNS_POLL         50   /* ms between two calls to dns_poll()       */
+
+/* As long a name as can be typed. prmv() hands back at most 100 bytes, so a
+*  longer one cannot reach these commands however long DNS_NAME_MAX is. */
+#define NET_DNS_NAME    100
+
+/* The name column of the cache listing. Wide enough for the names anybody
+*  types and narrow enough that name, address and TTL fit in eighty columns
+*  together -- 2 + 33 + 16 + 10 = 61. */
+#define NET_DNS_NAME_WIDTH 33
+
+/* What one lookup produced. A small record rather than four out parameters,
+*  because "nslookup" and "ping" want the same lookup and differ only in how
+*  they print it -- see net_dns_resolve(). */
+typedef struct
+{
+	uint32_t ip;      /* host order, the address that was found            */
+	uint32_t ttl;     /* seconds it may be kept, or seconds left if cached */
+	int      cached;  /* 1 when the answer was already here                */
+	int      ms;      /* how long the exchange took, 0 for a cache hit     */
+} net_dns_answer;
 
 /* --- what the bootloader reported ----------------------------------------
 *
@@ -523,6 +567,7 @@ void netconfig(char *cmd);
 void dhcpclient(char *cmd);
 void arptable(char *cmd);
 void pinghost(char *cmd);
+void nslookup(char *cmd);
 void help(void);
 
 static void mem_print_right(uint32_t value, int width);
@@ -597,15 +642,20 @@ static void net_show_pci(void);
 static void net_show_interface(void);
 static void net_show_arp(void);
 static int  net_ping_once(uint32_t dst, uint16_t sequence, uint32_t *from);
-static void net_ping(uint32_t dst);
+static void net_ping(uint32_t dst, const char *name);
 
-static void net_dhcp_duration(uint32_t seconds);
+static void net_duration(uint32_t seconds);
 static uint32_t net_dhcp_remaining(void);
 static void net_dhcp_leased_ip(const char *label, uint32_t ip);
 static void net_dhcp_step(int state);
 static const char *net_dhcp_stalled(int reached);
 static void net_dhcp_show_lease(void);
 static void net_dhcp_run(void);
+
+static void net_dns_explain_error(void);
+static int  net_dns_resolve(const char *what, const char *name,
+                            net_dns_answer *answer);
+static void net_dns_show_cache(void);
 
 /* Self-test counters, maintained by mem_check(). */
 static int mem_tests_run = 0;
@@ -682,6 +732,7 @@ void main()
 		else if(strcmp(word, "dhcp") == 0) dhcpclient(cmd);
 		else if(strcmp(word, "arp") == 0) arptable(cmd);
 		else if(strcmp(word, "ping") == 0) pinghost(cmd);
+		else if(strcmp(word, "nslookup") == 0) nslookup(cmd);
 		else if(strcmp(word, "reboot") == 0) reboot();
 		else if(strcmp(word, "help") == 0) help();
 		else if(strcmp(word, "start") == 0) taskmgr_task_start(taskmgr_add_task( task, "Test Task", TASK_PRIORITY_LOW ));
@@ -4310,12 +4361,12 @@ static void net_show_interface(void)
 		net_dhcp_leased_ip("DNS server:", dhcp_dns());
 
 		net_info_label("Lease:");
-		net_dhcp_duration(dhcp_lease_seconds());
+		net_duration(dhcp_lease_seconds());
 		if(dhcp_lease_seconds() != 0
 		   && dhcp_lease_seconds() != (uint32_t)DHCP_LEASE_FOREVER)
 		{
 			printf(", ");
-			net_dhcp_duration(net_dhcp_remaining());
+			net_duration(net_dhcp_remaining());
 			printf(" left");
 		}
 		printf("\n");
@@ -4518,9 +4569,16 @@ static int net_ping_once(uint32_t dst, uint16_t sequence, uint32_t *from)
 	return NET_PING_LOST;
 }
 
-/* "ping ADDRESS": NET_PING_COUNT echo requests, one line each, and the
-*  summary a ping is expected to end with. */
-static void net_ping(uint32_t dst)
+/* "ping HOST": NET_PING_COUNT echo requests, one line each, and the summary
+*  a ping is expected to end with.
+*
+*  name is what was typed when that was a name and 0 when it was an address.
+*  It is only ever printed where the address is not, because the two together
+*  in the header would push the line past eighty columns for any name of a
+*  realistic length -- and the address is on the line above (pinghost()
+*  printed what the name resolved to) and on every reply line below, so
+*  nothing is hidden by naming the destination the way the user named it. */
+static void net_ping(uint32_t dst, const char *name)
 {
 	uint32_t from;
 	uint16_t sequence;
@@ -4533,7 +4591,7 @@ static void net_ping(uint32_t dst)
 	int i;
 
 	printf("PING ");
-	net_print_ip(dst);
+	if(name != 0) printf("%s", name); else net_print_ip(dst);
 	printf(": %i requests, %i ms for a reply, %i ms for ARP.\n",
 	       NET_PING_COUNT, NET_PING_WAIT, NET_ARP_TRIES * NET_ARP_WAIT);
 
@@ -4584,7 +4642,7 @@ static void net_ping(uint32_t dst)
 	}
 
 	printf("  --- ");
-	net_print_ip(dst);
+	if(name != 0) printf("%s", name); else net_print_ip(dst);
 	printf(" ping statistics ---\n");
 
 	printf("  %i sent, %i received, %i%% loss, %i ms total\n",
@@ -4607,8 +4665,13 @@ static void net_ping(uint32_t dst)
 *  their head, so the seconds are printed and the same value follows in days,
 *  hours and minutes. Units that are zero are left out -- "1 d 30 min" rather
 *  than "1 d 0 h 30 min" -- and anything under a minute is already readable
-*  as it stands and gets no second form at all. */
-static void net_dhcp_duration(uint32_t seconds)
+*  as it stands and gets no second form at all.
+*
+*  Written for a lease and named for one until a DNS TTL turned out to be the
+*  same problem: a number of seconds a user has to judge in their head. Hence
+*  the name without "dhcp" in it. The one lease-specific thing it keeps is
+*  0xFFFFFFFF, which DHCP writes for "forever" and which no sane TTL is. */
+static void net_duration(uint32_t seconds)
 {
 	uint32_t days;
 	uint32_t hours;
@@ -4761,7 +4824,7 @@ static void net_dhcp_show_lease(void)
 	net_dhcp_leased_ip("DHCP server:", dhcp_server());
 
 	net_info_label("Lease:");
-	net_dhcp_duration(dhcp_lease_seconds());
+	net_duration(dhcp_lease_seconds());
 	printf("\n");
 }
 
@@ -4868,6 +4931,224 @@ static void net_dhcp_run(void)
 		printf("  answering: set the addresses by hand with\n");
 		printf("  \"ifconfig 10.0.2.15 255.255.255.0 10.0.2.2\" instead.\n");
 	}
+}
+
+/* --- dns ----------------------------------------------------------------- */
+
+/* Why the last lookup did not work, in the resolver's own words.
+*
+*  Four situations end up here and they are not the same thing at all: the
+*  name does not exist, the server tried and failed, no server is configured,
+*  or nothing answered. A user acts differently on each -- fix the name, wait
+*  and try again, get a server, look at the network -- so dns_last_error() is
+*  printed as it stands rather than boiled down into one "lookup failed".
+*
+*  Only one of the four has a fix that is a single command away, and this is
+*  where that command is named: with no lease there is no server to ask, and
+*  "dhcp" is what produces one. It is asked of dhcp_dns() rather than of the
+*  resolver because the shell is the one that knows where a server would have
+*  come from, and it is added to whatever the resolver said rather than in
+*  place of it -- a lookup can also fail for its own reasons on a machine
+*  that never had a server, and both halves are worth having. */
+static void net_dns_explain_error(void)
+{
+	const char *reason;
+
+	reason = dns_last_error();
+	if(reason != 0 && reason[0] != EOS) printf("  %s\n", reason);
+
+	if(dhcp_dns() == 0)
+	{
+		/* Deliberately not a second "run dhcp": the resolver may well have
+		   said that already. What it cannot know, and what the user in front
+		   of a hand-configured interface needs, is WHY there is no server --
+		   that one arrives with a lease and that "ifconfig" does not set
+		   one, so no amount of typing addresses will produce it. */
+		printf("  No lease has named one -- a DNS server arrives with the\n");
+		printf("  address \"dhcp\" asks for, and \"ifconfig\" does not set one.\n");
+	}
+}
+
+/* Runs one lookup to a conclusion. Returns 1 and fills in answer when a name
+*  was resolved, or 0 having already said why, under the caller's own name.
+*
+*  Shared by "nslookup" and "ping" because the waiting is identical and only
+*  the presentation of the answer is not -- and because the failures must
+*  read the same wherever a name was typed. The caller prints its own header
+*  line before calling, so that everything printed here starts on a fresh
+*  line of its own.
+*
+*  There is ONE path through here whether the name is cached or not, which is
+*  what dns.h asks for: a cached name goes through the same states and its
+*  answer comes back through dns_result() and dns_result_ttl() like any
+*  other, with the TTL already counted down to what is left of it. So the
+*  cache is not read for the answer. It is asked one question before the
+*  lookup starts and only that one -- was this already here -- because a
+*  cache hit and a fresh query are different things to somebody watching a
+*  name that keeps changing, and afterwards there is no way to tell them
+*  apart. dns_lookup_cached() is the right question to ask: it matches names
+*  the way the cache does, ignoring case and a trailing dot, which a strcmp()
+*  in this file would not. */
+static int net_dns_resolve(const char *what, const char *name,
+                           net_dns_answer *answer)
+{
+	int state;
+	int waited;
+	int start;
+
+	answer->ip = 0;
+	answer->ttl = 0;
+	answer->cached = (dns_lookup_cached(name) != 0);
+	answer->ms = 0;
+
+	if(dns_resolve(name) != 0)
+	{
+		printf("%s: the lookup of %s could not be started.\n", what, name);
+		net_dns_explain_error();
+		return 0;
+	}
+
+	start = timer_get_ticks();
+	state = DNS_STATE_QUERY;
+
+	for(waited = 0; waited < DNS_WAIT; waited += DNS_POLL)
+	{
+		state = dns_poll();
+
+		if(state == DNS_STATE_DONE || state == DNS_STATE_FAILED) break;
+
+		sleep(DNS_POLL);
+	}
+
+	if(state == DNS_STATE_DONE)
+	{
+		answer->ip = dns_result();
+		answer->ttl = dns_result_ttl();
+
+		answer->ms = timer_get_ticks() - start;
+		if(answer->ms < 0) answer->ms = 0;
+
+		/* Checked because the caller may be about to send packets to it. An
+		   address of zero at DNS_STATE_DONE would be a resolver bug rather
+		   than a lookup that failed, but ip_send() has no opinion about
+		   0.0.0.0 and would happily go looking for its MAC, so it is
+		   refused here where it can still be called what it is. */
+		if(answer->ip == 0)
+		{
+			printf("%s: %s resolved to no address at all.\n", what, name);
+			return 0;
+		}
+
+		/* Nothing is cancelled here on purpose. The lookup is finished, not
+		   in flight, and dns_cancel() is for one that is; the next call to
+		   dns_resolve() starts from a collected lookup perfectly well. */
+		return 1;
+	}
+
+	if(state != DNS_STATE_FAILED)
+	{
+		/* The shell's backstop ran out before the resolver gave up, which
+		   dns_poll() is supposed to do long before DNS_WAIT. Said plainly,
+		   because it means the resolver is not counting its own attempts
+		   rather than that the network is quiet -- the same distinction
+		   net_dhcp_run() draws, and for the same reason. */
+		printf("%s: %s was not resolved within %i ms.\n", what, name, DNS_WAIT);
+		printf("  The resolver had not given up yet; the shell stopped waiting.\n");
+		dns_cancel();
+		net_dns_explain_error();
+		return 0;
+	}
+
+	printf("%s: %s could not be resolved.\n", what, name);
+	net_dns_explain_error();
+	return 0;
+}
+
+/* "nslookup" with no name: what has been resolved and what has moved.
+*
+*  Part of "nslookup" rather than a command of its own, which is the opposite
+*  of what "arp" does with the ARP cache, and deliberately. The ARP cache has
+*  no command that fills it -- entries appear as a side effect of "ping" --
+*  so showing it needs a word of its own. This cache has an owner: every
+*  entry in it was put there by "nslookup" or by a "ping" that looked a name
+*  up, and the command that fills a cache is the natural place to look at it.
+*  A second command word would buy nothing and cost a line of "help".
+*
+*  The counters come with it, and that is where the argument about "ifconfig"
+*  is settled. They would be at home next to the UDP ones -- DNS runs on UDP
+*  and "ifconfig" is where one looks when the network does not work -- but
+*  that display is already fourteen rows on a screen that has twenty-five,
+*  and two more would push the top of it past the edge for the sake of
+*  numbers that are one word away here. They also read better here: queries
+*  sent against replies used is the story of this cache, and dropped is what
+*  separates "the server never answered" from "something answered and the
+*  resolver would not have it". */
+static void net_dns_show_cache(void)
+{
+	char entry[NET_DNS_NAME];
+	char ip_text[NET_IP_TEXT];
+	uint32_t ip;
+	uint32_t left;
+	int entries;
+	int shown;
+	int i;
+
+	entries = dns_cache_entries();
+
+	printf("DNS cache:\n");
+
+	if(entries <= 0)
+	{
+		printf("  Empty -- no name has been looked up yet.\n");
+
+		if(dhcp_dns() == 0)
+		{
+			printf("  No DNS server is known either: \"dhcp\" asks the network\n");
+			printf("  for one, and \"nslookup NAME\" then fills this in.\n");
+		} else {
+			printf("  \"nslookup NAME\" fills it: every answer is kept until the\n");
+			printf("  server's TTL for it runs out.\n");
+		}
+	} else {
+		printf("  ");
+		ps_print_left("Name", NET_DNS_NAME_WIDTH);
+		ps_print_left("Address", NET_IP_TEXT);
+		fs_print_right_text("TTL left", 10);
+		printf("\n");
+
+		/* dns_cache_get() answers 0 for an index it filled in, the same way
+		   round as arp_cache_get() and the same way round as the eye does
+		   not expect. The loop is bounded by the cache size rather than by
+		   the count, so a cache that changes between the two calls -- an
+		   entry expiring is enough -- cannot run it off the end. */
+		shown = 0;
+		for(i = 0; i < DNS_CACHE_SIZE; i++)
+		{
+			if(dns_cache_get(i, entry, (uint32_t)sizeof(entry), &ip, &left) != 0)
+			{
+				break;
+			}
+
+			net_ip_text(ip, ip_text);
+
+			printf("  ");
+			ps_print_left(entry, NET_DNS_NAME_WIDTH);
+			ps_print_left(ip_text, NET_IP_TEXT);
+			mem_print_right(left, 8);
+			printf(" s\n");
+			shown++;
+		}
+
+		printf("  %i of %i cache entries in use.\n", shown, DNS_CACHE_SIZE);
+	}
+
+	printf("  Queries sent: ");
+	mem_print_right(dns_queries_sent(), 8);
+	printf("   used: ");
+	mem_print_right(dns_replies_used(), 8);
+	printf("   dropped: ");
+	mem_print_right(dns_replies_dropped(), 8);
+	printf("\n");
 }
 
 /* --- the commands themselves --------------------------------------------- */
@@ -5022,35 +5303,182 @@ void arptable(char *cmd)
 	net_show_arp();
 }
 
+/* "ping HOST": an address, or a name to look up first.
+*
+*  Taking a name is what makes the resolver useful rather than a thing one
+*  can demonstrate, and it costs one branch: what does not parse as a dotted
+*  quad is tried as a name.
+*
+*  The order of the three steps is the whole of the care needed here. The
+*  parse decides which kind of argument this is and nothing else -- it does
+*  NOT write dst when it fails, which is exactly why a failed lookup has to
+*  return rather than fall through: dst would still hold whatever the stack
+*  left there, and ip_send() treats 0.0.0.0 as a destination like any other
+*  and would go looking for its MAC. A name that does not resolve fails as a
+*  name, here, before there is an address to misuse. */
 void pinghost(char *cmd)
 {
-	char address_text[100];
+	char target[NET_DNS_NAME];
+	net_dns_answer answer;
 	uint32_t dst;
+	int named;
 
 	if(prmc(cmd) == 0)
 	{
-		printf("Syntax: ping IP\n");
-		printf("\t          Send %i echo requests and time the replies,\n",
+		printf("Syntax: ping HOST\n");
+		printf("\t          Send %i echo requests and time the replies\n",
 		       NET_PING_COUNT);
-		printf("\t          for example ping 10.0.2.2\n");
+		printf("\tHOST      An address, for example ping 10.0.2.2, or a name\n");
+		printf("\t          to look up first, for example ping example.com\n");
 		return;
 	}
 
-	/* prmv() hands back a pointer into one static buffer, so the address is
+	/* prmv() hands back a pointer into one static buffer, so the argument is
 	   copied out before anything else can call prmv() again. */
-	strcpy(address_text, prmv(1, cmd));
+	strcpy(target, prmv(1, cmd));
 
-	if(!net_parse_ip(address_text, &dst))
-	{
-		printf("ping: %s is not an address.\n", address_text);
-		printf("      An address is four numbers 0..255 separated by dots,\n");
-		printf("      for example 10.0.2.2. There is no resolver here.\n");
-		return;
-	}
+	named = !net_parse_ip(target, &dst);
 
+	/* Asked before the lookup, not only before the echo requests: a query is
+	   a packet too, and "no address is configured" is a better answer to
+	   "ping example.com" than a resolver timing out because it had no source
+	   address to send from. */
 	if(!net_interface_ready("ping", 1)) return;
 
-	net_ping(dst);
+	if(named)
+	{
+		/* Printed before the wait rather than after it, because the wait is
+		   the part with nothing to show: a whole line, so that whatever
+		   net_dns_resolve() has to say begins on the next one. */
+		printf("ping: looking up %s ...\n", target);
+
+		if(!net_dns_resolve("ping", target, &answer)) return;
+
+		dst = answer.ip;
+
+		printf("ping: %s is ", target);
+		net_print_ip(dst);
+		if(answer.cached)
+		{
+			printf(" -- cached, ");
+			net_duration(answer.ttl);
+			printf(" left\n");
+		} else {
+			printf(" -- TTL ");
+			net_duration(answer.ttl);
+			printf("\n");
+		}
+	}
+
+	net_ping(dst, named ? target : 0);
+}
+
+/* "nslookup": a name into an address, and the cache that keeps the answers.
+*
+*  Two jobs in one command word -- see net_dns_show_cache() for why the cache
+*  is not a command of its own. With a name it asks; with nothing, "-c" or
+*  "-f" it shows or empties what has been asked already. */
+void nslookup(char *cmd)
+{
+	char name[NET_DNS_NAME];
+	net_dns_answer answer;
+	uint32_t address;
+	int entries;
+
+	if(prmc(cmd) == 0)
+	{
+		net_dns_show_cache();
+		return;
+	}
+
+	if(prmc(cmd) != 1)
+	{
+		printf("Syntax: nslookup [NAME|-c|-f]\n");
+		printf("\t          With no argument, show the cached answers and\n");
+		printf("\t          what the resolver has sent and received\n");
+		printf("\tNAME      Ask the DNS server for the address of NAME,\n");
+		printf("\t          for example nslookup example.com\n");
+		printf("\t-c        Show the cache, as with no argument at all\n");
+		printf("\t-f        Discard every cached answer\n");
+		return;
+	}
+
+	/* prmv() hands back a pointer into one static buffer, so the name is
+	   copied out before anything else can call prmv() again. */
+	strcpy(name, prmv(1, cmd));
+
+	if(strcmp(name, "-c") == 0)
+	{
+		net_dns_show_cache();
+		return;
+	}
+
+	if(strcmp(name, "-f") == 0)
+	{
+		entries = dns_cache_entries();
+		dns_cache_flush();
+
+		if(entries <= 0)
+		{
+			printf("nslookup: the cache was already empty.\n");
+			return;
+		}
+
+		printf("nslookup: %i cached answer(s) discarded.\n", entries);
+		printf("          The next lookup of any of them asks the server\n");
+		printf("          again, which is the point of emptying it.\n");
+		return;
+	}
+
+	/* An argument that is already an address. Refused rather than sent,
+	   because sending it would fail in a way that reads like the network is
+	   broken: "10.0.2.2" is a perfectly legal name to ask for and the server
+	   would answer that there is no such thing. The reverse lookup that
+	   would actually answer the question does not exist here -- this
+	   resolver asks for A records only -- so the honest thing is to say that
+	   and point at the command an address IS good for. */
+	if(net_parse_ip(name, &address))
+	{
+		printf("nslookup: %s is already an address.\n", name);
+		printf("  There is nothing to look up. This resolver asks for A\n");
+		printf("  records -- name to address -- and has no reverse lookup, so\n");
+		printf("  an address cannot be turned back into a name here. Asking\n");
+		printf("  for it as a name would only be told there is no such name.\n");
+		printf("  \"ping %s\" is what an address is for.\n", name);
+		return;
+	}
+
+	if(!net_interface_ready("nslookup", 1)) return;
+
+	printf("Looking up %s.\n", name);
+
+	if(!net_dns_resolve("nslookup", name, &answer)) return;
+
+	net_info_label("Address:");
+	net_print_ip(answer.ip);
+	printf("\n");
+
+	/* The TTL is the reason this command reports more than an address: it is
+	   what says whether the answer will still be true in a minute. A cached
+	   one is what is LEFT of it, which is a different number from the one
+	   the server stated, so the two do not read alike. */
+	net_info_label("TTL:");
+	net_duration(answer.ttl);
+	if(answer.cached) printf(" left");
+	printf("\n");
+
+	/* Where it came from. A cache hit and a fresh query are different things
+	   to somebody debugging a name that keeps moving, and only one of them
+	   proves the server is still answering. */
+	net_info_label("Answer:");
+	if(answer.cached)
+	{
+		printf("from the cache -- nothing was sent\n");
+	} else {
+		printf("from ");
+		net_print_ip(dhcp_dns());
+		printf(" in %i ms\n", answer.ms);
+	}
 }
 
 /* The other half of what can be typed: the programs in BIN_DIR.
@@ -5164,7 +5592,10 @@ void help(void)
 	printf("\tdhcp      Ask the network for an address instead of typing\n");
 	printf("\t          one, dhcp -f asks again when one is already set\n");
 	printf("\tarp       Show the ARP cache, address to hardware address\n");
-	printf("\tping      ping IP sends echo requests and times the replies\n");
+	printf("\tnslookup  nslookup NAME asks the DNS server for its address,\n");
+	printf("\t          nslookup alone or -c shows the cache, -f empties it\n");
+	printf("\tping      ping HOST sends echo requests and times the replies,\n");
+	printf("\t          HOST is an address or a name to look up first\n");
 	printf("\treboot    Restart the computer\n");
 	printf("\texit      Exit the shell\n");
 

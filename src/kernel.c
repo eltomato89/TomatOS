@@ -20,6 +20,7 @@
 #include <pci.h>
 #include <rtl8139.h>
 #include <net.h>
+#include <dns.h>
 #define cpuid(in, a, b, c, d) __asm__("cpuid": "=a" (a), "=b" (b), "=c" (c), "=d" (d) : "a" (in));
 
 void *memcpy(void *dest, const void *src, size_t count)
@@ -525,6 +526,14 @@ static void network_init(void)
 	pci_init();
 	rtl8139_init();
 	net_init();
+
+	/* The resolver binds its UDP port here rather than on first use: binding
+	*  is the only thing about it that can fail for a reason worth reporting,
+	*  and a lookup that has to bind first would discover that halfway into a
+	*  command. It asks nobody anything until dns_resolve() is called, and it
+	*  does not need the address yet -- the DNS server's address comes from
+	*  the DHCP lease, which is obtained later and from the shell. */
+	dns_init();
 }
 
 /* Entry point from start.asm. mbi_phys is the pointer the bootloader left in
