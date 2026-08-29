@@ -353,6 +353,58 @@ the screen before the comparison now. Measured: 0.27 ms against 1.16 ms for a
 pixel move at 1024x768x32 — and the real margin is wider, because moving
 pixels means *reading* an uncached framebuffer. The framebuffer is never read.
 
+### Writing to the disk
+
+FAT is no longer read only. `fetch -o page.txt example.com` keeps what it
+downloaded, `cp` copies and `rm` removes — all three are ring 3 programs in
+`/BIN`, working through four system calls that mirror the read side exactly: a
+path, an offset and a length, and no file descriptor anywhere.
+
+**This is the first code in the kernel that can destroy data.** Everything
+before it was additive: a wrong packet is dropped, a wrong pixel overwritten,
+a wrong page faults. A wrong sector write takes a file with it. One sentence
+decided nearly every design question in `src/fat.c`:
+
+> A leak is one `fsck -r` away; a cross-link cannot be repaired without losing
+> a file.
+
+So the ordering always falls the same way. **Deleting** writes the `0xE5`
+first and frees the chain afterwards — accepting that a crash in between
+leaves clusters belonging to no file. The other order would leave a live
+directory entry pointing at clusters the next `create` hands out, and then two
+files describe the same sectors. **Shrinking** is the mirror: the directory
+entry first, then the release, because an entry claiming a size the chain no
+longer backs sends a reader off the end. **Growing** commits last: data, then
+chain, then entry. And a cluster is marked used before anything is written
+into it, and zeroed before it is linked.
+
+**Both FAT copies** are written, backups first and the primary last, because
+the primary is what every reader uses — a failure part way then leaves the
+volume behaving as it did before rather than half committed. The count comes
+from the BPB rather than being assumed to be two. The one window that cannot
+be closed is between two sector writes; when it happens the driver latches the
+volume read-only until remount rather than piling more changes onto
+bookkeeping it knows is inconsistent.
+
+**FAT12's split entries** are the most error-prone thing in the file: a 12-bit
+entry can straddle a sector boundary, so writing one is a read-modify-write of
+two sectors in which the neighbouring entry sharing those bytes has to come
+through untouched. It is tested in both sharing directions, with a *different
+file's* chain as the neighbour that must survive, and mutation-tested —
+widening either nibble mask produces about thirty failures.
+
+The arbiter is not our own tests. `fsck.vfat -n` reports **clean, exit 0** on
+volumes this driver wrote, with the FAT copies byte identical, and it was
+confirmed that it does detect a deliberately introduced mismatch, so "clean"
+means something. Under 120 injected write failures there were zero cross-links
+and zero out-of-range clusters; the only residues were unreferenced clusters,
+which is the benign side of the trade above.
+
+Timestamps are written only when the CMOS clock reads plausibly. A zero date
+is legal and every tool renders it; a *wrong* one is worse than none, because
+nothing flags it — and on a machine with a flat battery it would be every file
+it ever writes.
+
 ### Networking
 
 `ping` works, in both directions. The run targets attach an **RTL8139** to

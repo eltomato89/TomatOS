@@ -89,6 +89,25 @@ extern int exec_spawn_path(const char *path, const char *args, int prio);
 *  limit. */
 #define SYS_READ_MAX 4096
 
+/* Most bytes a single SYS_FWRITE may move.
+*
+*  The same argument as SYS_READ_MAX and the same number, one direction over:
+*  the length comes from ring 3, this runs inside an interrupt handler, and
+*  fat_write() reaches the disk through PIO. An uncapped length would let a
+*  user program decide how long the kernel spends inside a single trap, which
+*  is a denial of service that needs no exploit -- just a big number.
+*
+*  The write side has one extra reason for the cap and one fewer objection to
+*  it. The extra reason: a write is not only a transfer. It allocates clusters,
+*  rewrites FAT entries in both copies and updates the directory entry, so a
+*  page of it is already several sector writes rather than one long read, and
+*  it is the operation during which the volume is briefly inconsistent. The
+*  absent objection: answering short needs no new contract here, because
+*  fat_write() can already return short on its own when the volume fills up.
+*  A caller that loops until everything has been written -- the only correct
+*  way to use this call -- therefore works without knowing the cap is there. */
+#define SYS_FWRITE_MAX 4096
+
 /* Longest host name SYS_RESOLVE accepts, terminator included.
 *
 *  DNS_NAME_MAX is the protocol's own limit on a whole name, so anything
@@ -1955,12 +1974,442 @@ static int sys_close(struct regs *r)
 
 
 /* ------------------------------------------------------------------ */
+/* Writing to the filesystem                                           */
+/* ------------------------------------------------------------------ */
+
+/* These four are the first calls in this file that can DESTROY something.
+*
+*  Everything above this line is additive, or is the caller's own. SYS_WRITE
+*  prints, SYS_SPAWN creates a task, a network call touches nobody else's data,
+*  and the worst a mistaken SYS_READ does is fill the caller's own buffer with
+*  the wrong bytes. A path handed to SYS_UNLINK names a file that is gone
+*  afterwards; a path handed to SYS_FWRITE names bytes that are overwritten.
+*  fat.c writes sectors, and there is no undo below this line.
+*
+*  So these calls have to answer a question the read side never raised: WHAT
+*  MAY RING 3 NAME?
+*
+*  The honest answer on this kernel is "anything the filesystem accepts", and
+*  it is worth being blunt about why, because that answer looks negligent
+*  until the alternatives have been looked at.
+*
+*  There are no permissions here. No owner, no mode bits, no read-only
+*  attribute honoured, no notion of a file the system needs -- fat.c has none
+*  of that and neither does tasks.c, so there is nothing for this file to
+*  consult. A program is at this gate because somebody typed its name at the
+*  shell, so it acts with exactly the authority that person has, which is all
+*  of it. That is the bargain MS-DOS made, and it is the bargain any system
+*  without accounts is making whether it admits it or not.
+*
+*  Concretely, and the case worth stating rather than leaving to be discovered:
+*  a program CAN unlink /BIN/LS.ELF, and afterwards the shell will not find
+*  "ls" any more. The obvious response is to special case that directory here.
+*  It was considered and turned down, for two reasons.
+*
+*  It would be the shape of a boundary and not a boundary. The only rule
+*  available at this gate is a comparison against a path, and a path has many
+*  spellings: /bin/ls.elf, //BIN/LS.ELF, /BIN/../BIN/LS.ELF. fat.c's resolver
+*  folds those together and a comparison here would not, so the check would
+*  turn down the honest caller and let through the one that is trying. A check
+*  that is defeated by typing the argument differently is worse than no check
+*  at all, because everybody who comes afterwards reads it as protection.
+*
+*  And it would protect the wrong verb. Denying SYS_UNLINK on /BIN still leaves
+*  SYS_TRUNCATE and SYS_FWRITE, either of which turns the same file into
+*  something the loader refuses -- the command is just as gone. Covering all
+*  four means teaching this file what fat.c means by a path, which is a second
+*  implementation of the filesystem's own name rules, kept in step by hand.
+*
+*  What IS enforced here is the boundary this gate actually owns, and it is
+*  unchanged from the read side: a path is a bounded, terminated string in the
+*  CALLER's address space, and a buffer is a range of the caller's own pages.
+*  Ring 3 cannot make the kernel read kernel memory, cannot make it walk off
+*  the end of a mapping, and cannot make it spend an unbounded time inside one
+*  trap. Memory isolation is a promise this file can keep on its own. Data
+*  protection is not, and twenty lines of path matching pretending otherwise
+*  would only be discovered to be absent at the worst moment.
+*
+*  The real next step is not a check here. It is an attribute in fat.c and an
+*  owner in tasks.c -- a permission system -- and until there is one the kernel
+*  should say plainly that there is not. */
+
+/* Copies the path argument of one of the four calls below into dst, which
+*  holds SYS_PATH_MAX bytes. Returns 0, or the error the caller should return.
+*
+*  The copy is the read side's -- see copy_string_from_user() for why the bytes
+*  are taken across rather than the pointer -- plus the one rule about names
+*  that belongs at this gate rather than in fat.c: an empty path, and the root
+*  directory spelled as "/", are refused. Both are how fat.c names the root,
+*  and the root is not a file to create, write into, empty or remove. They are
+*  turned down here rather than left to fail below because failing below costs
+*  a directory walk and comes back as a -1 whose meaning this file would then
+*  have to guess.
+*
+*  Every other rule about a name -- eight characters, an optional dot and three
+*  more, the character set FAT allows -- stays in fat.c, which refuses a name
+*  it cannot represent instead of mangling it (see fat.h). A second copy of
+*  those rules here would buy nothing and would be one edit away from
+*  disagreeing with the first. */
+static int sysfs_path(uint32_t addr, char *dst)
+{
+	if(copy_string_from_user(addr, dst, SYS_PATH_MAX) < 0) return SYS_EFAULT;
+
+	if(dst[0] == '\0') return SYS_EINVAL;
+	if(dst[0] == '/' && dst[1] == '\0') return SYS_EINVAL;
+
+	return 0;
+}
+
+/* Whether there is anything to write to at all, asked of the one function that
+*  answers exactly that.
+*
+*  Nothing mounted is the ORDINARY case on this kernel, not an exceptional one:
+*  "make run" boots with no disk and every one of these four calls has to have
+*  a sensible answer there. SYS_EROFS is that answer, and it is a different
+*  thing from the SYS_ENOENT the read side gives -- "there is no file" invites
+*  a program to try another name, "there is nowhere to write" tells it to stop
+*  asking.
+*
+*  fat_writable() rather than fat_mounted(), and the difference is not
+*  theoretical: fat.h defines it as mounted AND the drive answered an identify
+*  AND the geometry left room to write back. A volume that is mounted and
+*  cannot be written to would pass the weaker test and then fail after the
+*  caller had already been told to go ahead, which fat.h calls out as the worse
+*  answer of the two. */
+static int sysfs_rofs(void)
+{
+	if(!fat_writable()) return SYS_EROFS;
+
+	return 0;
+}
+
+/* Non-zero if the path names a directory.
+*
+*  All four calls below need this on their error path, and they need it because
+*  of a property of fat_size(): it answers about FILES. A path that names a
+*  directory is refused by it exactly as a path that names nothing is, so the
+*  existence probe the read side uses -- ask for the size, and take a failure to
+*  mean the file is not there -- reports SYS_ENOENT for a directory that is
+*  plainly there. That is not a limitation worth passing on to ring 3: telling a
+*  program that /BIN does not exist when what happened is that /BIN cannot be
+*  unlinked sends it looking for the wrong problem.
+*
+*  fat_readdir() is the one function in fat.h that answers about a directory as
+*  such. It takes a directory path and refuses anything else, so index 0 is a
+*  type test: 0 or 1 (filled in, or an empty directory) means a directory, and
+*  negative means it is not one -- including the path that names nothing, which
+*  is why the probe is asked FIRST and the size probe only afterwards. The walk
+*  costs the same as the one fat_size() would have done, and it happens on the
+*  error path only.
+*
+*  fat_dirent is filled in and thrown away. It is 24 bytes on a 4 KiB kernel
+*  stack, in a function that calls nothing deeper than fat.c's own directory
+*  walk -- the same cost sys_readdir() already carries on its ordinary path.
+*
+*  Worth stating because it is a difference between the two halves of this
+*  file: the READ side does not do this. SYS_STAT and SYS_READ answer
+*  SYS_ENOENT for a directory, and say in their own comments that they cannot
+*  do better with the error codes fat.h offers -- which was true when they were
+*  written, and is why cat.c re-asks with sys_readdir() out in ring 3. The
+*  write side can do better because it already has to ask a second question on
+*  its error path, so the probe is nearly free here, and because getting it
+*  wrong is worse: telling a program that a path it can plainly see does not
+*  exist, on the one call that would have destroyed it, is the kind of answer
+*  somebody acts on. The two sides therefore disagree about a directory until
+*  the read side is brought up to this, and a caller must not assume they
+*  agree. */
+static int sysfs_is_dir(const char *path)
+{
+	fat_dirent entry;
+
+	return fat_readdir(path, 0, &entry) >= 0;
+}
+
+/* fcreate(path) -- creates an empty file. Returns 0 or a negative code.
+*
+*  Fails when the file is already there, which is fat_create()'s contract kept
+*  rather than smoothed over. A "create" that quietly meant "create or empty"
+*  is how a program destroys a file it only meant to name, and the caller is
+*  the one with the context to decide: SYS_EEXIST is a code it acts on, by
+*  asking, by picking another name, or by saying truncate(path, 0) and meaning
+*  it.
+*
+*  fat.c reports every failure as -1 and puts the words in fat_last_error(), so
+*  the split here is made by asking a second question: does the path name
+*  something now? A file of that name, or a directory of that name, both mean
+*  the create failed because the name is taken, and both are SYS_EEXIST -- a
+*  caller acts on either of them the same way, by choosing another name.
+*
+*  What is left is SYS_EINVAL: a name that does not survive the 8.3 conversion,
+*  a directory on the way to it that does not exist, or a root directory with no
+*  free slot left. The first is much the most likely and is genuinely an
+*  argument that makes no sense; splitting the other two out needs error codes
+*  fat.h does not have, the same limit sys_stat() records. */
+static int sys_fcreate(struct regs *r)
+{
+	char path[SYS_PATH_MAX];
+	uint32_t unused;
+	int err;
+
+	err = sysfs_path((uint32_t)r->ebx, path);
+	if(err != 0) return err;
+
+	err = sysfs_rofs();
+	if(err != 0) return err;
+
+	if(fat_create(path) != 0)
+	{
+		if(fat_size(path, &unused) == 0) return SYS_EEXIST;
+		if(sysfs_is_dir(path)) return SYS_EEXIST;
+
+		return SYS_EINVAL;
+	}
+
+	return 0;
+}
+
+/* fwrite(path, offset, len, buf) -- writes len bytes at offset. Returns how
+*  many bytes were written.
+*
+*  SYS_READ's mirror image, and the three places where a mirror image is not a
+*  copy are what this comment is about.
+*
+*  FIRST, the direction of the pointer. buf is READ through, never written
+*  through, so the check is user_range_ok(buf, len, 0) -- the readable one,
+*  user_byte_ok() per page, PAGE_PRESENT and PAGE_USER and no PAGE_WRITE.
+*  SYS_READ's writable check is not the stricter version of that, it is the
+*  answer to a different question, and using it here would be wrong twice over.
+*  It would ask something this call does not raise: the kernel never stores
+*  into this buffer, so whether the CALLER may store into it is none of the
+*  kernel's business. And it would refuse the ordinary case -- exec.c maps a
+*  PT_LOAD without PF_W as PAGE_USER and not PAGE_WRITE, so a program writing a
+*  string literal out of its own read-only data would be handed SYS_EFAULT for
+*  a pointer that is perfectly good to read from. The direction of the copy
+*  picks the check; nothing else does.
+*
+*  SECOND, the length. Capped at SYS_FWRITE_MAX, for the reason set out there,
+*  and capped BEFORE the range check for the reason sys_read() gives: the
+*  question put to user_range_ok() is about the bytes that will actually be
+*  touched, so a caller asking for four gigabytes is not refused over a buffer
+*  it never needed -- it is answered with a page out of a buffer that only has
+*  to be a page long.
+*
+*  THIRD, and the one that decides whether a program can use this call at all:
+*  a SHORT WRITE IS NOT AN ERROR. fat_write() returns how many bytes landed,
+*  which is short exactly when the volume filled up in the middle, and that
+*  number is the only thing telling a caller where to carry on from. It is
+*  passed through untouched. Folding it into an error code would tell a program
+*  nothing was written when most of it was -- and would tell it that after the
+*  bytes had already reached the disk, so the file and the return value would
+*  disagree.
+*
+*  The one count that does not cross unchanged is zero out of a request for
+*  bytes, which becomes SYS_ENOSPC. Zero is not partial progress a caller can
+*  build on, it is no progress at all, and as a return value it would be
+*  indistinguishable from the zero length request handled below -- so the
+*  obvious loop, "write what is left and advance by the result", would call
+*  again with the same arguments forever. fat.c reports its failures
+*  negatively, so a zero out of a non-zero request leaves one cause, and it is
+*  the one SYS_ENOSPC names. The pair of rules is what matters: never turn a
+*  short write into an error, and never turn a stall into a zero.
+*
+*  offset + len is never formed, for the reason sys_read() spells out. The
+*  buffer check uses buf and len alone and does its own no-wrap test, and the
+*  offset is compared against the size of the volume rather than added to
+*  anything. */
+static int sys_fwrite(struct regs *r)
+{
+	char path[SYS_PATH_MAX];
+	uint32_t offset;
+	uint32_t len;
+	uint32_t buf;
+	uint32_t total;
+	uint32_t unused;
+	int err;
+	int wrote;
+
+	offset = (uint32_t)r->ecx;
+	len    = (uint32_t)r->edx;
+	buf    = (uint32_t)r->esi;
+
+	err = sysfs_path((uint32_t)r->ebx, path);
+	if(err != 0) return err;
+
+	if(len > SYS_FWRITE_MAX) len = SYS_FWRITE_MAX;
+
+	if(!user_range_ok(buf, len, 0)) return SYS_EFAULT;
+
+	err = sysfs_rofs();
+	if(err != 0) return err;
+
+	/* Nothing to write, so nothing is written and the file is neither created
+	*  nor extended on the way past.
+	*
+	*  Unlike SYS_READ this is answered AFTER the mount test rather than before
+	*  it, and the difference is deliberate. A zero length read asks for no
+	*  bytes and gets none, which is true whatever the disk is doing. A zero
+	*  length write answered 0 on a machine with no disk would be reporting
+	*  success from a call whose entire purpose is to put bytes somewhere, and
+	*  the program that writes an empty buffer first to see whether it may write
+	*  at all deserves to be told SYS_EROFS. */
+	if(len == 0) return 0;
+
+	/* An offset past the end of the volume can never be inside a file on it,
+	*  so the write must fail -- but fat_write() would find that out by
+	*  zero-filling the gap, which means spending every free cluster on the
+	*  disk on zeroes before returning 0. A typo in an offset would consume the
+	*  whole volume. Refusing here costs one comparison and is the same answer.
+	*
+	*  Guarded on total being non-zero so that a filesystem which does not
+	*  report a size cannot turn every write into SYS_ENOSPC. What is left
+	*  unbounded is the legitimate case -- an offset just inside the volume
+	*  still zero-fills up to the end of it -- and that bound belongs in fat.c,
+	*  which is the only code that knows how far it has got. */
+	total = fat_total_bytes();
+	if(total != 0 && offset >= total) return SYS_ENOSPC;
+
+	/* The caller's buffer is handed to fat_write() directly rather than bounced
+	*  through the kernel stack, for the reason sys_read() gives: every page of
+	*  it has just been validated as readable from ring 3, and the only code
+	*  that could invalidate that mapping is the caller -- which is parked
+	*  inside this call. */
+	wrote = fat_write(path, offset, len, (const void *)buf);
+	if(wrote < 0)
+	{
+		/* The same split as SYS_READ, on the same evidence, with the directory
+		*  asked about first for the reason sysfs_is_dir() gives: a directory is
+		*  not a file to write bytes into and saying so is more use than
+		*  SYS_ENOENT about a path that is plainly there. Then, if the path
+		*  cannot be sized either, there was no file to write to; and if it can,
+		*  the entry exists and the layer below refused to store the bytes,
+		*  which is what SYS_EIO is for. All of it is on the error path only. */
+		if(sysfs_is_dir(path)) return SYS_EINVAL;
+		if(fat_size(path, &unused) != 0) return SYS_ENOENT;
+
+		return SYS_EIO;
+	}
+
+	if(wrote == 0) return SYS_ENOSPC;
+
+	return wrote;
+}
+
+/* unlink(path) -- removes a file. Returns 0 or a negative code.
+*
+*  The call the section header above is really about: the one that destroys
+*  rather than changes. Everything this kernel can honestly say about which
+*  files ring 3 may do that to is said there.
+*
+*  fat_delete() refuses a directory, and this call does not try to work around
+*  that. There is no fat_rmdir() to pair with, and emptying a directory from
+*  inside a system call is a recursive walk over a filesystem being modified
+*  underneath it -- with no handle, no depth bound and a 4 KiB kernel stack.
+*  A directory is an argument that makes no sense for a call that removes
+*  files, and is answered as one.
+*
+*  The split asks afterwards what the path actually names. A directory is
+*  SYS_EINVAL, which is the case this call is most likely to be handed by
+*  mistake. Nothing at all is SYS_ENOENT, and that is a distinction a caller
+*  acts on -- removing a name that was already gone is a different situation
+*  from a removal that could not be performed. A file that is still there was
+*  not removed by a drive that refused the write, which is SYS_EIO. */
+static int sys_unlink(struct regs *r)
+{
+	char path[SYS_PATH_MAX];
+	uint32_t unused;
+	int err;
+
+	err = sysfs_path((uint32_t)r->ebx, path);
+	if(err != 0) return err;
+
+	err = sysfs_rofs();
+	if(err != 0) return err;
+
+	if(fat_delete(path) != 0)
+	{
+		if(sysfs_is_dir(path)) return SYS_EINVAL;
+		if(fat_size(path, &unused) != 0) return SYS_ENOENT;
+
+		return SYS_EIO;
+	}
+
+	return 0;
+}
+
+/* truncate(path, size) -- sets the length of a file. Returns 0 or negative.
+*
+*  Two operations wearing one name, and the shrinking one is the ordinary case:
+*  truncate(path, 0) is how a program overwrites a file it did not create, and
+*  it is what SYS_FCREATE's SYS_EEXIST points a caller at.
+*
+*  The growing one is where the argument needs the same suspicion SYS_FWRITE's
+*  length gets. Growing zero-fills, and a zero fill is written to the disk, so
+*  truncate(path, 0xFFFFFFFF) is a request to write four gigabytes of zeroes by
+*  PIO from inside a single trap. Unlike a length, a size cannot simply be
+*  capped: a truncate that quietly produced a different size than it was asked
+*  for would be lying to its caller about the one thing it does.
+*
+*  What can be done is to refuse the sizes that could never be reached. A file
+*  cannot be larger than the volume holding it, so a size above
+*  fat_total_bytes() is answered SYS_ENOSPC before anything is written, instead
+*  of after every free cluster on the disk has been spent on zeroes to learn
+*  the same thing. That is not a complete bound -- a size that does fit still
+*  zero-fills up to the size of the volume -- and the rest of it belongs in
+*  fat.c, which is the only code that knows how far it has got. It is a bound
+*  on what a typo can cost, which is what an argument check is for.
+*
+*  The failure split uses the size the file already had, which the existence
+*  probe hands over for free. A grow that failed ran out of room, and
+*  SYS_ENOSPC is a code a program can act on by deleting something; a shrink
+*  that failed did not run out of room, so it was the drive refusing, which is
+*  SYS_EIO. That is inference over fat.c's single -1 rather than something
+*  fat.h reports, and it is drawn this way because the inference is right in
+*  the case that actually happens. The directory and the missing path are asked
+*  about first, in the order sysfs_is_dir() explains. */
+static int sys_truncate(struct regs *r)
+{
+	char path[SYS_PATH_MAX];
+	uint32_t size;
+	uint32_t total;
+	uint32_t have;
+	int err;
+
+	size = (uint32_t)r->ecx;
+
+	err = sysfs_path((uint32_t)r->ebx, path);
+	if(err != 0) return err;
+
+	err = sysfs_rofs();
+	if(err != 0) return err;
+
+	total = fat_total_bytes();
+	if(total != 0 && size > total) return SYS_ENOSPC;
+
+	if(fat_truncate(path, size) != 0)
+	{
+		if(sysfs_is_dir(path)) return SYS_EINVAL;
+
+		have = 0;
+		if(fat_size(path, &have) != 0) return SYS_ENOENT;
+		if(size > have) return SYS_ENOSPC;
+
+		return SYS_EIO;
+	}
+
+	return 0;
+}
+
+
+/* ------------------------------------------------------------------ */
 /* Dispatch                                                            */
 /* ------------------------------------------------------------------ */
 
 /* Indexed by call number. A table instead of a switch, so that an unknown
 *  number is a bounds check and a null test rather than a forgotten case --
-*  the gaps up to SYSCALL_MAX are zero and answer with SYS_ENOSYS. */
+*  any gap up to SYSCALL_MAX is zero and answers with SYS_ENOSYS. There is no
+*  gap at the moment: the table is full to SYSCALL_MAX, so a call number ring 3
+*  invents is rejected by the bounds check alone, and the null test is what
+*  keeps the next number added to syscall.h safe before it has a handler. */
 static syscall_fn syscall_table[SYSCALL_MAX] =
 {
 	sys_exit,      /* SYS_EXIT      0 */
@@ -1983,10 +2432,10 @@ static syscall_fn syscall_table[SYSCALL_MAX] =
 	sys_send,      /* SYS_SEND     17 */
 	sys_recv,      /* SYS_RECV     18 */
 	sys_close,     /* SYS_CLOSE    19 */
-	0,             /* 20 -- unassigned, answers SYS_ENOSYS */
-	0,             /* 21 */
-	0,             /* 22 */
-	0              /* 23 */
+	sys_fcreate,   /* SYS_FCREATE  20 */
+	sys_fwrite,    /* SYS_FWRITE   21 */
+	sys_unlink,    /* SYS_UNLINK   22 */
+	sys_truncate   /* SYS_TRUNCATE 23 */
 };
 
 void syscall_handler(struct regs *r)

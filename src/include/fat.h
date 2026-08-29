@@ -1,5 +1,14 @@
-/* TomatOS - FAT12/FAT16 filesystem, read only for now
-*  Desc: Enough to list a directory and read a file off a real disk.
+/* TomatOS - FAT12/FAT16 filesystem
+*  Desc: Enough to list a directory, and to read and write a file on a real
+*        disk.
+*
+*  Writing is the first thing in this kernel that can DESTROY data. Everything
+*  before it was additive: a wrong packet is dropped, a wrong pixel is
+*  overwritten, a wrong page faults. A wrong sector write takes a file with it,
+*  and on real hardware it takes somebody's file. That shapes what is here --
+*  see the notes on the write functions, and in particular the one on the two
+*  FAT copies, which is the difference between a filesystem another operating
+*  system will still mount and one it will offer to repair.
 *
 *  FAT12 and FAT16 differ only in how wide a FAT entry is -- 12 or 16 bits --
 *  and in where the root directory lives. Both are handled here; FAT32 is
@@ -59,5 +68,49 @@ extern int fat_size(const char *path, uint32_t *size);
 extern int fat_read(const char *path, uint32_t offset, uint32_t len, void *buf);
 
 extern const char *fat_last_error(void);
+
+/* ---------------------------------------------------------------------------
+*  Writing
+*
+*  Non-zero when the mounted volume can be written to at all: something is
+*  mounted, the drive answered an identify, and the geometry left room to write
+*  back. A caller checks this before offering to save anything, because failing
+*  after the user has typed a filename is a worse answer than saying so first. */
+extern int fat_writable(void);
+
+/* Creates an empty file. Fails if it exists -- overwriting is a decision the
+*  caller has to make deliberately, with fat_truncate() or fat_delete().
+*
+*  The name has to survive the 8.3 conversion: at most eight characters, an
+*  optional dot and at most three more, and nothing outside the character set
+*  FAT allows. A name that does not is refused rather than mangled, because a
+*  file the caller cannot name again is worse than a file that was not created.
+*  Returns 0, or negative with fat_last_error() explaining. */
+extern int fat_create(const char *path);
+
+/* Writes len bytes at offset, growing the file and its cluster chain as
+*  needed. Writing past the end zero-fills the gap, which is what every
+*  filesystem does and what a caller seeking forward expects.
+*
+*  Returns the number of bytes written -- which can be short when the volume
+*  fills up, and a caller has to look at the number rather than assume. A
+*  partial write leaves a consistent filesystem: the directory entry and the
+*  chain describe exactly the bytes that made it. */
+extern int fat_write(const char *path, uint32_t offset, uint32_t len,
+                     const void *buf);
+
+/* Sets the file's length. Shrinking releases the clusters past the new end;
+*  growing zero-fills. Truncating to 0 is how a caller overwrites a file it
+*  did not create. Returns 0 or negative. */
+extern int fat_truncate(const char *path, uint32_t size);
+
+/* Removes a file and releases its clusters. Refuses a directory: emptying one
+*  first is the caller's business, and there is no fat_rmdir() to pair with it.
+*  Returns 0 or negative. */
+extern int fat_delete(const char *path);
+
+/* Bytes actually written to the disk since mount, for a shell that wants to
+*  show that something happened. */
+extern uint32_t fat_bytes_written(void);
 
 #endif

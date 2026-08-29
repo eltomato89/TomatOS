@@ -140,6 +140,61 @@
 *  So the target is printed, in full, as the thing to type next -- and when
 *  it is an https:// target, the reason it cannot be typed next is printed
 *  with it.
+*
+*  ------------------------------------------------------------------------
+*  -o FILE: keeping the page instead of watching it go past
+*  ------------------------------------------------------------------------
+*  With -o the BODY goes to a file and nothing else changes: the status line,
+*  the headers under -i and every message this program makes are still printed
+*  on the screen. That split is the whole point. A 404 written silently into a
+*  file is the worst outcome this program could produce -- the file would look
+*  like the page that was asked for -- so what the server said is never the
+*  thing that gets redirected away from the reader.
+*
+*  Four decisions make up the feature, and each of them is a refusal to guess:
+*
+*    1. ONLY A 200 IS WRITTEN. 200 is the one code that means "here is the
+*       thing you asked for". A 404's body is an error page, a 301's is a stub
+*       nobody reads, and a reply that does not begin with "HTTP/" is not a
+*       response at all. In each of those cases the file is never created and
+*       the body is printed on the screen instead -- because the reader now
+*       needs to SEE what the server actually sent, which is exactly the
+*       information a saved file would have hidden. And because -o asks for a
+*       file and no file was produced, that exits non-zero, unlike a plain
+*       fetch of a 404 which is a perfectly successful transaction.
+*
+*    2. AN EXISTING FILE IS NOT OVERWRITTEN. sys_fcreate() refuses one on
+*       purpose (see user/syscall.h) and this program does not argue with it.
+*       What arrives over a network is not known in advance -- it can be a
+*       redirect stub, a captive portal or nothing at all -- and overwriting
+*       something that is already on the disk with it, unasked, is a trade of
+*       a certainty for a guess. "rm FILE" is how one says it was meant. The
+*       check is also made BEFORE the request goes out, so a name that cannot
+*       be written is discovered without spending a connection on it.
+*
+*    3. THE FILE IS CREATED WHEN THE FIRST BODY BYTE IS DUE, not at startup.
+*       A fetch that fails at the resolver or the connect then leaves nothing
+*       behind; an empty file named after a page that was never retrieved is
+*       a small lie that outlives the message explaining it.
+*
+*    4. A SHORT sys_fwrite() IS NOT AN ERROR, it is the volume filling up.
+*       The write loop asks again for the remainder and only a return of zero
+*       means "it will not take more". That case says so, says how many bytes
+*       did reach the disk, and stops the transfer -- there is no point
+*       pulling the rest of a page down a wire to throw it away.
+*
+*  What is left behind after a failure differs between this program and cp,
+*  and the difference is deliberate: a partial download is kept, because the
+*  bytes came off a network and getting them again costs another transfer,
+*  whereas cp deletes its partial copy because the source is still sitting
+*  there intact and the fragment holds nothing the original does not.
+*
+*  The body reaches the file UNFILTERED. The 0x20..0x7E filter exists because
+*  a control character reaching sys_putch() moves a cursor; a file has no
+*  cursor, and "fetch -o" on a JPEG that stored dots instead of pixels would
+*  be useless. So the filter is a property of the screen, not of the page, and
+*  the trailer's "not printable" count -- which exists to repair the filter's
+*  lie -- is absent when there is no filter to repair.
 */
 #include "syscall.h"
 #include "lib.h"
@@ -181,6 +236,18 @@
 /* "host:port/path" as it is echoed in the trailer. */
 #define FETCH_TARGET       256
 
+/* How much body is staged before it is handed to sys_fwrite(). The kernel
+*  moves at most SYS_READ_MAX (4096) bytes per call and the filesystem writes
+*  whole clusters, so a smaller buffer would only mean more traps for the same
+*  bytes; a larger one would be chopped up by the kernel anyway. A short
+*  return is handled by the loop in file_flush() regardless of the size, so
+*  this is a throughput knob and nothing more. */
+#define FETCH_FILE         4096
+
+/* The one status code whose body is the thing that was asked for. See the
+*  note at the top on why -o writes nothing for any other. */
+#define FETCH_STATUS_OK    200
+
 /* cat's filter, byte for byte. */
 #define FETCH_FIRST_PRINT  0x20
 #define FETCH_LAST_PRINT   0x7E
@@ -217,6 +284,7 @@ static char line_buf[FETCH_LINE];
 static char request[FETCH_REQUEST];
 static char location[FETCH_LOCATION];
 static char target[FETCH_TARGET];
+static char file_buf[FETCH_FILE];        /* body on its way to the disk      */
 
 static int out_held;                     /* characters staged in out_buf     */
 static int line_held;                    /* characters of the current line   */
@@ -226,6 +294,28 @@ static int state;                        /* ST_*                             */
 static int show_headers;                 /* -i was given                     */
 static int status_code = -1;             /* from the status line, -1 if none */
 static int not_http;                     /* the reply did not begin "HTTP/"  */
+
+/* -o. out_path is the name that was given, or 0 when the body goes to the
+*  screen as it always did -- so "out_path != 0" is the whole test for "this
+*  is a fetch that is meant to produce a file".
+*
+*  The three flags below are not one enum because they answer three different
+*  questions and a run can be in more than one of the states at once:
+*
+*    to_file      where feed() sends a body byte right now. Decided once, at
+*                 the blank line, when the status code is finally known.
+*    file_made    the file exists on the disk because this program created it.
+*                 What separates "nothing was written" from "something was".
+*    file_stop    writing has stopped and the reason has already been printed.
+*                 The receive loop watches this and gives up the transfer.
+*/
+static const char *out_path;             /* -o FILE, or 0                    */
+static int to_file;                      /* body bytes go to the file        */
+static int file_made;                    /* sys_fcreate() succeeded          */
+static int file_stop;                    /* writing failed, message printed  */
+static int file_refused;                 /* -o given, nothing may be saved   */
+static unsigned long file_written;       /* body bytes actually on the disk  */
+static int file_held;                    /* body bytes staged in file_buf    */
 
 static unsigned long received;           /* bytes off the wire, all of them  */
 static unsigned long body_bytes;         /* bytes after the blank line       */
@@ -326,6 +416,175 @@ static void show_line(void)
 
 
 /* ------------------------------------------------------------------ */
+/* The file side, when -o was given                                    */
+/* ------------------------------------------------------------------ */
+
+/* Every message about the file goes through the same explain() the network
+*  errors use, so that "fetch: OUT.TXT: ..." reads the same whether the disk
+*  or the wire produced it. It is defined further down with the rest of the
+*  reporting, hence the declaration here. */
+static void explain(const char *what, int rc);
+
+/* Puts the screen back at the left margin before a message. Body bytes do not
+*  reach the screen while -o is writing, but the status line, a header shown
+*  under -i and a message from an earlier failure all can, and a diagnostic
+*  that begins in the middle of somebody else's line is hard to read. */
+static void break_line(void)
+{
+	out_flush();
+	if(!at_margin)
+	{
+		printf("\n");
+		at_margin = 1;
+	}
+}
+
+/* Hands everything staged in file_buf to the filesystem.
+*
+*  sys_fwrite() returns how many bytes it TOOK, and a count short of what was
+*  offered is not an error -- it is the volume running out underneath the
+*  write. So the loop asks again for the remainder, and only a return of ZERO
+*  is "it will not take any more". That distinction is the whole of this
+*  function: treating a short count as a failure would abandon a page that was
+*  still being written perfectly well, and treating it as success would report
+*  bytes as saved that are not on the disk.
+*
+*  file_written is the offset of the next byte AND the count of what has
+*  reached the disk, because sys_fwrite() has no file position of its own --
+*  every call says where to write. One variable, no way for the two numbers to
+*  drift apart.
+*
+*  Returns 0 when everything staged was written, -1 when it was not; in the
+*  second case the reason has already been printed and file_stop is set, so no
+*  caller has to report it a second time. */
+static int file_flush(void)
+{
+	int done;
+	int n;
+
+	if(file_stop || file_held == 0) return file_stop ? -1 : 0;
+
+	done = 0;
+
+	while(done < file_held)
+	{
+		n = sys_fwrite(out_path, file_written,
+		               (unsigned long)(file_held - done), file_buf + done);
+
+		if(n < 0)
+		{
+			break_line();
+			printf("fetch: writing to %s failed after %lu bytes:\n",
+			       out_path, file_written);
+			explain(out_path, n);
+			file_stop = 1;
+			return -1;
+		}
+
+		if(n == 0)
+		{
+			/* No progress on a non-empty request: the volume is full. Said
+			*  with the number, because "the disk is full" and "the disk is
+			*  full and your file stops at byte 8192" are different pieces of
+			*  news and only the second one can be acted on. */
+			break_line();
+			printf("fetch: the volume is full. %lu bytes of the page reached\n",
+			       file_written);
+			printf("       %s; the rest of it did not and the transfer is\n",
+			       out_path);
+			printf("       given up here. What was saved is kept -- \"rm %s\"\n",
+			       out_path);
+			printf("       gives the space back. \"df\" shows what is left.\n");
+			file_stop = 1;
+			return -1;
+		}
+
+		/* A write claiming to have taken more than it was offered is the one
+		*  number here that crossed the privilege boundary. It cannot happen,
+		*  and it is checked anyway: believing it would run file_written past
+		*  the end of the file and silently zero-fill the gap. */
+		if(n > file_held - done)
+		{
+			break_line();
+			printf("fetch: the kernel wrote %d bytes of a %d byte request.\n",
+			       n, file_held - done);
+			file_stop = 1;
+			return -1;
+		}
+
+		file_written += (unsigned long)n;
+		done += n;
+	}
+
+	file_held = 0;
+	return 0;
+}
+
+/* One body byte on its way to the disk. No filter: see the note at the top on
+*  why the 0x20..0x7E substitution belongs to the screen, not to the page. */
+static void file_putc(unsigned char c)
+{
+	file_buf[file_held++] = (char)c;
+	if(file_held == FETCH_FILE) file_flush();
+}
+
+/* Creates the file, at the moment the first body byte is due rather than at
+*  startup -- so a fetch that never got a body leaves nothing behind.
+*
+*  sys_fcreate() refusing an existing file is the guard that actually matters.
+*  main() checks with sys_stat() first, which is the check that produces a good
+*  message without spending a connection, but that answer is a moment old by
+*  the time the body arrives; this one is the filesystem's own and cannot be
+*  raced. Returns 1 when the body may be written. */
+static int file_begin(void)
+{
+	int rc;
+
+	rc = sys_fcreate(out_path);
+	if(rc == 0)
+	{
+		file_made = 1;
+		return 1;
+	}
+
+	break_line();
+	printf("fetch: %s could not be created:\n", out_path);
+	explain(out_path, rc);
+	return 0;
+}
+
+/* Why nothing is being saved, said once, at the moment the body starts. The
+*  body then goes to the SCREEN instead: the reader asked for a page and did
+*  not get one, and what the server sent instead is the only thing that
+*  explains why. Hiding it in a file, or dropping it, would leave the reader
+*  with a status code and no way to see what it was about. */
+static void file_not_saved(void)
+{
+	file_refused = 1;
+
+	break_line();
+
+	if(not_http)
+	{
+		printf("fetch: nothing is written to %s -- the reply is not an HTTP\n",
+		       out_path);
+		printf("       response, so there is no body to separate from it.\n");
+	}
+	else if(status_code < 0)
+	{
+		printf("fetch: nothing is written to %s -- the status line could not\n",
+		       out_path);
+		printf("       be read, so what follows is not known to be the page.\n");
+	} else {
+		printf("fetch: the server answered %d, not %d, so nothing is written\n",
+		       status_code, FETCH_STATUS_OK);
+		printf("       to %s. What follows is the body it sent instead.\n",
+		       out_path);
+	}
+}
+
+
+/* ------------------------------------------------------------------ */
 /* Reading the response                                                */
 /* ------------------------------------------------------------------ */
 
@@ -404,6 +663,10 @@ static void status_line_done(void)
 		printf("       an HTTP response and nothing is stripped from it --\n");
 		printf("       what follows is every byte that arrived.\n");
 
+		/* -o writes a page, and this is not one. Nothing is created; the
+		*  bytes go to the screen, where they can at least be looked at. */
+		if(out_path != 0) file_not_saved();
+
 		for(i = 0; i < line_held; i++) net_putc((unsigned char)line_buf[i], 1);
 		net_putc((unsigned char)'\n', 1);
 		body_bytes += (unsigned long)line_held + 1;
@@ -432,10 +695,36 @@ static void header_line(void)
 	if(v != 0) strlcpy(location, v, sizeof(location));
 }
 
-/* The blank line. */
+/* The blank line: the headers are over and everything after this is content.
+*
+*  This is also where -o decides, and it is the only place it could: the
+*  status code is known by now and not one byte of the body has been consumed
+*  yet, so the choice between the disk and the screen is made once and no byte
+*  can be routed the wrong way. */
 static void headers_done(void)
 {
 	state = ST_BODY;
+
+	if(out_path != 0)
+	{
+		if(status_code == FETCH_STATUS_OK)
+		{
+			to_file = 1;
+			if(!file_begin())
+			{
+				/* Nothing to write to. The transfer is abandoned rather than
+				*  quietly turned back into a screen dump: -o asked for a
+				*  file, and pulling the page down to print it instead is not
+				*  what was asked for. to_file stays set so feed() drops what
+				*  is already in flight. */
+				file_stop = 1;
+			}
+		} else {
+			file_not_saved();
+		}
+	}
+
+	if(to_file) return;
 
 	/* One empty line between what the protocol said and what the page says,
 	*  so the two are never read as one block of text. */
@@ -483,7 +772,11 @@ static void line_push(char c)
 *  Note what is NOT done to the body: nothing. Once state is ST_BODY every
 *  byte goes to the filter unexamined. '\r' is dropped in the header block
 *  because it is protocol there -- the CR of a CR LF -- and dropped in the
-*  body because cat drops it, but only the body's is counted. */
+*  body because cat drops it, but only the body's is counted.
+*
+*  Under -o the body goes to file_putc() instead, unfiltered and uncounted:
+*  the filter and the "not printable" tally exist to keep the SCREEN honest
+*  about bytes it could not show, and a file shows every byte it is given. */
 static void feed(const unsigned char *data, int n)
 {
 	int i;
@@ -495,6 +788,18 @@ static void feed(const unsigned char *data, int n)
 
 		if(state == ST_BODY)
 		{
+			if(to_file)
+			{
+				/* Writing has stopped and has said why. The rest of this
+				*  chunk is dropped and the receive loop, which checks
+				*  file_stop, ends the transfer. */
+				if(file_stop) return;
+
+				body_bytes++;
+				file_putc(c);
+				continue;
+			}
+
 			body_bytes++;
 			net_putc(c, 1);
 			continue;
@@ -641,14 +946,18 @@ static void print_ip(unsigned long ip)
 
 static void usage(void)
 {
-	printf("Syntax: fetch [-i] HOST [PATH] [PORT]\n");
-	printf("          HOST   a name or a dotted quad\n");
-	printf("          PATH   what to ask for, \"/\" if not given\n");
-	printf("          PORT   the TCP port, %d if not given\n", FETCH_PORT);
-	printf("          -i     print the response headers too\n");
+	printf("Syntax: fetch [-i] [-o FILE] HOST [PATH] [PORT]\n");
+	printf("          HOST     a name or a dotted quad\n");
+	printf("          PATH     what to ask for, \"/\" if not given\n");
+	printf("          PORT     the TCP port, %d if not given\n", FETCH_PORT);
+	printf("          -i       print the response headers too\n");
+	printf("          -o FILE  write the body to FILE instead of the screen.\n");
+	printf("                   Only a %d is saved, and an existing FILE is\n",
+	       FETCH_STATUS_OK);
+	printf("                   never overwritten -- \"rm FILE\" first.\n");
 	printf("        The parts are separate arguments, not a URL:\n");
 	printf("          fetch example.com /index.html\n");
-	printf("          fetch 10.0.2.2 / 8080\n");
+	printf("          fetch -o /P.TXT 10.0.2.2 /page.txt 8080\n");
 }
 
 /* Turns a negative system call return into a sentence. "what" names the step
@@ -703,7 +1012,49 @@ static void explain(const char *what, int rc)
 			break;
 
 		case SYS_EIO:
-			printf("fetch: %s: the card refused.\n", what);
+			/* Both sides of this program can produce it now: the card
+			*  refusing a packet and the disk refusing a sector. "what" is the
+			*  step or the file name, which is what tells the two apart. */
+			printf("fetch: %s: the hardware refused.\n", what);
+			break;
+
+		/* --- the three that only -o can reach ---------------------------- */
+
+		case SYS_EEXIST:
+		{
+			/* sys_fcreate() answers EEXIST for a DIRECTORY of that name as
+			*  well: the name is taken, by something that is not a file. The
+			*  difference matters because the advice differs -- "rm /DOCS" is
+			*  advice rm would refuse to take. A FAT subdirectory always
+			*  carries its own "." and ".." entries, so entry zero of a real
+			*  directory always exists, which is what tells the two apart. */
+			sys_dirent ent;
+
+			if(sys_readdir(what, 0, &ent) == 0)
+			{
+				printf("fetch: %s is a directory, not a file.\n", what);
+				printf("       -o writes a page to a file; give it a name that\n");
+				printf("       is free, such as %s/PAGE.TXT.\n", what);
+				break;
+			}
+
+			printf("fetch: %s: that file is already there.\n", what);
+			printf("       fetch will not overwrite it with whatever a server\n");
+			printf("       happens to send -- \"rm %s\" first, or pick\n", what);
+			printf("       another name.\n");
+			break;
+		}
+
+		case SYS_ENOSPC:
+			printf("fetch: %s: the volume is full.\n", what);
+			printf("       \"df\" shows how much room is left.\n");
+			break;
+
+		case SYS_EROFS:
+			printf("fetch: %s: nothing is mounted that can be written to.\n",
+			       what);
+			printf("       Booting without a disk is a normal case here --\n");
+			printf("       \"df\" shows what the drivers did find.\n");
 			break;
 
 		case SYS_ENOSYS:
@@ -792,10 +1143,103 @@ static void report_transfer(int ms)
 	printf("%lu bytes received", received);
 
 	if(!not_http) printf(", %lu body", body_bytes);
+	if(file_made) printf(", %lu written", file_written);
 	if(hidden != 0) printf(", %lu not printable", hidden);
 	if(dropped != 0) printf(", %lu dropped from an over-long line", dropped);
 
 	printf(", %d ms]\n", ms);
+}
+
+/* The last word on the disk, printed after everything else so that the final
+*  line on the screen answers the question -o was asked: is it there or not?
+*
+*  "failed" is main()'s verdict on the transfer as a whole, and it is what
+*  turns a file that was written into a file that is INCOMPLETE -- a key press
+*  or a reset connection stops the body without any write ever failing, so
+*  file_stop alone would not notice. A truncated file that is reported as
+*  saved is the one outcome this whole feature exists to avoid. */
+static void report_file(int failed)
+{
+	if(out_path == 0) return;
+
+	if(!file_made)
+	{
+		/* Why is already on the screen -- a status that was not 200, a reply
+		*  that was not HTTP, a file that could not be created, a transfer
+		*  that never reached a body. This is the one-line version of it, and
+		*  it says which of the two kinds it was: a reply that was not worth
+		*  saving, or a save that was not possible. */
+		if(file_refused)
+			printf("fetch: %s was not created -- the reply was not a page to\n"
+			       "       save.\n", out_path);
+		else
+			printf("fetch: nothing was written to %s.\n", out_path);
+		return;
+	}
+
+	if(file_stop || failed)
+	{
+		printf("fetch: %s IS INCOMPLETE -- it holds the first %lu bytes of a\n",
+		       out_path, file_written);
+		printf("       page that did not finish arriving.\n");
+		return;
+	}
+
+	printf("fetch: %lu bytes saved to %s.\n", file_written, out_path);
+}
+
+/* -o, before a single packet is sent. Both checks could be left to
+*  sys_fcreate() when the body starts, and both are made here instead for the
+*  same reason: a name that cannot be written to is worth discovering before a
+*  connection, a request and a page have been spent on finding it out.
+*
+*  Returns 1 when the fetch may go ahead. */
+static int prepare_output(void)
+{
+	sys_fsinfo info;
+	sys_dirent ent;
+	unsigned long size;
+
+	if(sys_statfs(&info) != 0)
+	{
+		printf("fetch: -o %s: no filesystem is mounted, so there is nowhere\n",
+		       out_path);
+		printf("       to write. Either no disk was found or nothing on it\n");
+		printf("       could be read -- booting without a disk is a normal\n");
+		printf("       case here, not a fault. \"df\" shows what there is.\n");
+		return 0;
+	}
+
+	/* A DIRECTORY of that name, which sys_stat() below cannot see: it answers
+	*  ENOENT for a directory exactly as it does for a name that is not there.
+	*  sys_fcreate() would catch it later -- it answers EEXIST, because the
+	*  name is taken by something -- but "later" is after a connection, a
+	*  request and however much of a page arrived before the blank line. A FAT
+	*  subdirectory always carries its own "." and ".." entries, so entry zero
+	*  of a real directory always exists, which makes this the one call that
+	*  can answer the question now. */
+	if(sys_readdir(out_path, 0, &ent) == 0)
+	{
+		printf("fetch: %s is a directory, not a file.\n", out_path);
+		printf("       -o writes a page to a file; give it a name that is\n");
+		printf("       free, such as %s/PAGE.TXT.\n", out_path);
+		return 0;
+	}
+
+	/* sys_stat() succeeds for a file and only for a file, so with the
+	*  directory already ruled out this is exactly the "it is already there"
+	*  test. */
+	if(sys_stat(out_path, &size) == 0)
+	{
+		printf("fetch: %s is already there (%lu bytes).\n", out_path, size);
+		printf("       fetch will not overwrite a file that exists with\n");
+		printf("       whatever a server happens to send -- what arrives over\n");
+		printf("       a network is not known until it has arrived. Remove it\n");
+		printf("       with \"rm %s\", or give -o another name.\n", out_path);
+		return 0;
+	}
+
+	return 1;
 }
 
 
@@ -825,20 +1269,59 @@ int main(int argc, char **argv)
 	port = FETCH_PORT;
 	failed = 0;
 
-	/* The one option, and it may only come first. Anything more elaborate
-	*  would mean an option parser, and there is one option. */
+	/* The options, and they come before the host. Two of them is still not
+	*  enough to justify a parser: the loop below is the parser, it accepts
+	*  them in either order, and anything it does not recognise is a mistake
+	*  rather than a host that begins with a dash -- no such host exists. */
 	arg = 1;
-	if(argc > 1 && argv[1][0] == '-')
+
+	while(arg < argc && argv[arg][0] == '-')
 	{
-		if(strcmp(argv[1], "-i") == 0)
+		if(strcmp(argv[arg], "-i") == 0)
 		{
 			show_headers = 1;
-			arg = 2;
-		} else {
-			printf("fetch: \"%s\" is not an option here.\n", argv[1]);
-			usage();
-			return FETCH_USAGE;
+			arg++;
+			continue;
 		}
+
+		if(strcmp(argv[arg], "-o") == 0)
+		{
+			if(arg + 1 >= argc)
+			{
+				printf("fetch: -o wants a file name after it.\n");
+				usage();
+				return FETCH_USAGE;
+			}
+
+			out_path = argv[arg + 1];
+
+			/* "fetch -o -i example.com" would otherwise create a file called
+			*  "-i" and then fail to resolve "example.com" as a path. A file
+			*  name beginning with a dash cannot exist on a FAT volume
+			*  anyway, so this rules out nothing anybody could have meant. */
+			if(out_path[0] == '-')
+			{
+				printf("fetch: \"%s\" looks like an option, not a file name\n",
+				       out_path);
+				printf("       for -o to write to.\n");
+				usage();
+				return FETCH_USAGE;
+			}
+
+			if(out_path[0] == '\0')
+			{
+				printf("fetch: -o was given an empty file name.\n");
+				usage();
+				return FETCH_USAGE;
+			}
+
+			arg += 2;
+			continue;
+		}
+
+		printf("fetch: \"%s\" is not an option here.\n", argv[arg]);
+		usage();
+		return FETCH_USAGE;
 	}
 
 	rest = argc - arg;
@@ -904,6 +1387,9 @@ int main(int argc, char **argv)
 		snprintf(target, sizeof(target), "%s%s%s", host, slash, path);
 	else
 		snprintf(target, sizeof(target), "%s:%d%s%s", host, port, slash, path);
+
+	/* Before the network, not after it: see prepare_output(). */
+	if(out_path != 0 && !prepare_output()) return FETCH_FAILED;
 
 	started = sys_uptime();
 
@@ -1025,6 +1511,17 @@ int main(int argc, char **argv)
 
 		received += (unsigned long)got;
 		feed((const unsigned char *)recv_buf, got);
+
+		/* The disk gave up: the volume filled, a write failed, or the file
+		*  could not be created at all. All three have already printed what
+		*  happened. Pulling the rest of the page down a wire to drop it on
+		*  the floor would cost the reader time and buy nothing, so the
+		*  transfer ends here. */
+		if(file_stop)
+		{
+			failed = 1;
+			break;
+		}
 	}
 
 	/* The clock is read HERE, before the close and before anything is
@@ -1038,9 +1535,17 @@ int main(int argc, char **argv)
 
 	sys_close(handle);
 
-	/* Whatever the last chunk left staged. The tail of a page reaches the
-	*  screen this way almost always, so this is the normal path and not an
-	*  exceptional one. */
+	/* Whatever the last chunk left staged, on either side. The tail of a page
+	*  reaches the screen -- or the disk -- this way almost always, so both of
+	*  these are the normal path and not an exceptional one.
+	*
+	*  The file is flushed after the clock has been read on purpose: elapsed
+	*  answers "how long did the page take to arrive", and the last write to a
+	*  disk this program has already finished waiting for is not part of that
+	*  question. What the write costs is not hidden -- it simply is not
+	*  reported as network time. */
+	if(to_file && file_flush() != 0) failed = 1;
+
 	out_flush();
 	if(!at_margin) printf("\n");
 
@@ -1066,8 +1571,17 @@ int main(int argc, char **argv)
 		failed = 1;
 	}
 
+	/* Without -o, a 404 is a successful fetch: the server answered the
+	*  question that was asked and this program printed the answer. With -o
+	*  the job was to produce a FILE holding the page, and no file was
+	*  produced -- so the two cases part company here. The exit status is the
+	*  only part of any of this that a caller who did not read the screen can
+	*  see, and it must not say "fine" about an empty hand. */
+	if(out_path != 0 && !file_made) failed = 1;
+
 	report_transfer(elapsed);
 	report_status();
+	report_file(failed);
 
 	return failed ? FETCH_FAILED : FETCH_OK;
 }

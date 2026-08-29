@@ -47,6 +47,10 @@
 #define SYS_SEND    17       /* send(handle, buf, len) -> bytes taken       */
 #define SYS_RECV    18       /* recv(handle, buf, len) -> bytes, 0 = ended  */
 #define SYS_CLOSE   19       /* close(handle)                               */
+#define SYS_FCREATE 20       /* fcreate(path)                               */
+#define SYS_FWRITE  21       /* fwrite(path, offset, len, buf) -> written    */
+#define SYS_UNLINK  22       /* unlink(path)                                */
+#define SYS_TRUNCATE 23      /* truncate(path, size)                        */
 
 /* --- Error returns -- mirror of src/include/syscall.h ------------------- */
 #define SYS_ENOSYS   (-1)    /* no such call number                         */
@@ -58,6 +62,9 @@
 #define SYS_ENETDOWN (-7)    /* no card, or the stack is not configured     */
 #define SYS_ETIMEDOUT (-8)   /* nothing answered in the time allowed        */
 #define SYS_ECONNRESET (-9)  /* the peer refused or reset the connection    */
+#define SYS_EEXIST  (-10)    /* the file is already there                   */
+#define SYS_EROFS   (-11)    /* nothing mounted, or it cannot be written     */
+#define SYS_ENOSPC  (-12)    /* the volume is full                          */
 
 /* --- Structures crossing the gate -- mirror of src/include/syscall.h ----
 *
@@ -316,6 +323,43 @@ static __inline__ int sys_recv(int handle, void *buf, unsigned long len)
 static __inline__ int sys_close(int handle)
 {
 	return syscall1(SYS_CLOSE, handle);
+}
+
+/* --- Writing files -----------------------------------------------------
+*
+*  The same shape as sys_read(): a path, an offset and a length, and no handle
+*  anywhere. Nothing has to be opened, so nothing can be left open.
+*/
+
+/* Creates an empty file. SYS_EEXIST if it is already there -- overwriting is
+*  a decision this call will not make for you; sys_truncate(path, 0) is how
+*  you say you meant it. The name must fit 8.3 or it is refused rather than
+*  shortened into something you cannot name again. */
+static __inline__ int sys_fcreate(const char *path)
+{
+	return syscall1(SYS_FCREATE, (int)path);
+}
+
+/* Writes at an offset, growing the file if it has to. Returns how many bytes
+*  were written, which is short when the volume fills up -- look at the number.
+*  Writing past the end zero-fills the gap. */
+static __inline__ int sys_fwrite(const char *path, unsigned long offset,
+                                 unsigned long len, const void *buf)
+{
+	return syscall4(SYS_FWRITE, (int)path, (int)offset, (int)len, (int)buf);
+}
+
+/* Removes a file. Refuses a directory. */
+static __inline__ int sys_unlink(const char *path)
+{
+	return syscall1(SYS_UNLINK, (int)path);
+}
+
+/* Sets the length: shrinking frees what is past the end, growing zero-fills.
+*  Truncating to 0 is the ordinary way to overwrite a file that exists. */
+static __inline__ int sys_truncate(const char *path, unsigned long size)
+{
+	return syscall2(SYS_TRUNCATE, (int)path, (int)size);
 }
 
 #endif

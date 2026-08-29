@@ -56,6 +56,20 @@
 #define SYS_RECV        18       /* recv(handle, buf, len) -> bytes, 0 = ended */
 #define SYS_CLOSE       19       /* close(handle)                              */
 
+/* Writing to the filesystem. Deliberately the same shape as SYS_READ -- a
+*  path, an offset and a length, no handle -- so that the read and write sides
+*  of a file look alike and neither needs a descriptor table in the kernel.
+*
+*  The cost of that symmetry is that every call re-walks the directory and the
+*  cluster chain, which for a program writing a page in 4 KB pieces is a real
+*  cost. It is accepted for the same reason as on the read side: a descriptor
+*  table is per-task state to allocate, validate, inherit and leak, and this is
+*  a filesystem a shell writes files to, not a database. */
+#define SYS_FCREATE     20       /* fcreate(path)                              */
+#define SYS_FWRITE      21       /* fwrite(path, offset, len, buf) -> written   */
+#define SYS_UNLINK      22       /* unlink(path)                               */
+#define SYS_TRUNCATE    23       /* truncate(path, size)                       */
+
 /* Error returns. Negative so a valid result stays distinguishable. */
 #define SYS_ENOSYS       (-1)    /* no such call number                        */
 #define SYS_EFAULT       (-2)    /* argument pointer outside the caller's reach */
@@ -66,6 +80,9 @@
 #define SYS_ENETDOWN     (-7)    /* no card, or the stack is not configured    */
 #define SYS_ETIMEDOUT    (-8)    /* nothing answered in the time allowed       */
 #define SYS_ECONNRESET   (-9)    /* the peer refused or reset the connection   */
+#define SYS_EEXIST      (-10)    /* the file is already there                  */
+#define SYS_EROFS       (-11)    /* nothing mounted, or it cannot be written   */
+#define SYS_ENOSPC      (-12)    /* the volume is full                         */
 
 /* ---------------------------------------------------------------------------
 *  Structures crossing the gate
