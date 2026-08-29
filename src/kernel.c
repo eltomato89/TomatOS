@@ -14,6 +14,7 @@
 #include <syscall.h>
 #include <vmm.h>
 #include <fbcon.h>
+#include <mouse.h>
 #include <exec.h>
 #include <ata.h>
 #include <fat.h>
@@ -24,18 +25,234 @@
 #include <tcp.h>
 #define cpuid(in, a, b, c, d) __asm__("cpuid": "=a" (a), "=b" (b), "=c" (c), "=d" (d) : "a" (in));
 
+/* --- memcpy() / memset() --------------------------------------------------
+*
+*  Both used to move one byte per iteration, which is what a 2011 tutorial
+*  kernel starts out with and what everything above them has quietly paid for
+*  ever since. The numbers are not subtle: a 1024x768x32 back buffer is
+*  3145728 bytes, so a single blit of one frame was three million iterations
+*  of load, store, two increments and a branch. The framebuffer console's
+*  scroll, the ELF loader's segment copies and the network stack's ring
+*  buffers all sit on the same two functions.
+*
+*  What follows moves 32 bits at a time. Measured in the kernel with
+*  timer_get_ticks(), 64 repetitions of the 3145728 byte case, on a heap
+*  buffer, so 192 MB moved per figure:
+*
+*      memcpy  byte loop  64 ms  ->  rep movsl  17 ms   (1.00 -> 0.27 ms/blit)
+*      memset  byte loop  52 ms  ->  rep stosl   6 ms   (0.81 -> 0.09 ms/clear)
+*
+*  A factor of 3.8 for the copy and 8.7 for the clear. The clear gains more
+*  because a store-only loop was already close to what the store buffer can
+*  retire, so replacing it removes almost all of the remaining instruction
+*  overhead, while the copy stays bounded by moving 6 MB through the cache
+*  either way. Note what that also says: the byte loop was never 32 times
+*  slower than a dword move. Out-of-order execution hides most of a tight
+*  byte loop, and the honest reason to change this is not the factor but that
+*  the factor is paid once per frame, forever.
+*
+*  Three decisions went into it, and each one is a decision rather than a
+*  style preference:
+*
+*  1. rep movsl / rep stosl instead of a C uint32_t loop.
+*
+*     This is not taste, it is what the compiler actually produces. GCC 16 at
+*     the -O1 this kernel is built with turns
+*
+*         while(words--) { *(uint32_t *)dp = *(const uint32_t *)sp;
+*                          dp += 4; sp += 4; }
+*
+*     into a six instruction loop body -- load, store, two adds, compare,
+*     branch -- and neither unrolls it nor recognises it as a block move.
+*     That is the byte loop with a quarter of the iterations and nothing more.
+*     "rep movsl" is ONE instruction for the whole run, and on every x86 since
+*     the 486 the string move is the path the hardware optimises: it issues
+*     full cache-line transfers instead of one bus cycle per dword.
+*
+*     There is a second reason, and on a freestanding kernel it is the more
+*     dangerous one. A C loop that copies memory is exactly the pattern
+*     -ftree-loop-distribute-patterns replaces with a call to memcpy(). It is
+*     off at -O1 and -fno-builtin is in the flags as well, so it does not
+*     happen today -- but the failure mode if either ever changes is memcpy()
+*     compiled into a call to itself: an infinite recursion inside the one
+*     function every other file depends on. Inline assembly cannot be turned
+*     into a library call, which takes the question off the table for good.
+*     Inline assembly is also what the rest of this file already uses for
+*     port I/O, so it is nothing new here.
+*
+*     -mgeneral-regs-only rules out the SSE paths a hosted libc would take;
+*     32 bits at a time is the widest this kernel may move.
+*
+*  2. The DESTINATION is aligned, not the source.
+*
+*     Only one of the two can be: dest and src may differ in their low two
+*     bits, and no number of head bytes ever makes those agree. So the head
+*     loop picks a side, and the measurement says the choice is worth less
+*     than one might think. Timed inside the kernel, 64 copies of 3145728
+*     bytes between two heap buffers:
+*
+*         dest and src both aligned                 17 ms
+*         dest and src both off by one (mutually
+*           aligned once the head loop has run)     18 ms
+*         dest off by one, src aligned              43 ms
+*         dest aligned, src off by one              50 ms
+*         ... and the same two with the SOURCE
+*         aligned by the head loop instead:         42 ms / 51 ms
+*
+*     The last two lines are the point. Aligning the source instead of the
+*     destination gives 42/51 against 43/50 -- the same numbers, inside the
+*     1 ms resolution of the tick counter. What actually costs a factor of
+*     2.5 is that the two sides are MUTUALLY misaligned, and neither choice
+*     can fix that. On a CPU with cheap unaligned access the decision is
+*     therefore free, and the reason it is the destination anyway is a case
+*     this measurement does not contain: a copy INTO the framebuffer. That
+*     memory is write-combining, and an unaligned store there can break the
+*     combining buffer apart and turn one burst into two partial bus writes,
+*     which a misaligned load never does. When the destination is MMIO, the
+*     destination is the side to align; when it is RAM, it does not matter.
+*     Aligning the destination is right in both.
+*
+*  3. The copy direction stays FORWARD, and that is load bearing.
+*
+*     fbcon_scroll() copies its shadow buffer up by one row -- destination
+*     BELOW source, ranges overlapping -- and its comment says in so many
+*     words that it relies on the forward byte loop this replaces. It is the
+*     only caller in the kernel that overlaps at all; the other ring buffers
+*     (net.c, tcp.c) copy between separate buffers, and heap.c's realloc()
+*     copies into a fresh block. There is no memmove() on the kernel side --
+*     user/lib.c has one, but that is a different binary.
+*
+*     "rep movsb"/"rep movsl" with DF clear ascend, so the direction is kept.
+*     What is NOT kept is byte-for-byte equivalence with the old loop when
+*     dest and src overlap by fewer than four bytes: writing a dword at dp
+*     touches sp[-3..0] before they are read, whereas the byte loop would have
+*     read each one first. That difference is only visible for src - dest in
+*     1..3, i.e. the "replicate a small pattern forwards" trick. Nothing here
+*     does that -- fbcon's two rows are 256 bytes apart -- and the small-copy
+*     path below is still a plain byte loop, but it is the one property a
+*     future caller must not assume.
+*
+*  The threshold: below MEMOP_BLOCK_MIN bytes the byte loop wins outright.
+*  Computing head/words/tail and starting three "rep" instructions costs on
+*  the order of a few dozen cycles of setup, and the kernel's most frequent
+*  copy by count is ETH_ALEN -- six bytes, in net.c's frame builders. Sixteen
+*  is where the two are roughly even and is deliberately generous: a copy that
+*  small is never on a path that matters.
+*/
+#define MEMOP_BLOCK_MIN 16
+
 void *memcpy(void *dest, const void *src, size_t count)
 {
-    const char *sp = (const char *)src;
-    char *dp = (char *)dest;
-    for(; count != 0; count--) *dp++ = *sp++;
+    unsigned char *dp;
+    const unsigned char *sp;
+    size_t head;
+    size_t words;
+    size_t tail;
+
+    dp = (unsigned char *)dest;
+    sp = (const unsigned char *)src;
+
+    if(count < MEMOP_BLOCK_MIN)
+    {
+        while(count != 0)
+        {
+            *dp++ = *sp++;
+            count--;
+        }
+        return dest;
+    }
+
+    /* Bytes up to the next 4 byte boundary of the DESTINATION: 0 when dp is
+    *  already aligned, otherwise 4 - (dp & 3). Written as the negation so
+    *  there is no branch and no subtraction that could wrap. count is at
+    *  least MEMOP_BLOCK_MIN here, so head can never exceed it. */
+    head = (size_t)((0u - (uint32_t)dp) & 3u);
+    count -= head;
+    words = count >> 2;
+    tail  = count & 3u;
+
+    /* Three statements rather than one block with the counts in scratch
+    *  registers: each one names edi/esi/ecx as read-write operands, so the
+    *  compiler threads the updated pointers from one to the next itself and
+    *  there is no input register that could be allocated on top of an output
+    *  -- the classic way an inline "rep" sequence goes wrong.
+    *
+    *  cld belongs to the first of them. The System V ABI says DF is clear at
+    *  every function boundary and start.asm clears it once at entry, so this
+    *  is belt and braces -- but a single interrupt stub that ever left DF set
+    *  would otherwise turn every copy in the kernel into a backwards one, and
+    *  that is not a bug anybody wants to find from the outside.
+    *
+    *  A "rep" with ecx == 0 is a no-op, so the head and tail statements cost
+    *  one predictable branch each when there is nothing for them to do. */
+    __asm__ __volatile__("cld\n\trep movsb"
+        : "+D"(dp), "+S"(sp), "+c"(head)
+        : : "memory", "cc");
+    __asm__ __volatile__("rep movsl"
+        : "+D"(dp), "+S"(sp), "+c"(words)
+        : : "memory", "cc");
+    __asm__ __volatile__("rep movsb"
+        : "+D"(dp), "+S"(sp), "+c"(tail)
+        : : "memory", "cc");
+
     return dest;
 }
 
+/* The signature is the one in system.h and does not change: val is a char,
+*  not the int a hosted memset() takes. Every caller in the kernel passes a
+*  character or a zero, so widening it would buy nothing and would silently
+*  change the meaning of the dozens of existing call sites -- memset(p, 256,
+*  n) means something different in the two versions.
+*
+*  What the char DOES force is the cast on the way in. Plain char is signed on
+*  x86, so memset(p, 0xFF, n) arrives as -1, and multiplying that by
+*  0x01010101 as a signed value is signed overflow. The cast to unsigned char
+*  first is what makes the pattern 0xFFFFFFFF instead of undefined. */
 void *memset(void *dest, char val, size_t count)
 {
-    char *temp = (char *)dest;
-    for( ; count != 0; count--) *temp++ = val;
+    unsigned char *dp;
+    uint32_t byte;
+    uint32_t pattern;
+    size_t head;
+    size_t words;
+    size_t tail;
+
+    dp = (unsigned char *)dest;
+    byte = (uint32_t)(unsigned char)val;
+
+    if(count < MEMOP_BLOCK_MIN)
+    {
+        while(count != 0)
+        {
+            *dp++ = (unsigned char)byte;
+            count--;
+        }
+        return dest;
+    }
+
+    /* One byte smeared across all four lanes. The multiply is a single imul
+    *  and beats the three shift/or pairs GCC would otherwise emit. */
+    pattern = byte * 0x01010101u;
+
+    head = (size_t)((0u - (uint32_t)dp) & 3u);
+    count -= head;
+    words = count >> 2;
+    tail  = count & 3u;
+
+    /* eax is an input only, and both "+D"/"+c" are hard register constraints,
+    *  so nothing can be allocated over it. The head and tail runs want the
+    *  byte in al, the middle one the full pattern in eax; the two are handed
+    *  in separately rather than shifted about inside the asm. */
+    __asm__ __volatile__("cld\n\trep stosb"
+        : "+D"(dp), "+c"(head)
+        : "a"(byte) : "memory", "cc");
+    __asm__ __volatile__("rep stosl"
+        : "+D"(dp), "+c"(words)
+        : "a"(pattern) : "memory", "cc");
+    __asm__ __volatile__("rep stosb"
+        : "+D"(dp), "+c"(tail)
+        : "a"(byte) : "memory", "cc");
+
     return dest;
 }
 
@@ -161,6 +378,136 @@ static void print_memory_map(multiboot_info *mbi)
 		total_kib, (total_kib / 1024u), shown);
 }
 
+/* --- The kernel command line ----------------------------------------------
+*
+*  The string a Multiboot loader passes to the kernel itself, as opposed to
+*  the per-module command lines exec.c reads. QEMU supplies it with -append,
+*  GRUB with whatever follows the file name on the "multiboot" line. Our own
+*  stage 2 supplies none at all: boot/stage2.asm never sets MB_FLAG_CMDLINE,
+*  so on the bootdisk every option below is simply absent, which is exactly
+*  the behaviour the bootdisk needs.
+*
+*  Exactly one option exists so far, "text" -- see cmdline_text_mode().
+*
+*  The reading follows what exec.c's module_name_from_cmdline() already does,
+*  and for the same reasons: the address is PHYSICAL, it may be zero, it may
+*  point outside the direct mapping, and the string may not be terminated at
+*  all. All three are answered by refusing to read rather than by faulting,
+*  and the length is bounded against the end of the direct mapping rather
+*  than trusted.
+*/
+#define CMDLINE_MAX 256
+
+/* Non-zero if opt appears in the command line as a word of its own.
+*
+*  Whole words, not a substring search, and that is not pedantry. QEMU's
+*  Multiboot loader prepends the kernel's file name to whatever -append says,
+*  so the string this sees is "kernel.elf text" and not "text"; GRUB does the
+*  same with the path from the "multiboot" line. A substring match would fire
+*  on any file name that happens to contain the option -- booting a kernel
+*  called "textmode.elf" would silently disable the framebuffer. Whitespace
+*  on both sides is the only rule, so a path can say anything it likes as
+*  long as it is not the bare word. */
+static int cmdline_has(multiboot_info *mbi, const char *opt)
+{
+	const char *cmd;
+	uint32_t room;
+	int limit;
+	int i;
+	int j;
+	int start;
+
+	if(mbi == 0) return 0;
+	if(!(mbi->flags & MULTIBOOT_INFO_CMDLINE)) return 0;
+	if(mbi->cmdline == 0 || mbi->cmdline > DIRECT_MAP_LIMIT) return 0;
+
+	room  = DIRECT_MAP_LIMIT - mbi->cmdline + 1;
+	limit = CMDLINE_MAX;
+	if(room < (uint32_t)limit) limit = (int)room;
+
+	cmd = (const char *)P2V(mbi->cmdline);
+
+	i = 0;
+	while(i < limit && cmd[i] != '\0')
+	{
+		/* Skip the separators, then take everything up to the next one
+		*  as one word and compare it in full. */
+		if(cmd[i] == ' ' || cmd[i] == '\t')
+		{
+			i++;
+			continue;
+		}
+
+		start = i;
+		while(i < limit && cmd[i] != '\0' && cmd[i] != ' ' && cmd[i] != '\t')
+			i++;
+
+		for(j = 0; opt[j] != '\0'; j++)
+			if(start + j >= i || cmd[start + j] != opt[j]) break;
+
+		/* Both ended together: same length, same characters. */
+		if(opt[j] == '\0' && start + j == i) return 1;
+	}
+
+	return 0;
+}
+
+/* "text" on the kernel command line: use the VGA text console and ignore any
+*  framebuffer the loader reports.
+*
+*  Why this exists at all. The Multiboot header in start.asm now asks for
+*  1024x768x32, so a loader that honours it hands us a graphics mode and the
+*  framebuffer console takes the screen. That is what we want by default and
+*  it is also a one-way door: from protected mode there is no int 0x10 and
+*  therefore no way to ask for a different mode, so a kernel that only ever
+*  used what it was given could never be told to stay in text mode again. A
+*  request is a preference and not a guarantee, but the fallback it produces
+*  is an accident of the loader -- "it happened not to work" -- and that is
+*  not the same thing as being able to choose.
+*
+*  What it does and what it does NOT do, because the difference matters and
+*  is easy to get wrong. This makes the KERNEL behave as though no
+*  framebuffer had been reported: the console stays on 0xB8000, fb_usable()
+*  says no, and "gfx" finds no surface. It does not, and cannot, put the
+*  DISPLAY back into a text mode -- that needs int 0x10, the loader is the
+*  last code that could still call it, and by the time this runs the loader
+*  is gone.
+*
+*  Which is why the option is refused when it cannot be carried out. If the
+*  loader reports a framebuffer whose type is not EGA text, then the screen
+*  IS a graphics mode, and a kernel that dutifully moved its console to
+*  0xB8000 would be writing into memory nothing is displaying: a black
+*  screen, no boot messages, no shell, and no way to find out why. That was
+*  measured rather than assumed -- GRUB honours the video request in the
+*  header even with "set gfxpayload=text" in front of the multiboot line, and
+*  the result is exactly that black screen. Going blind on request is not
+*  serving the request, so in that case the framebuffer console keeps the
+*  screen and framebuffer_init() prints one line saying the option was seen,
+*  what stopped it, and where to ask instead.
+*
+*  So, per boot path:
+*
+*    - "make run" (QEMU -kernel): QEMU's Multiboot loader does not implement
+*      the video request at all -- it prints "multiboot knows VBE. we don't"
+*      on stderr and reports no framebuffer -- so the machine is in text mode
+*      either way, the option is honoured, and it is what makes the kernel's
+*      behaviour deliberate rather than incidental. This is the case it is
+*      for, and the one the Makefile wires up with -append.
+*    - GRUB: sets the mode, so the option is refused and reported. Text mode
+*      there is the loader's to give: build without MULTIBOOT_VIDEO_MODE, or
+*      boot the kernel some other way.
+*    - The bootdisk: stage 2 passes no command line at all (it never sets
+*      MB_FLAG_CMDLINE), so none of this can be reached and nothing changes.
+*
+*  The spelling is the bare word "text". It reads as what it means on the
+*  command line one actually types -- -append "text" -- and it is the word
+*  Linux has used for the same thing for thirty years, which is worth more
+*  than a more precise "novideo" or "nofb" that has to be looked up. */
+static int cmdline_text_mode(multiboot_info *mbi)
+{
+	return cmdline_has(mbi, "text");
+}
+
 /* --- The framebuffer the bootloader handed over ---------------------------
 *
 *  A graphics mode cannot be established from protected mode: a VBE mode needs
@@ -194,6 +541,16 @@ static uint32_t fb_bpp;
 static uint32_t fb_type = MULTIBOOT_FRAMEBUFFER_EGA_TEXT;
 static int fb_reachable;	/* P2V() can name it at all                  */
 static int fb_mapped;		/* and the page is actually present          */
+
+/* "text" was on the kernel command line, and what came of it. Read once, in
+*  framebuffer_describe(), and remembered rather than parsed again in
+*  framebuffer_init(): the two must not be able to disagree, and the second of
+*  them runs several hundred lines and one page directory later.
+*
+*  Two flags because the answer has three states, not two: not asked for,
+*  asked for and done, asked for and impossible. See cmdline_text_mode(). */
+static int fb_text_forced;	/* honoured: the console stays on 0xB8000    */
+static int fb_text_refused;	/* asked for, but the display is graphics    */
 
 uint32_t fb_base(void)           { return fb_addr; }
 uint32_t fb_pitch_bytes(void)    { return fb_pitch; }
@@ -245,7 +602,41 @@ static void framebuffer_describe(multiboot_info *mbi)
 {
 	uint32_t addr;
 
-	if(!(mbi->flags & MULTIBOOT_INFO_FRAMEBUFFER))
+	/* Read here and nowhere else, and read before the framebuffer flag is
+	*  even looked at: this is the first line of the kernel that consults
+	*  the command line, and everything that reacts to it is below. */
+	fb_text_forced = cmdline_text_mode(mbi);
+
+	/* The refusal, and it is decided here rather than in framebuffer_init()
+	*  because here is where it takes effect: this is the call that hands
+	*  the console its screen, and by the time framebuffer_init() runs the
+	*  console has already been painted.
+	*
+	*  The test is the reported TYPE and nothing else. A type other than EGA
+	*  text is the loader saying it put the display into a graphics mode,
+	*  which is precisely the situation in which 0xB8000 shows nobody
+	*  anything. Whether the kernel can go on to map that framebuffer, and
+	*  whether the console then succeeds in taking it over, are later and
+	*  separate questions - fbcon_activate() answers them and falls back to
+	*  text mode on its own if it cannot. That fallback is blind on such a
+	*  machine, but it is the pre-existing behaviour for a framebuffer the
+	*  kernel cannot use and is not made worse by anything here. */
+	if(fb_text_forced
+	   && (mbi->flags & MULTIBOOT_INFO_FRAMEBUFFER)
+	   && mbi->framebuffer_type != MULTIBOOT_FRAMEBUFFER_EGA_TEXT)
+	{
+		fb_text_refused = 1;
+		fb_text_forced  = 0;
+	}
+
+	/* "text" and "no framebuffer reported" are described to the console in
+	*  exactly the same way, on purpose. The console has one text mode, not
+	*  two, and a second path into it would be a second thing to keep
+	*  correct for no gain. Whatever the loader put in the framebuffer
+	*  fields is dropped on the floor here and is never recorded, so
+	*  everything downstream -- fb_usable(), "gfx", the shell -- sees a
+	*  machine that has no graphics surface, which is what was asked for. */
+	if(fb_text_forced || !(mbi->flags & MULTIBOOT_INFO_FRAMEBUFFER))
 	{
 		fbcon_describe(0, 0, 0, 0, 0, MULTIBOOT_FRAMEBUFFER_EGA_TEXT);
 		return;
@@ -268,12 +659,24 @@ static void framebuffer_init(multiboot_info *mbi)
 	const char *kind;
 	const char *status;
 
+	/* Asked for by hand, so it is reported by hand: the line says the mode
+	*  was chosen rather than merely absent, and it names the option that
+	*  chose it, which is the one thing somebody staring at an unexpected
+	*  80x25 screen needs to know. Nothing is recorded in fb_* -- see
+	*  framebuffer_describe(). */
+	if(fb_text_forced)
+	{
+		printf("Framebuffer: disabled by \"text\" on the command line\n");
+		return;
+	}
+
 	if(!(mbi->flags & MULTIBOOT_INFO_FRAMEBUFFER))
 	{
-		/* GRUB Legacy never sets the bit, and GRUB 2 leaves it out when
-		*  the multiboot header asks for no video mode. That is not a
-		*  failure - it means the machine is still in the VGA text mode
-		*  scrn.c drives, which is what we want today. */
+		/* GRUB Legacy never sets the bit, and a Multiboot loader that
+		*  does not implement the video request of our header leaves it
+		*  out as well -- QEMU's own -kernel loader is exactly that case
+		*  and says so on stderr. That is not a failure: it means the
+		*  machine is still in the VGA text mode scrn.c drives. */
 		printf("Framebuffer: none reported, VGA text mode\n");
 		return;
 	}
@@ -345,6 +748,14 @@ static void framebuffer_init(multiboot_info *mbi)
 	*  reports the full mode with "gfx -i". */
 	printf(" (%s, %s)\n", status,
 		fbcon_active() ? "console active" : "text mode");
+
+	/* Only ever printed when somebody actually typed the option, so the
+	*  boot output of every normal run is one line shorter than this
+	*  function looks. It costs a row precisely where a row is worth it:
+	*  the alternative to this line is a user who asked for text mode,
+	*  did not get it, and has nothing on screen explaining that. */
+	if(fb_text_refused)
+		printf("  \"text\" ignored: the loader set this mode, ask it instead\n");
 }
 
 /* Reports the modules the bootloader loaded alongside the kernel, in exactly
@@ -827,6 +1238,22 @@ int kernel(uint32_t magic, multiboot_info *mbi_phys)
 	mt_install();
     pic_install();
     keyboard_install();
+
+	/* The mouse hangs off the same 8042 controller as the keyboard, so it goes
+	*  in right after it -- and after it on purpose, not before: bringing the
+	*  auxiliary port up means reading and rewriting the controller's shared
+	*  configuration byte, and mouse_init() masks IRQ 1 across that because the
+	*  controller answers a config read by raising the KEYBOARD interrupt.
+	*  Doing this while the keyboard handler is already installed is what makes
+	*  that masking meaningful; doing it before would leave a byte in the buffer
+	*  with nobody to blame.
+	*
+	*  No mouse is an ordinary outcome, not a failure -- a machine may have
+	*  none, and QEMU can be told to leave the controller out entirely. It
+	*  reports through its return value rather than printing, so nothing is said
+	*  here either: "mouse" shows what was found, and a line at boot saying a
+	*  mouse exists would be a row spent on news nobody asked for. */
+	mouse_init();
 	printf("Initializing Serial Port\n");
 	init_serial();
 	printf("Enabling A20 Gate\n");

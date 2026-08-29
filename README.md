@@ -230,6 +230,77 @@ type string in the boot sector — that field is advisory and often wrong. And
 the root directory of FAT12/16 is a fixed area behind the FATs, not part of
 the cluster chain, unlike every subdirectory.
 
+### The mouse
+
+`mouse` shows the pointer live: position, movement, buttons, and counters for
+packets, resyncs, overflows and dropped events. It blocks while nothing moves
+rather than polling — `ps` from another command shows the task as `Blocked`,
+waiting on the channel `mouse_wait_channel()` returns.
+
+The interface in `src/include/mouse.h` deliberately says nothing about PS/2 —
+no ports, no scancodes, no packet format. A USB HID driver is meant to fill the
+same queue later, and everything above it should keep working without learning
+that anything changed.
+
+Three details in the device get implementations wrong, and one thing about the
+controller cannot be worked out by reading anything:
+
+**The byte stream can desynchronise.** There is no framing, so a lost or
+spurious byte shifts every packet after it and the pointer flies off. Bit 3 of
+the first byte is always set and is the only anchor — but it is not enough on
+its own: a misaligned byte that happens to have it set (a dy of 8 to 15) slips
+through, so a half-collected packet older than 50 ms is also treated as debris.
+Tested by stealing one byte out of the live stream, which is exactly what a
+lost interrupt looks like: two resyncs, then fifteen consecutive movements
+decoded exactly.
+
+**dx and dy are 9-bit signed**, with the sign bit in the flags byte rather than
+the data byte. Treating them as signed chars works until somebody moves the
+mouse quickly, and then the pointer jumps backwards.
+
+**Y counts up and screens count down.** Inverting it in one place is the
+difference between a pointer that works and one that works in half the code.
+
+**And the one that had to be found by testing:** the 8042 answers "read
+configuration" by setting the *keyboard* output flag, so it raises IRQ 1. The
+keyboard handler then reads the byte and the mouse's bring-up never sees it —
+the first run reported "no mouse" on a machine that has one. IRQ 1 is masked
+across that step now, and every failure path restores the configuration byte,
+because a driver that gives up and leaves the keyboard switched off has done
+more damage than the mouse it did not find.
+
+Overflow keeps the buttons and discards the movement: an overflowed data byte
+is the movement modulo 512 with the true size known only to be at least 256, so
+using it is not using a value but inventing one. The buttons in the same packet
+did not overflow.
+
+### Faster copies
+
+`memcpy` and `memset` were byte loops from 2011. They are `rep movsl`/`rep
+stosl` with an aligned destination now, which matters for a GUI blitting a
+3 MB back buffer, and already mattered for console scrolling, the ELF loader
+and the network stack:
+
+| | before | after | |
+|---|---|---|---|
+| `memcpy`, 3 MB | 1.00 ms | 0.27 ms | 3.8× |
+| `memset`, 3 MB | 0.81 ms | 0.09 ms | 8.7× |
+
+The choice of inline assembly over a C `uint32_t` loop was made from the
+generated code, not from taste: GCC 16 at `-O1` compiles the C version to a
+six-instruction body with no unrolling — the byte loop with a quarter of the
+iterations. There is also a hazard peculiar to a freestanding kernel, which
+inline assembly removes: a C copy loop is exactly the shape
+`-ftree-loop-distribute-patterns` rewrites into a call to `memcpy`, so `memcpy`
+would compile into a call to itself.
+
+Measurement settled the alignment question too. Aligning the destination or the
+source costs the same; what costs 2.5× is the two sides being *mutually*
+misaligned, which neither choice can fix. The destination is aligned anyway,
+for the case RAM benchmarks do not contain — a copy *into* the framebuffer,
+where a split store can break a write-combining burst apart and a split load
+cannot.
+
 ### Graphics
 
 `gfx` draws a demonstration picture, and **which surface it draws into depends

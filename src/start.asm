@@ -185,15 +185,67 @@ mboot:
     ; Multiboot macros to make a few lines later more readable
     MULTIBOOT_PAGE_ALIGN	equ 1<<0
     MULTIBOOT_MEMORY_INFO	equ 1<<1
+    MULTIBOOT_VIDEO_MODE	equ 1<<2
     MULTIBOOT_HEADER_MAGIC	equ 0x1BADB002
-    MULTIBOOT_HEADER_FLAGS	equ MULTIBOOT_PAGE_ALIGN | MULTIBOOT_MEMORY_INFO
+    MULTIBOOT_HEADER_FLAGS	equ MULTIBOOT_PAGE_ALIGN | MULTIBOOT_MEMORY_INFO | MULTIBOOT_VIDEO_MODE
     MULTIBOOT_CHECKSUM	equ -(MULTIBOOT_HEADER_MAGIC + MULTIBOOT_HEADER_FLAGS)
+
+    ; The mode we would like. mode_type 0 is "linear graphics", 1 would be
+    ; "EGA text"; width and height are then pixels and depth is bits per
+    ; pixel. 1024x768x32 is what boot/vbe.inc scores highest as well, so both
+    ; boot paths aim at the same screen and the framebuffer console gets the
+    ; 128x48 character grid it is sized for either way.
+    ;
+    ; A zero in any of the three would mean "no preference"; we state all
+    ; three, because a loader that cannot serve them is REQUIRED to fall back
+    ; to something close rather than to fail, and "close to 1024x768x32" is a
+    ; far better guess than "close to nothing".
+    MULTIBOOT_VIDEO_LINEAR	equ 0
+    MULTIBOOT_VIDEO_WIDTH	equ 1024
+    MULTIBOOT_VIDEO_HEIGHT	equ 768
+    MULTIBOOT_VIDEO_DEPTH	equ 32
 
     ; This is the GRUB Multiboot header. A boot signature
     ; No AOUT kludge: the bootloader uses the ELF program headers instead.
+    ;
+    ; The layout below is the whole reason this header is written out field by
+    ; field instead of as three dwords. Multiboot 1 puts every field at a
+    ; FIXED offset from the magic -- the flag bits say which ones are valid,
+    ; they do not say which ones are present:
+    ;
+    ;   0x00 magic          0x0C header_addr    0x20 mode_type
+    ;   0x04 flags          0x10 load_addr      0x24 width
+    ;   0x08 checksum       0x14 load_end_addr  0x28 height
+    ;                       0x18 bss_end_addr   0x2C depth
+    ;                       0x1C entry_addr
+    ;
+    ; The five address fields at 0x0C..0x1C belong to the a.out kludge (flag
+    ; bit 16), which we do NOT set -- the loader takes the ELF program headers
+    ; instead. But the video fields sit at 0x20 regardless, so those five
+    ; dwords have to be emitted as padding anyway. Leaving them out and
+    ; writing mode_type straight after the checksum would put it at 0x0C,
+    ; where the loader reads header_addr, and the header would describe a
+    ; kernel to be loaded at address 0 with 1024 as its entry point. That is
+    ; read and acted upon before a single instruction of ours runs, so there
+    ; would be nothing to debug it with.
+    ;
+    ; They are zero and stay zero: with bit 16 clear the loader must not look
+    ; at them at all, and zero is the value that is obviously not a real
+    ; address should anything ever look anyway.
     dd MULTIBOOT_HEADER_MAGIC
     dd MULTIBOOT_HEADER_FLAGS
     dd MULTIBOOT_CHECKSUM
+
+    dd 0                    ; header_addr    ) a.out kludge, flag bit 16 --
+    dd 0                    ; load_addr      ) not set, so these are padding
+    dd 0                    ; load_end_addr  ) that only exists to place the
+    dd 0                    ; bss_end_addr   ) video fields at offset 0x20
+    dd 0                    ; entry_addr     )
+
+    dd MULTIBOOT_VIDEO_LINEAR   ; mode_type
+    dd MULTIBOOT_VIDEO_WIDTH
+    dd MULTIBOOT_VIDEO_HEIGHT
+    dd MULTIBOOT_VIDEO_DEPTH
 
 ; This is an endless loop here. Make a note of this: Later on, we
 ; will insert an 'extern kernel', followed by 'call kernel', right

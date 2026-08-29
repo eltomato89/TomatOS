@@ -20,6 +20,7 @@
 #include <dhcp.h>
 #include <dns.h>
 #include <tcp.h>
+#include <mouse.h>
 //#include <wmessages.h>
 
 #define NULL 0
@@ -415,6 +416,83 @@ extern char usertext_end[];
 *  column actually is. */
 #define GFX_INFO_LABEL   17
 
+/* --- mouse ---------------------------------------------------------------
+*
+*  Column widths of the row "mouse" repaints while it runs, and of the header
+*  over it. printf() has no field widths, so every field is padded by hand out
+*  of ps_print_left(), fs_print_right_text(), mem_print_right() and
+*  mouse_print_signed(), exactly as the "ps", "df", "arp" and "netstat" tables
+*  are.
+*
+*  THE ROW HAS TO COME OUT THE SAME WIDTH EVERY TIME. It is rewritten in place
+*  with a carriage return rather than a newline -- that is what makes it a live
+*  display instead of a page of scrolling numbers -- and a carriage return only
+*  moves the cursor back to the margin, erasing nothing. A row that shrank from
+*  four digits to three would leave the fourth standing there. So every field
+*  below is padded to its width and none is truncated to it, and the widths are
+*  the ones the values cannot outgrow: a coordinate is clamped into the bounds
+*  and a movement carries a sign, and five columns hold both at any screen size
+*  this kernel can drive.
+*
+*  The counters are 32 bit and would want ten columns each. They get nine, and
+*  a machine that has produced a billion packets pushes the row along instead
+*  of losing a digit -- a display that has stopped lining up rather than one
+*  that has started lying. It takes a fortnight of moving the mouse to get
+*  there, and the alternative costs the row its position column.
+*
+*  2 + 13 + 2 + 13 + 2 + 7 + 4 * 9 = 75 columns, which leaves the eighty column
+*  line intact and the cursor short of the margin -- so the row never wraps
+*  onto a second line, which would leave half of it on the screen for good. */
+#define MOUSE_COORD_WIDTH    5   /* one coordinate, its sign included      */
+#define MOUSE_PAIR_WIDTH    13   /* "(nnnnn,nnnnn)": two of those, the
+                                    brackets and the comma                 */
+#define MOUSE_BTN_WIDTH      7   /* "LMR" and the gap to the next column   */
+#define MOUSE_COUNT_WIDTH    9
+#define MOUSE_GAP            2
+#define MOUSE_ROW_WIDTH   (MOUSE_GAP + MOUSE_PAIR_WIDTH \
+                           + MOUSE_GAP + MOUSE_PAIR_WIDTH \
+                           + MOUSE_GAP + MOUSE_BTN_WIDTH \
+                           + 4 * MOUSE_COUNT_WIDTH)
+
+/* Width of the label column of "mouse -i", counted from the start of the line
+*  including the two leading spaces -- the same idea as GFX_INFO_LABEL. */
+#define MOUSE_INFO_LABEL    14
+
+/* The text screen, and the size of the cell the font draws into it. Only used
+*  to convert between the two: the pointer's field is cells times cell size,
+*  and "mouse -i" divides back to say which cell the pointer is over. See the
+*  comment above mouse_console_field() for why a text screen is measured in
+*  pixels at all. */
+#define MOUSE_TEXT_COLS     80
+#define MOUSE_TEXT_ROWS     25
+#define MOUSE_CELL_W         8
+#define MOUSE_CELL_H        16
+
+/* Upper bound on one wait in the live loop, in milliseconds. Not a deadline:
+*  the loop around it sees to that. It is how often the keyboard is looked at,
+*  and getch() carries the same number for a related reason -- see
+*  mouse_wait_turn(). */
+#define MOUSE_WAIT_MS      200
+
+/* The largest field "mouse -b" accepts. Nothing this kernel can drive is
+*  anywhere near it; it is here so that a typing mistake becomes a message
+*  rather than a pointer somewhere off in a field of two billion pixels. */
+#define MOUSE_FIELD_MAX   8192
+
+/* The field "mouse -t" works in, and the numbers it pushes the pointer to.
+*  A field of its own rather than the console's, so that the checks read the
+*  same on every machine, and one no screen has exactly -- a clamp that
+*  happened to land on the console size would prove nothing. MOUSE_TEST_OVER
+*  is how far past a corner the pointer is pushed: comfortably more than one,
+*  so an off-by-one clamp cannot be mistaken for a clamp that works. */
+#define MOUSE_TEST_W       800
+#define MOUSE_TEST_H       600
+#define MOUSE_TEST_X       100
+#define MOUSE_TEST_Y        50
+#define MOUSE_TEST_OVER    100
+#define MOUSE_SMALL_W      320
+#define MOUSE_SMALL_H      200
+
 /* --- network -------------------------------------------------------------
 *
 *  Byte order, once, because everything below depends on it: the addresses
@@ -660,6 +738,7 @@ void arptable(char *cmd);
 void pinghost(char *cmd);
 void nslookup(char *cmd);
 void netstat(char *cmd);
+void mousepointer(char *cmd);
 void help(void);
 
 static void mem_print_right(uint32_t value, int width);
@@ -735,6 +814,30 @@ static void gfx_check(int ok);
 static const char *gfx_mode_kind(void);
 static void gfx_info_label(const char *label);
 static void gfx_show_mode(void);
+
+static void mouse_console_field(int *w, int *h);
+static void mouse_apply_field(void);
+static const char *mouse_field_text(void);
+static void mouse_print_signed(int value, int width, int plus);
+static void mouse_print_pair(int a, int b, int plus);
+static void mouse_button_text(int buttons, char *text);
+static const char *mouse_button_name(int mask);
+static void mouse_row_header(void);
+static void mouse_row(int x, int y, int dx, int dy, int buttons);
+static void mouse_clear_row(void);
+static void mouse_info_label(const char *label);
+static void mouse_explain_absent(void);
+static void mouse_explain_counters(uint32_t resyncs, uint32_t overflows,
+                                   uint32_t dropped);
+static void mouse_show_counters(void);
+static void mouse_show_status(void);
+static void mouse_print_event(const mouse_event *ev, int *presses,
+                              int *releases);
+static void mouse_wait_turn(uint32_t seen);
+static void mouse_live(void);
+static void mouse_set_field(char *cmd);
+static void mouse_check(int ok);
+static void mouse_selftest(void);
 
 static char *net_put_byte(char *p, uint32_t value);
 static void net_ip_text(uint32_t ip, char *text);
@@ -850,6 +953,7 @@ void main()
 		else if(strcmp(word, "ping") == 0) pinghost(cmd);
 		else if(strcmp(word, "nslookup") == 0) nslookup(cmd);
 		else if(strcmp(word, "netstat") == 0) netstat(cmd);
+		else if(strcmp(word, "mouse") == 0) mousepointer(cmd);
 		else if(strcmp(word, "reboot") == 0) reboot();
 		else if(strcmp(word, "help") == 0) help();
 		else if(strcmp(word, "start") == 0) taskmgr_task_start(taskmgr_add_task( task, "Test Task", TASK_PRIORITY_LOW ));
@@ -4663,6 +4767,950 @@ void graphics(char *cmd)
 	}
 }
 
+/* --- mouse ---------------------------------------------------------------
+*
+*  Why this command exists at all. Nothing draws a cursor yet -- there is no
+*  GUI to draw one in -- so the only way to tell a driver that works from one
+*  that does not is to print what the interface says and watch it while the
+*  mouse is moved. Every field below is one that separates a fault from a
+*  device merely being used.
+*
+*  NOTHING HERE KNOWS WHAT KIND OF POINTER IT IS. mouse.h is deliberately not
+*  about any one bus, because a second driver is meant to fill the same queue
+*  later, and a shell command that printed a packet layout or an interrupt
+*  number would be the first thing to break the day it does. So this asks
+*  mouse.h its questions and prints the answers, and the one place a device
+*  may name itself is mouse_describe(), whose sentence is printed as it comes.
+*
+*  Three things are shown that the position by itself does not say.
+*
+*  THE EVENTS, not only the state. mouse_buttons() answers "what is down
+*  now", and a click that is pressed and released between two looks at it is
+*  invisible -- which, on a queue read a few times a second, is most clicks.
+*  So the loop drains mouse_poll() and prints a line for every press and every
+*  release, while the row underneath keeps the state. Draining is also what
+*  keeps the queue empty: a reader that only looked at the position would let
+*  the queue fill and the dropped counter climb, and would then be displaying
+*  a fault it had caused itself.
+*
+*  THE COUNTERS, and resyncs before the others. A pointer that jumps looks
+*  exactly like a driver bug and very often is not one: if the stream keeps
+*  losing its framing this counter says so, and the fault is below the driver.
+*  Overflows and drops then separate a device moving faster than one event can
+*  describe from a queue nobody emptied in time. Three different faults that
+*  look identical on the screen, told apart by three numbers.
+*
+*  AND THAT IT WAITS RATHER THAN SPINS. The loop blocks on
+*  mouse_wait_channel() with the idiom system.h spells out, so a mouse lying
+*  still costs this machine five wakeups a second and nothing else. "ps" from
+*  a second shell shows the task Blocked, and that is the whole difference
+*  from the polling loop this would otherwise have been.
+*/
+
+/* What "the surface" is when there is no surface.
+*
+*  mouse_set_bounds() wants the screen the pointer is drawn on, in pixels, and
+*  a text shell draws nothing: there is no pixel surface here and no cursor
+*  whose clamping could be seen. Bounds are still needed -- a driver with none
+*  has no idea how far right is -- so the honest choice is the screen the user
+*  is actually looking at, expressed in the pixels it would have if it were a
+*  surface.
+*
+*  On a framebuffer console that is a real number and is asked for. On the VGA
+*  text console there are no pixels to ask about, so a character cell is taken
+*  at the size of the font that draws it, 8 by 16, which makes the 80 by 25
+*  screen 640 by 400. Both give the one property that matters: moving the
+*  mouse to the right edge of the screen puts the pointer at the right edge of
+*  its field, so the clamping happens where the user expects to see it. A
+*  field of some invented size would clamp somewhere in the middle of the
+*  screen and look like a bug.
+*
+*  THE SHELL REMEMBERS WHAT IT SET, because mouse.h offers no way to ask. That
+*  is right on both sides: the driver is told the surface by whoever owns it,
+*  and a display that prints a position has to be able to say what field the
+*  number is in. "mouse -b" writes the same three variables, so a field set by
+*  hand survives the next "mouse" instead of being quietly reset -- which is
+*  what makes it possible to walk the pointer into a corner of a small field
+*  and watch it stop. */
+#define MOUSE_FIELD_NONE     0   /* nothing has set the bounds yet         */
+#define MOUSE_FIELD_CONSOLE  1   /* the screen the console is on           */
+#define MOUSE_FIELD_TYPED    2   /* whatever "mouse -b" was given          */
+
+static int mouse_field_w = 0;
+static int mouse_field_h = 0;
+static int mouse_field_source = MOUSE_FIELD_NONE;
+
+/* Self-test counters, the same pair every other self-test in this file
+*  keeps. */
+static int mouse_tests_run = 0;
+static int mouse_tests_ok = 0;
+
+/* The size of a text cell in pixels, and the text screen in cells. Only used
+*  to turn the one into the other, in both directions: the field is cells
+*  times cell size, and "mouse -i" divides back to say which cell the pointer
+*  is over. */
+static void mouse_console_field(int *w, int *h)
+{
+	if(fbcon_active() && fbcon_width() != 0 && fbcon_height() != 0)
+	{
+		*w = (int)fbcon_width();
+		*h = (int)fbcon_height();
+		return;
+	}
+
+	*w = MOUSE_TEXT_COLS * MOUSE_CELL_W;
+	*h = MOUSE_TEXT_ROWS * MOUSE_CELL_H;
+}
+
+/* Gives the driver a field to work in, once. Every entry point calls this,
+*  and a field somebody typed is left alone -- see the comment above. */
+static void mouse_apply_field(void)
+{
+	int w;
+	int h;
+
+	if(mouse_field_source != MOUSE_FIELD_NONE) return;
+
+	mouse_console_field(&w, &h);
+	mouse_set_bounds(w, h);
+
+	mouse_field_w = w;
+	mouse_field_h = h;
+	mouse_field_source = MOUSE_FIELD_CONSOLE;
+}
+
+/* Where the field came from, in the words the display uses. */
+static const char *mouse_field_text(void)
+{
+	if(mouse_field_source == MOUSE_FIELD_TYPED) return "set with mouse -b";
+	if(fbcon_active()) return "the framebuffer console";
+	return "the text console, 8 x 16 pixels a cell";
+}
+
+/* A signed value right-aligned in a field of the given width, with the sign
+*  immediately in front of the digits rather than out at the left edge of the
+*  column. mem_print_right() takes a uint32_t and would print a movement of
+*  -1 as 4294967295; this is its counterpart for the two columns that carry a
+*  direction. plus asks for an explicit '+', which is worth two characters on
+*  a movement -- a column of bare numbers that sometimes carry a minus reads
+*  as a column of magnitudes with mistakes in it. */
+static void mouse_print_signed(int value, int width, int plus)
+{
+	unsigned int magnitude;
+	unsigned int rest;
+	int digits;
+	int i;
+
+	magnitude = (value < 0) ? (unsigned int)(-value) : (unsigned int)value;
+
+	digits = 1;
+	rest = magnitude;
+	while(rest >= 10)
+	{
+		rest = rest / 10;
+		digits++;
+	}
+
+	if(value < 0 || plus) digits++;
+
+	for(i = digits; i < width; i++)
+	{
+		putch(' ');
+	}
+
+	if(value < 0)
+	{
+		putch('-');
+	}
+	else if(plus)
+	{
+		putch('+');
+	}
+
+	printf("%u", (int)magnitude);
+}
+
+/* "(nnnnn,nnnnn)", exactly MOUSE_PAIR_WIDTH columns wide whatever the two
+*  values are. Both the position and the movement are printed with it, so the
+*  two columns line up under each other. */
+static void mouse_print_pair(int a, int b, int plus)
+{
+	putch('(');
+	mouse_print_signed(a, MOUSE_COORD_WIDTH, plus);
+	putch(',');
+	mouse_print_signed(b, MOUSE_COORD_WIDTH, plus);
+	putch(')');
+}
+
+/* Which buttons are down, as three fixed positions rather than a list: a
+*  list would change width as buttons go down and up, and this is written
+*  into a row that is rewritten in place. L, M and R in the order they sit
+*  under the hand, a dash for one that is up. */
+static void mouse_button_text(int buttons, char *text)
+{
+	text[0] = (buttons & MOUSE_BUTTON_LEFT)   ? 'L' : '-';
+	text[1] = (buttons & MOUSE_BUTTON_MIDDLE) ? 'M' : '-';
+	text[2] = (buttons & MOUSE_BUTTON_RIGHT)  ? 'R' : '-';
+	text[3] = EOS;
+}
+
+/* One button's name, for the event lines. Only the three mouse.h defines are
+*  named; anything else keeps its number and says so, because a driver that
+*  reports a fourth button is exactly the thing this command should not hide. */
+static const char *mouse_button_name(int mask)
+{
+	switch(mask)
+	{
+		case MOUSE_BUTTON_LEFT:   return "left";
+		case MOUSE_BUTTON_MIDDLE: return "middle";
+		case MOUSE_BUTTON_RIGHT:  return "right";
+		default:                  break;
+	}
+
+	return "other";
+}
+
+/* The header over the live row. The widths are the row's own, so the two
+*  cannot drift apart: a column here is one field there. */
+static void mouse_row_header(void)
+{
+	printf("  ");
+	ps_print_left("Position", MOUSE_PAIR_WIDTH + MOUSE_GAP);
+	ps_print_left("Movement", MOUSE_PAIR_WIDTH + MOUSE_GAP);
+	ps_print_left("Btn", MOUSE_BTN_WIDTH);
+	fs_print_right_text("Packets", MOUSE_COUNT_WIDTH);
+	fs_print_right_text("Resyncs", MOUSE_COUNT_WIDTH);
+	fs_print_right_text("Overflow", MOUSE_COUNT_WIDTH);
+	fs_print_right_text("Dropped", MOUSE_COUNT_WIDTH);
+	printf("\n");
+}
+
+/* The row itself, written from the margin of the line it is already on and
+*  without a newline after it, so the next call overwrites it. That is what
+*  makes it a live display instead of a page of scrolling numbers, and it is
+*  why every field is padded rather than truncated: a carriage return moves
+*  the cursor and erases nothing, so a row that shrank from four digits to
+*  three would leave the fourth standing there. */
+static void mouse_row(int x, int y, int dx, int dy, int buttons)
+{
+	char text[4];
+
+	mouse_button_text(buttons, text);
+
+	printf("\r  ");
+	mouse_print_pair(x, y, 0);
+	printf("  ");
+	mouse_print_pair(dx, dy, 1);
+	printf("  ");
+	ps_print_left(text, MOUSE_BTN_WIDTH);
+	mem_print_right(mouse_packets(), MOUSE_COUNT_WIDTH);
+	mem_print_right(mouse_resyncs(), MOUSE_COUNT_WIDTH);
+	mem_print_right(mouse_overflows(), MOUSE_COUNT_WIDTH);
+	mem_print_right(mouse_dropped(), MOUSE_COUNT_WIDTH);
+}
+
+/* Blanks the row and comes back to the margin, for the moment before a line
+*  is printed over it. Without this the new line would inherit whatever of the
+*  row it did not cover. */
+static void mouse_clear_row(void)
+{
+	int i;
+
+	putch('\r');
+	for(i = 0; i < MOUSE_ROW_WIDTH; i++)
+	{
+		putch(' ');
+	}
+	putch('\r');
+}
+
+/* The label column of "mouse -i", padded the way "gfx -i" and "ifconfig" pad
+*  theirs, and for the same reason: printf() has no field widths. */
+static void mouse_info_label(const char *label)
+{
+	int used;
+
+	printf("  %s", label);
+
+	used = 2 + (int)strlen(label);
+	while(used < MOUSE_INFO_LABEL)
+	{
+		putch(' ');
+		used++;
+	}
+}
+
+/* Having no pointer is an ordinary state, so it is explained rather than
+*  reported as a failure -- the same answer the network commands give for a
+*  machine with no card, and in one place so that all four entry points give
+*  it identically. */
+static void mouse_explain_absent(void)
+{
+	printf("  No pointing device is present.\n");
+	printf("  Nothing answered when the driver looked for one, which is an\n");
+	printf("  ordinary outcome rather than a failure: a machine may simply\n");
+	printf("  have none, and a virtual machine has none unless it is given\n");
+	printf("  one. Everything above the interface then sees a pointer that\n");
+	printf("  never moves, so nothing else stops working -- there is only\n");
+	printf("  nothing here to show.\n");
+}
+
+/* The two counters that mean something is wrong, and the one that means the
+*  reader was too slow. Said only when they are not zero, the way "ifconfig"
+*  explains an overrun only while there has been one: prose next to a zero is
+*  prose that teaches the reader to skip the paragraph.
+*
+*  The values are passed in rather than read here, because both callers have a
+*  different pair of them -- "mouse -i" shows the totals since boot and the
+*  live view shows what moved while it was running, and the second is the one
+*  that says "this is happening now". */
+static void mouse_explain_counters(uint32_t resyncs, uint32_t overflows,
+                                   uint32_t dropped)
+{
+	if(resyncs != 0)
+	{
+		printf("  Resyncs are the stream losing its framing and the driver\n");
+		printf("  finding it again. A byte was lost or invented below the\n");
+		printf("  driver -- a missed interrupt, a controller dropping one --\n");
+		printf("  and until the boundary is back the pointer flies off. A\n");
+		printf("  pointer that jumps while this number stands still is a\n");
+		printf("  different fault, and it is above this line, not below it.\n");
+	}
+
+	if(overflows != 0)
+	{
+		printf("  Overflows are movements the device could not fit into one\n");
+		printf("  event. How far the hand went is not recoverable, so the\n");
+		printf("  pointer falls behind it -- fast movement, not a fault.\n");
+	}
+
+	if(dropped != 0)
+	{
+		printf("  Dropped events arrived faster than they were taken out of\n");
+		printf("  the queue and the oldest were overwritten. The queue bridges\n");
+		printf("  two turns of the reader and is not a history, so this costs\n");
+		printf("  detail and never the position -- but a click can be lost\n");
+		printf("  with it.\n");
+	}
+}
+
+/* The four counters, in two rows of two. */
+static void mouse_show_counters(void)
+{
+	mouse_info_label("Packets:");
+	mem_print_right(mouse_packets(), 8);
+	printf("   Resyncs:");
+	mem_print_right(mouse_resyncs(), 9);
+	printf("\n");
+
+	mouse_info_label("Overflows:");
+	mem_print_right(mouse_overflows(), 8);
+	printf("   Dropped:");
+	mem_print_right(mouse_dropped(), 9);
+	printf("\n");
+}
+
+/* "mouse -i": everything the live view shows, once, and left on the screen.
+*  The live view has to be ended before it can be read, and the state it was
+*  in is exactly what one wants to look at afterwards. */
+static void mouse_show_status(void)
+{
+	char text[4];
+	int buttons;
+	int cols;
+	int rows;
+
+	printf("Pointer:\n");
+
+	if(!mouse_present())
+	{
+		mouse_explain_absent();
+		return;
+	}
+
+	mouse_apply_field();
+	buttons = mouse_buttons();
+	mouse_button_text(buttons, text);
+
+	mouse_info_label("Device:");
+	printf("%s\n", mouse_describe());
+
+	mouse_info_label("Field:");
+	printf("%i x %i pixels, %s\n", mouse_field_w, mouse_field_h,
+	       mouse_field_text());
+
+	mouse_info_label("Position:");
+	printf("(%i, %i)", mouse_x(), mouse_y());
+
+	/* Which character cell the pointer is over, and only while the field is
+	   the console's: on a field somebody typed the division would produce a
+	   cell that has nothing to do with the screen, and a number that means
+	   nothing is worse than no number. */
+	if(mouse_field_source == MOUSE_FIELD_CONSOLE
+	   && mouse_field_w > 0 && mouse_field_h > 0)
+	{
+		cols = fbcon_active() ? fbcon_cols() : MOUSE_TEXT_COLS;
+		rows = fbcon_active() ? fbcon_rows() : MOUSE_TEXT_ROWS;
+
+		printf(", over cell (%i, %i) of %i x %i",
+		       (mouse_x() * cols) / mouse_field_w,
+		       (mouse_y() * rows) / mouse_field_h, cols, rows);
+	}
+
+	printf("\n");
+
+	mouse_info_label("Buttons:");
+	if(buttons == 0)
+	{
+		printf("none down\n");
+	} else {
+		printf("%s down\n", text);
+	}
+
+	mouse_show_counters();
+
+	/* Totals since boot. A counter that has been standing at 3 since the
+	   machine started says something quite different from one that moved
+	   while somebody watched, which is what the live view reports instead. */
+	mouse_explain_counters(mouse_resyncs(), mouse_overflows(),
+	                       mouse_dropped());
+
+	if(mouse_packets() == 0)
+	{
+		printf("  No packet has arrived yet. The device answered when it was\n");
+		printf("  looked for, so this is a mouse nobody has touched -- move it\n");
+		printf("  and run \"mouse\" to watch the numbers move.\n");
+	}
+}
+
+/* One line for each button that changed with this event, and the two running
+*  totals the summary prints. A press and the release after it are two lines,
+*  because they are two events and the whole reason the queue exists is that
+*  the state between them can be gone before anyone looks. */
+static void mouse_print_event(const mouse_event *ev, int *presses,
+                              int *releases)
+{
+	static const int masks[3] =
+	{
+		MOUSE_BUTTON_LEFT, MOUSE_BUTTON_MIDDLE, MOUSE_BUTTON_RIGHT
+	};
+	int changed;
+	int down;
+	int i;
+
+	changed = (int)ev->changed;
+
+	for(i = 0; i < 3; i++)
+	{
+		if((changed & masks[i]) == 0) continue;
+
+		down = ((int)ev->buttons & masks[i]) != 0;
+		if(down) (*presses)++; else (*releases)++;
+
+		printf("  ");
+		mem_print_right(ev->time_ms, 9);
+		printf(" ms  ");
+		ps_print_left(down ? "press" : "release", 9);
+		ps_print_left(mouse_button_name(masks[i]), 8);
+		mouse_print_pair((int)ev->x, (int)ev->y, 0);
+		printf("\n");
+	}
+
+	/* A bit outside the three mouse.h names. Nothing here can say what it
+	   is, so it is printed as the number it is rather than swallowed. */
+	changed = changed & ~(MOUSE_BUTTON_LEFT | MOUSE_BUTTON_MIDDLE
+	                      | MOUSE_BUTTON_RIGHT);
+	if(changed != 0)
+	{
+		printf("  ");
+		mem_print_right(ev->time_ms, 9);
+		printf(" ms  changed  button mask 0x%X, which is not one of the\n",
+		       changed);
+		printf("               three mouse.h names\n");
+	}
+}
+
+/* One turn of the live loop: block until the driver has something new, or
+*  until the keyboard is due to be looked at again.
+*
+*  This is the mechanism the command was written to make visible, so it is
+*  written exactly the way system.h asks and for the reasons it gives there.
+*
+*  THE CONDITION IS mouse_packets(), because the loop cannot see inside the
+*  queue with interrupts off without emptying it. The caller reads the counter
+*  BEFORE its drain and passes it in; if it has moved by the time interrupts
+*  are off here, a packet arrived at some point during the turn and the loop
+*  must go round again rather than wait for a wake that may already have been
+*  spent. Reading it before the drain rather than after costs one wasted turn
+*  per burst -- the packet it saw may well be one the drain already took --
+*  and buys the guarantee that this never blocks with an event sitting in the
+*  queue. The counter is written only from the interrupt and tested here with
+*  interrupts off, so there is no window left between the test and the block,
+*  which is what closes the lost wakeup race.
+*
+*  It cannot spin: a turn that skips the wait has a packet to show for it, and
+*  a device nobody is touching produces none.
+*
+*  WHY THERE IS A TIMEOUT although the mouse wakes this task. The view ends on
+*  a keypress, and a key does not wake the mouse's channel -- kb.c wakes its
+*  own, which is not exported, and a task waits on one channel anyway. So the
+*  keyboard is looked at once a turn and this bound is the longest a keystroke
+*  can sit unnoticed. 200 ms is what getch() gives its own wait for a related
+*  reason: five wakeups a second next to the thousand ticks the timer produces
+*  in the same second is nothing, and it is fast enough that nobody can feel
+*  the key.
+*
+*  NO TASK TO BLOCK means task_wait() would report a timeout at once and the
+*  loop would spin, so that case keeps a sleep. It should not happen -- the
+*  shell is a task -- and one comparison makes sure of it. */
+static void mouse_wait_turn(uint32_t seen)
+{
+	unsigned long flags;
+
+	if(taskmgr_get_currpid() < 0)
+	{
+		sleep(MOUSE_WAIT_MS);
+		return;
+	}
+
+	/* net_irq_save() and its partner are this file's pair; the name records
+	   where they were first needed and not who may use them. A second
+	   identical pair of inline assembly in the same file would be worse than
+	   the name. */
+	flags = net_irq_save();
+
+	if(mouse_packets() == seen)
+	{
+		task_wait(mouse_wait_channel(), MOUSE_WAIT_MS);
+	}
+
+	net_irq_restore(flags);
+}
+
+/* "mouse": the live view, until a key is pressed. */
+static void mouse_live(void)
+{
+	mouse_event ev;
+	uint32_t seen;
+	uint32_t packets;
+	uint32_t resyncs;
+	uint32_t overflows;
+	uint32_t dropped;
+	int started;
+	int elapsed;
+	int events;
+	int presses;
+	int releases;
+	int redraw;
+	int taken;
+	int x;
+	int y;
+	int dx;
+	int dy;
+	unsigned char key;
+
+	if(!mouse_present())
+	{
+		printf("Pointer:\n");
+		mouse_explain_absent();
+		return;
+	}
+
+	mouse_apply_field();
+
+	/* A key already in the slot would end the view before it had been looked
+	   at -- the same guard "gfx" puts in front of its picture. kb_flush()
+	   clears the special key, getchn() the ordinary one. */
+	kb_flush();
+	getchn();
+
+	/* And events already in the queue are things that happened before this
+	   command was typed. Printing them as if they had just happened would be
+	   the one lie this display must not tell, so they are thrown away here --
+	   which is also the state the drain below expects to start from.
+
+	   Bounded, like every drain in this command: the queue holds
+	   MOUSE_QUEUE_SIZE events and no more, so a read that never empties is a
+	   driver fault rather than a busy mouse, and it must not take the shell
+	   with it. Finding exactly that kind of fault is what this command is
+	   for. */
+	taken = 0;
+	while(taken <= MOUSE_QUEUE_SIZE && mouse_poll(&ev))
+	{
+		taken++;
+	}
+
+	packets = mouse_packets();
+	resyncs = mouse_resyncs();
+	overflows = mouse_overflows();
+	dropped = mouse_dropped();
+	started = timer_get_ticks();
+
+	events = 0;
+	presses = 0;
+	releases = 0;
+
+	x = mouse_x();
+	y = mouse_y();
+	dx = 0;
+	dy = 0;
+
+	printf("Pointer: %s\n", mouse_describe());
+	printf("  Field:   %i x %i pixels, %s\n", mouse_field_w, mouse_field_h,
+	       mouse_field_text());
+	printf("  Moving updates the row, a press or a release prints a line of\n");
+	printf("  its own. Press any key to return.\n\n");
+
+	mouse_row_header();
+	mouse_row(x, y, dx, dy, mouse_buttons());
+
+	key = getchn();
+	while(key == EOS)
+	{
+		/* Before the drain, never after it -- see mouse_wait_turn(). */
+		seen = mouse_packets();
+		redraw = 0;
+
+		taken = 0;
+		while(taken <= MOUSE_QUEUE_SIZE && mouse_poll(&ev))
+		{
+			taken++;
+			events++;
+			redraw = 1;
+
+			x = (int)ev.x;
+			y = (int)ev.y;
+			dx = (int)ev.dx;
+			dy = (int)ev.dy;
+
+			if(ev.changed != 0)
+			{
+				mouse_clear_row();
+				mouse_print_event(&ev, &presses, &releases);
+			}
+		}
+
+		/* The row carries the last event's movement rather than a sum: it is
+		   redrawn immediately after the drain, so "what just happened" is the
+		   event that just happened. The buttons come from mouse_buttons()
+		   because that column is the state, and the state is what that call
+		   is for. */
+		if(redraw || mouse_packets() != seen)
+		{
+			mouse_row(x, y, dx, dy, mouse_buttons());
+		}
+
+		mouse_wait_turn(seen);
+		key = getchn();
+	}
+
+	printf("\n\n");
+
+	packets = mouse_packets() - packets;
+	resyncs = mouse_resyncs() - resyncs;
+	overflows = mouse_overflows() - overflows;
+	dropped = mouse_dropped() - dropped;
+
+	elapsed = (timer_get_ticks() - started) / 1000;
+
+	printf("  While that ran: %u packets in %i s, ", (int)packets, elapsed);
+	printf("%i events, %i presses,\n", events, presses);
+	printf("  %i releases. Resyncs %u, overflows %u, dropped %u.\n",
+	       releases, (int)resyncs, (int)overflows, (int)dropped);
+
+	mouse_explain_counters(resyncs, overflows, dropped);
+}
+
+/* "mouse -b [WIDTH HEIGHT]": the field, by hand.
+*
+*  Worth a form of its own for one reason: the clamping is the half of the
+*  interface that cannot be seen on a screen the pointer already fits on. A
+*  small field walked into with the mouse stops at a number one can read,
+*  which is the only demonstration available that the driver clamps at all --
+*  and setting a large one back is how the pointer is freed again. */
+static void mouse_set_field(char *cmd)
+{
+	int w;
+	int h;
+
+	/* "mouse -b" with nothing after it goes back to the console, which is the
+	   way out of a field small enough to be inconvenient. */
+	if(prmc(cmd) == 1)
+	{
+		mouse_field_source = MOUSE_FIELD_NONE;
+		mouse_apply_field();
+
+		printf("Field back to the console: %i x %i pixels.\n",
+		       mouse_field_w, mouse_field_h);
+		printf("  Pointer at (%i, %i).\n", mouse_x(), mouse_y());
+		return;
+	}
+
+	if(prmc(cmd) != 3)
+	{
+		printf("Syntax: mouse -b [WIDTH HEIGHT]\n");
+		printf("\t          Both numbers, or neither to go back to the "
+		       "console\n");
+		return;
+	}
+
+	/* prmv() hands back one static buffer, so the two are converted one at a
+	   time rather than both being held at once. */
+	w = atoi(prmv(2, cmd));
+	h = atoi(prmv(3, cmd));
+
+	/* atoi() answers -1 for anything that is not all digits. */
+	if(w < 1 || h < 1 || w > MOUSE_FIELD_MAX || h > MOUSE_FIELD_MAX)
+	{
+		printf("Both have to be whole numbers from 1 to %i.\n",
+		       MOUSE_FIELD_MAX);
+		return;
+	}
+
+	mouse_set_bounds(w, h);
+
+	mouse_field_w = w;
+	mouse_field_h = h;
+	mouse_field_source = MOUSE_FIELD_TYPED;
+
+	printf("Field set to %i x %i pixels.\n", w, h);
+
+	/* Where the pointer ended up, because setting bounds under it moves it:
+	   mouse.h clamps the position into the new field, so a field smaller than
+	   the old position is the one case where this command moves the pointer
+	   without anybody touching the mouse. */
+	printf("  Pointer at (%i, %i).\n", mouse_x(), mouse_y());
+	printf("  \"mouse\" now stops at the edges of that field, \"mouse -b\"\n");
+	printf("  alone puts the console's field back.\n");
+}
+
+/* Records the result of a check, like gfx_check() does for the surface. */
+static void mouse_check(int ok)
+{
+	mouse_tests_run++;
+
+	if(ok)
+	{
+		mouse_tests_ok++;
+		printf("  [  OK  ] ");
+	} else {
+		printf("  [FAILED] ");
+	}
+}
+
+/* --- mouse -t ------------------------------------------------------------
+*
+*  WHAT CAN BE ASSERTED ABOUT A DEVICE DRIVEN BY A HAND, and nothing else.
+*  Not that a packet ever arrives, not that a movement to the right raises x,
+*  not that a button reports down, not that the counters stay at zero: every
+*  one of those needs somebody touching the mouse while the test runs, and a
+*  check that fails because nobody did is a check that teaches its reader to
+*  ignore it. The command itself is where those are looked at, by eye, which
+*  is the only instrument there is for them.
+*
+*  What is left is the half of mouse.h that is bookkeeping, and it is worth
+*  testing precisely because it is the half a driver gets wrong quietly. A
+*  clamp that is off by one puts the pointer one pixel outside the surface,
+*  where a GUI writes past the end of a row; bounds that do not pull the
+*  position in leave it outside a field that just shrank; a queue whose read
+*  never empties hangs whoever drains it. None of that shows on the screen
+*  until something else is built on top.
+*
+*  IT RUNS WITH INTERRUPTS OFF, which is what makes it a test rather than a
+*  race. Every check below is a call and its answer, and between the two the
+*  device's interrupt could otherwise move the pointer and fail an assertion
+*  that is perfectly true -- while a hand rests on the mouse, which is the
+*  normal state of a machine somebody is typing at. Nothing here waits, so
+*  the whole sequence is a few dozen instructions with the interrupt held
+*  off, and the drain is bounded by the queue's own size.
+*
+*  IT PUTS BACK WHAT IT MOVED. The field and the position are read first and
+*  written back last: a self-test that leaves the pointer in the corner of a
+*  320 by 200 field has broken the thing it was asked to check. */
+static void mouse_selftest(void)
+{
+	mouse_event ev;
+	unsigned long flags;
+	const char *name;
+	int save_w;
+	int save_h;
+	int save_x;
+	int save_y;
+	int at_x;
+	int at_y;
+	int far_x;
+	int far_y;
+	int low_x;
+	int low_y;
+	int shrunk_x;
+	int shrunk_y;
+	int drained;
+	int empty;
+
+	mouse_tests_run = 0;
+	mouse_tests_ok = 0;
+
+	printf("Pointer self-test:\n");
+
+	if(!mouse_present())
+	{
+		mouse_explain_absent();
+		printf("  There is nothing here that can be tested without one: every\n");
+		printf("  check below is about a position the driver keeps for a\n");
+		printf("  device, and there is no device.\n");
+		return;
+	}
+
+	mouse_apply_field();
+
+	save_w = mouse_field_w;
+	save_h = mouse_field_h;
+	save_x = mouse_x();
+	save_y = mouse_y();
+
+	name = mouse_describe();
+
+	flags = net_irq_save();
+
+	mouse_set_bounds(MOUSE_TEST_W, MOUSE_TEST_H);
+
+	/* A position inside the field, taken as given. */
+	mouse_set_position(MOUSE_TEST_X, MOUSE_TEST_Y);
+	at_x = mouse_x();
+	at_y = mouse_y();
+
+	/* Well past the far corner. */
+	mouse_set_position(MOUSE_TEST_W + MOUSE_TEST_OVER,
+	                   MOUSE_TEST_H + MOUSE_TEST_OVER);
+	far_x = mouse_x();
+	far_y = mouse_y();
+
+	/* And past the near one, which is the direction a signed coordinate gets
+	   wrong differently: an unsigned clamp lets a negative through as a very
+	   large number and it lands at the far edge instead of the origin. */
+	mouse_set_position(-MOUSE_TEST_OVER, -MOUSE_TEST_OVER);
+	low_x = mouse_x();
+	low_y = mouse_y();
+
+	/* The field shrinking under a pointer that is already outside where it
+	   will end. */
+	mouse_set_position(MOUSE_TEST_W - 1, MOUSE_TEST_H - 1);
+	mouse_set_bounds(MOUSE_SMALL_W, MOUSE_SMALL_H);
+	shrunk_x = mouse_x();
+	shrunk_y = mouse_y();
+
+	/* The queue, emptied and then read once more. Bounded by its own size
+	   plus one, so a read that never empties ends the loop instead of
+	   hanging the machine with interrupts off. */
+	drained = 0;
+	while(drained <= MOUSE_QUEUE_SIZE && mouse_poll(&ev))
+	{
+		drained++;
+	}
+	empty = mouse_poll(&ev);
+
+	mouse_set_bounds(save_w, save_h);
+	mouse_set_position(save_x, save_y);
+
+	net_irq_restore(flags);
+
+	printf("  Field %i x %i for the duration, then %i x %i back.\n",
+	       MOUSE_TEST_W, MOUSE_TEST_H, save_w, save_h);
+
+	/* 1. The device says what it is. The string is the driver's own and is
+	      printed unread everywhere else, so the one thing worth checking is
+	      that there is one: a null here is a null pointer handed to puts(). */
+	mouse_check(name != 0 && name[0] != EOS);
+	printf("mouse_describe() = \"%s\"\n", (name != 0) ? name : "");
+
+	/* 2. A position inside the field is the position. */
+	mouse_check(at_x == MOUSE_TEST_X && at_y == MOUSE_TEST_Y);
+	printf("Set (%i,%i) inside the field, read (%i,%i)\n",
+	       MOUSE_TEST_X, MOUSE_TEST_Y, at_x, at_y);
+
+	/* 3. Beyond the far corner the pointer stops at the last pixel that is
+	      inside. Not merely somewhere inside: a pointer pushed right has to
+	      stop at the right edge, and one that jumped back to the middle
+	      would be a pointer the user cannot park anywhere. */
+	mouse_check(far_x == MOUSE_TEST_W - 1 && far_y == MOUSE_TEST_H - 1);
+	printf("Set (%i,%i) past the corner, read (%i,%i), edge is (%i,%i)\n",
+	       MOUSE_TEST_W + MOUSE_TEST_OVER, MOUSE_TEST_H + MOUSE_TEST_OVER,
+	       far_x, far_y, MOUSE_TEST_W - 1, MOUSE_TEST_H - 1);
+
+	/* 4. And below the origin it stops at the origin. */
+	mouse_check(low_x == 0 && low_y == 0);
+	printf("Set (%i,%i) below the origin, read (%i,%i)\n",
+	       -MOUSE_TEST_OVER, -MOUSE_TEST_OVER, low_x, low_y);
+
+	/* 5. A field that shrinks takes the pointer with it. Whoever owns the
+	      surface calls this when the surface changes, and a position left
+	      outside is a cursor drawn off the end of a row. */
+	mouse_check(shrunk_x >= 0 && shrunk_x < MOUSE_SMALL_W
+	            && shrunk_y >= 0 && shrunk_y < MOUSE_SMALL_H);
+	printf("At (%i,%i), field cut to %i x %i, pointer now (%i,%i)\n",
+	       MOUSE_TEST_W - 1, MOUSE_TEST_H - 1, MOUSE_SMALL_W, MOUSE_SMALL_H,
+	       shrunk_x, shrunk_y);
+
+	/* 6. An emptied queue reads empty, and the read that found it empty came
+	      back. Both halves ran with interrupts off, so a mouse_poll() that
+	      waited for an event would have stopped this machine rather than
+	      returned a wrong answer -- which is the strongest form the "never
+	      blocks" half of the contract can be tested in. */
+	mouse_check(empty == 0 && drained <= MOUSE_QUEUE_SIZE);
+	printf("Drained %i event(s) of at most %i, next read returned %i\n",
+	       drained, MOUSE_QUEUE_SIZE, empty);
+
+	printf("  Result: %i of %i checks passed\n",
+	       mouse_tests_ok, mouse_tests_run);
+
+	printf("  Nothing above needed the mouse to move, and nothing above says\n");
+	printf("  the device works: that a packet arrives, that x rises to the\n");
+	printf("  right, that a button reports down are all facts about a hand on\n");
+	printf("  the mouse. \"mouse\" is where they are looked at.\n");
+}
+
+/* "mouse": what the pointer is doing, live.
+*
+*  Four forms and one of them is the point; the other three are the questions
+*  that come up while looking at it. "-i" is the same numbers left standing on
+*  the screen after the view has been ended, "-b" is the field they are
+*  measured in, and "-t" is the part of the contract a machine can check by
+*  itself. */
+void mousepointer(char *cmd)
+{
+	char opt[100];
+
+	if(prmc(cmd) == 0)
+	{
+		mouse_live();
+		return;
+	}
+
+	/* prmv() hands back a pointer into one static buffer, so the option is
+	   copied out before anything else can call prmv() again. */
+	strcpy(opt, prmv(1, cmd));
+
+	if(strcmp(opt, "-i") == 0)
+	{
+		mouse_show_status();
+	}
+	else if(strcmp(opt, "-t") == 0)
+	{
+		mouse_selftest();
+	}
+	else if(strcmp(opt, "-b") == 0)
+	{
+		mouse_set_field(cmd);
+	} else {
+		printf("Syntax: mouse [-i] [-t] [-b WIDTH HEIGHT]\n");
+		printf("\t          Watch the pointer live, any key returns\n");
+		printf("\t-i        Show the device, the position and the counters\n");
+		printf("\t-t        Run the checks that need nobody to touch it\n");
+		printf("\t-b W H    Set the field the pointer moves in, -b alone\n");
+		printf("\t          puts the console's field back\n");
+	}
+}
+
 /* --- lspci, ifconfig, arp and ping ---------------------------------------
 *
 *  Four commands and one thing they have in common: on a machine that booted
@@ -7049,6 +8097,10 @@ void help(void)
 	printf("\t          HOST is an address or a name to look up first\n");
 	printf("\tnetstat   Show the open TCP connections, the state each one is\n");
 	printf("\t          in, and what the TCP layer has sent and resent\n");
+	printf("\tmouse     Watch the pointer move and the buttons go down until\n");
+	printf("\t          a key is pressed, mouse -i shows the same numbers\n");
+	printf("\t          once, mouse -t tests what needs no hand on it, and\n");
+	printf("\t          mouse -b W H sets the field it may move in\n");
 	printf("\treboot    Restart the computer\n");
 	printf("\texit      Exit the shell\n");
 
