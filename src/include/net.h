@@ -128,9 +128,54 @@ extern uint32_t net_netmask(void);
 extern uint32_t net_gateway(void);
 extern const uint8_t *net_mac(void);
 
-/* Called by the driver for every frame that arrives, from interrupt
-*  context. Keep the work here bounded. */
+/* Called by the driver for every frame that arrives, from INTERRUPT context.
+*
+*  It no longer does the protocol work. It checks that the frame is addressed
+*  to us, copies it into the receive queue, and returns -- everything else
+*  happens later, in a task, with interrupts on. The frame it is given belongs
+*  to the driver's ring and is reused the moment this returns, which is
+*  precisely why it has to be copied rather than remembered.
+*
+*  The reason for the split is written up at net_queue_drain(). */
 extern void net_receive(const uint8_t *frame, uint32_t len);
+
+/* Processes the frames the queue holds: ARP, IP, ICMP, UDP, TCP, all the work
+*  net_receive() used to do inline. Runs in TASK context, with interrupts on,
+*  and returns how many frames it handled.
+*
+*  Why this exists. Every protocol added since the first ping ran inside the
+*  card's interrupt handler, and that held only because each path was short.
+*  It stopped being true: a DHCP option walk, a DNS name with compression
+*  pointers and a TCP state machine are not "short and finite" in the sense
+*  that argument needed, and a bug in any of them is a hung MACHINE rather than
+*  a hung process, because the handler runs with the whole system waiting.
+*
+*  The TCP work made the cost concrete. Acknowledgements were being discarded
+*  because the card's interrupt ran INSIDE ip_send(), between the send and the
+*  bookkeeping that follows it. That is a class of bug the queue removes: the
+*  receive path can no longer preempt a send half way through.
+*
+*  What the queue does NOT remove is concurrency. The draining task can still
+*  be preempted by the timer while a shell task is inside ip_send(), so every
+*  guard that exists for that reason -- ip_tx_busy, the ordering discipline in
+*  tcp.c -- is still needed and still correct. The change is which kind of
+*  preemption has to be reasoned about, not whether any does. */
+extern int net_queue_drain(void);
+
+/* What the queue is doing, for the shell to show. "used" and "peak" are in
+*  bytes; the peak is the number worth watching, because a queue that never
+*  fills is the only evidence that the drain keeps up with the wire. */
+extern uint32_t net_queue_capacity(void);
+extern uint32_t net_queue_used(void);
+extern uint32_t net_queue_peak(void);
+extern int net_queue_frames(void);
+
+/* Frames the interrupt had to throw away because the queue was full. Distinct
+*  from net_rx_dropped(), which counts frames the protocol layers rejected --
+*  a frame that was not for us, or that failed a check. This one means the
+*  machine could not keep up, which is a different problem with a different
+*  answer. */
+extern uint32_t net_rx_overrun(void);
 
 /* Sends one frame, filling in the ethernet header. Returns 0 on success. */
 extern int net_send(const uint8_t dst_mac[ETH_ALEN], uint16_t type,
@@ -163,14 +208,17 @@ extern int icmp_last_reply(uint32_t *from, uint16_t *id, uint16_t *sequence);
 /* UDP.
 *
 *  A handler is called for every datagram that arrives on the port it was
-*  bound to -- from INTERRUPT CONTEXT, like everything else in the receive
-*  path, so it must be short and must not print, allocate or wait. The buffer
-*  it is given belongs to the driver's receive ring and is reused the moment
-*  the handler returns; anything worth keeping has to be copied out.
+*  bound to. That used to be interrupt context; since the receive queue it is
+*  the drain TASK, with interrupts on -- so a handler that takes a moment no
+*  longer stops the machine, only the drain. It must still be short and must
+*  still not print: a busy segment would bury the console, and frames pile up
+*  in the queue behind it either way.
 *
-*  There are no sockets and no receive queues. A bound port and a callback is
-*  the smallest thing that lets two protocols share UDP, and it is what a
-*  DHCP client needs. */
+*  The buffer it is given belongs to the drain and is reused the moment the
+*  handler returns; anything worth keeping has to be copied out.
+*
+*  There are no sockets. A bound port and a callback is the smallest thing
+*  that lets two protocols share UDP, and it is what a DHCP client needs. */
 typedef void (*udp_handler)(uint32_t src_ip, uint16_t src_port,
                             const uint8_t *data, uint32_t len);
 

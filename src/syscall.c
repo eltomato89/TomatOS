@@ -648,6 +648,23 @@ static uint32_t sysnet_ms_since(uint32_t start)
 *  in tasks.c would be the right next step. */
 static void sysnet_pump(void)
 {
+	/* Drain the receive queue ourselves rather than waiting for the task that
+	*  normally does it.
+	*
+	*  Since the protocol work moved out of the card's interrupt, a frame is
+	*  copied into a queue and handled later -- and "later" is one full trip
+	*  round the scheduler, because every task holds its slice even while it
+	*  sleeps. Measured, that turned a ping's round trip from 0 ms into 34 ms.
+	*  No sleep interval fixes it; the cost is in tasks.c.
+	*
+	*  But a task that is sitting here is a task waiting for exactly the packet
+	*  in that queue, so it may as well take it out itself. net_queue_drain()
+	*  is written for task context and refuses re-entry, so two tasks calling
+	*  it is not a problem -- the second gets 0 and carries on. The dedicated
+	*  drain task stays: it is what handles everything nobody is waiting for,
+	*  an ARP request to answer or a peer's retransmission arriving while this
+	*  machine has nothing open. */
+	net_queue_drain();
 	dns_poll();
 	tcp_poll();
 	sleep(SYS_NET_POLL);

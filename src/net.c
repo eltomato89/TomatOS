@@ -19,20 +19,25 @@
 *      the classic first-stack bug: the packet leaves the machine looking
 *      plausible and nothing ever answers it.
 *
-*    - Interrupt context. net_receive() is called by the card driver from
-*      inside its interrupt handler. Everything it reaches -- ARP handling,
-*      the reply it sends, ip_receive() -- therefore runs with the rest of
-*      the kernel stopped mid-instruction. That is why nothing down that
-*      path prints, allocates, waits for the timer or spins on the card:
-*      the work is bounded by a fixed 16 entry cache walk and one frame
-*      copy. See the note above net_receive() for what a queue would buy
-*      us instead.
+*    - Two contexts, one boundary. net_receive() is called by the card
+*      driver from inside its interrupt handler and does nothing but check
+*      the addressing and copy the frame into the receive queue. Everything
+*      above it -- ARP handling, the reply it sends, ip_receive() and the
+*      whole of what hangs off it -- runs in net_queue_drain(), in a task,
+*      with interrupts on. The queue between the two is the only place in
+*      this file where the two contexts meet, and the rules that make that
+*      meeting safe are written out above it.
+*
+*      What did not change is that net_send() and the ARP cache are still
+*      reached from both sides -- a task sends, and net_receive() reads
+*      net_hwaddr while doing so -- which is what irq_save() below is for.
 *
 *  Notes: No warranty expressed or implied. Use at own risk.
 */
 
 #include <system.h>
 #include <stdio.h>
+#include <mm.h>
 #include <net.h>
 #include <rtl8139.h>
 
@@ -42,10 +47,12 @@
 *  it is internal to the stack -- nothing outside net.c and ip.c may call it.
 *  The pointer is to the first byte after the ethernet header, len is what is
 *  left of the frame from there on, and ip.c must not hold on to the buffer:
-*  it belongs to the driver's receive ring and is reused as soon as we
-*  return.
+*  it belongs to the drain's staging buffer and is overwritten by the next
+*  frame we hand up.
 *
-*  Called from interrupt context, with the same restrictions that apply here.
+*  Called from TASK context now, out of net_queue_drain(), not from the
+*  card's interrupt any more. The rule about not keeping the buffer is the
+*  one thing that did not change with that.
 */
 extern void ip_receive(const uint8_t *packet, uint32_t len);
 
@@ -125,9 +132,24 @@ static int      net_is_up   = 0;
 
 static arp_entry arp_cache[ARP_CACHE_SIZE];
 
-static uint32_t stat_rx     = 0;
-static uint32_t stat_tx     = 0;
-static uint32_t stat_drop   = 0;
+/* Counters, and which context owns each one.
+*
+*  Every one of these is a read-modify-write, so a counter touched from both
+*  the interrupt and a task would lose increments whenever the interrupt
+*  lands between the load and the store. Nothing terrible follows from a
+*  lost count, but the fix is free: the drop counter is split in two, one
+*  per context, and net_rx_dropped() adds them up. stat_tx is incremented
+*  inside net_send()'s critical section and needs nothing further.
+*
+*  stat_rx counts every frame that passed the addressing check, exactly as
+*  it did when net_receive() did the protocol work itself -- including the
+*  ones the queue then had no room for, which stat_overrun counts as well.
+*  So rx - overrun is what actually reached the protocol layers. */
+static uint32_t stat_rx       = 0;   /* irq  */
+static uint32_t stat_tx       = 0;   /* both, under irq_save()             */
+static uint32_t stat_drop_irq = 0;   /* irq  */
+static uint32_t stat_drop_tsk = 0;   /* task */
+static uint32_t stat_overrun  = 0;   /* irq  */
 
 /* The frame we assemble outgoing packets in. One buffer, shared between
 *  task context and the ARP replies that go out from the interrupt handler,
@@ -298,6 +320,338 @@ static void irq_restore(uint32_t flags)
                           : : "r" (flags) : "memory", "cc");
 }
 
+/* --- The receive queue ---------------------------------------------------
+*
+*  One producer in interrupt context, one consumer in task context, and no
+*  lock between them. What follows is why that is safe, because it is not
+*  obvious and it is the only thing standing between this file and frames
+*  that arrive half written.
+*
+*  SHAPE. A byte ring with length prefixed records, not an array of frame
+*  sized slots. A slot array sized for the worst case would be 1518 bytes
+*  per frame while the frames that actually turn up -- an ACK, an ARP reply,
+*  a DNS answer -- are 60 to 100, so nine tenths of it would be padding, and
+*  a queue that holds twenty frames whatever their size is the wrong queue
+*  for a stack whose bursts are made of small ones. A byte ring holds what
+*  it is given: twenty one full sized frames, or five hundred acknowledge-
+*  ments, out of the same memory.
+*
+*  Each record is a two byte length in host order followed by that many
+*  bytes of frame. Two bytes because the longest frame is 1518.
+*
+*  INDICES. Both are free running byte counters that are never reduced
+*  modulo anything; the position of a byte is index & NET_RXQ_MASK, which is
+*  why the size has to be a power of two. Occupancy is head - tail in
+*  unsigned arithmetic and stays right when the counters wrap, so there is
+*  no "full or empty?" ambiguity to resolve and no byte to sacrifice to it.
+*  This is what tcp.c does with its two rings, for the same reason -- see
+*  the note on sequence indexed buffers at the top of that file -- and doing
+*  it differently here would mean two idioms for one problem.
+*
+*  WHO WRITES WHAT. Exactly one context writes each variable:
+*
+*      rxq_head   the interrupt only. Where the next frame will be written.
+*      rxq_tail   the task only.      Where the next frame will be read.
+*      rxq_in     the interrupt only. Frames enqueued, ever.
+*      rxq_out    the task only.      Frames dequeued, ever.
+*      rxq_peak   the interrupt only. High water mark, in bytes.
+*
+*  Neither side ever writes the other's, and each reads the other's exactly
+*  once per operation into a local. That is what removes the need to mask
+*  interrupts on the common path: there is no read-modify-write for an
+*  interrupt to land in the middle of. A 32 bit aligned load or store cannot
+*  be torn on this machine, so a stale read is the worst that happens, and a
+*  stale read is always conservative -- the producer believes there is less
+*  room than there is, the consumer believes there is less data than there
+*  is, and the next call sees the truth. The counters wrapping past 2^32
+*  changes none of that, since only differences are ever computed.
+*
+*  Note what this rules out: the queue must not be drained by two tasks at
+*  once, because rxq_tail would then be advanced by two readers. That is a
+*  task against task race, not an interrupt one, and net_queue_drain()
+*  refuses the second caller rather than pretending it cannot happen.
+*
+*  PUBLICATION ORDER. The frame is written into the ring at [head, head+n)
+*  -- memory the consumer does not look at, because it only reads below
+*  head -- and only then does head move. So a partially written frame is
+*  never visible: the length, the bytes and the index that publishes them
+*  are stored in that order, with a compiler barrier before the last one.
+*  The barrier is against the compiler alone. Producer and consumer are the
+*  same CPU with an interrupt in between, and an interrupt is a serialising
+*  event, so there is no store buffer to flush and no fence to issue -- the
+*  volatile qualifiers plus that barrier are the whole of the ordering.
+*
+*  THE WRAP. A record that would run past the end of the ring is SPLIT: the
+*  part that fits goes at the end, the rest at the beginning, and the two
+*  byte length can itself be split down the middle. The alternative is to
+*  leave the tail unused and start the record at zero, which needs a marker
+*  record so the reader knows to skip -- and a marker is a length that is
+*  not a length, so every reader has to know a reserved value. Splitting
+*  needs neither: it costs one extra memcpy in the rare case, wastes not one
+*  byte, and it is again what tcp_ring_put()/tcp_ring_get() already do.
+*
+*  OVERFLOW. When the room is not there the newest frame is dropped and
+*  net_rx_overrun() counts it. Dropping the oldest instead would mean the
+*  interrupt moving rxq_tail, which is the consumer's variable and possibly
+*  in use by a consumer that was preempted halfway through reading the very
+*  record we would be reclaiming -- it would buy a slightly nicer loss
+*  policy at the price of the entire argument above. Keeping the oldest is
+*  also the better answer for what runs on top: the frames already in the
+*  queue are the earlier ones, so what a burst loses is its tail, which is
+*  what a lost frame on the wire looks like anyway and what TCP recovers
+*  from most cheaply. A drop is not counted in net_rx_dropped(): that one
+*  means a frame the protocols rejected, and this one means the machine did
+*  not keep up, which is a different problem with a different answer.
+*/
+
+/* 32 KiB, the same size as the card's own receive ring.
+*
+*  The upper bound on what can legitimately be in flight towards us is a
+*  TCP receive window -- 8 KiB -- plus its headers, about 8.6 KiB on the
+*  wire, so one connection cannot fill this queue even if the drain does not
+*  run for the whole time the window is open. Matching the card's ring is
+*  the other half of the argument: whichever of the two fills first, the
+*  answer is the same one, and there is no point in a second stage so much
+*  smaller than the first that it becomes the bottleneck.
+*
+*  It comes from the heap, and that is deliberate: the .bss of this kernel
+*  was cut from 341 KB to 67 KB on purpose, and 32 KB of it would go
+*  straight back for a buffer that a machine with no card never touches.
+*  From the heap it is paid for only once the stack is actually up. */
+#define NET_RXQ_SIZE      32768UL
+#define NET_RXQ_MASK      (NET_RXQ_SIZE - 1UL)
+
+/* The length prefix in front of every record. */
+#define NET_RXQ_HDR       2UL
+
+/* One allocation, two uses: the ring, and behind it the buffer the drain
+*  reassembles a split frame into. Separate mallocs would work as well; one
+*  is simply one thing to fail and one thing to free. The driver's ring has
+*  the same slack behind it for the same reason. */
+#define NET_RXQ_ALLOC     (NET_RXQ_SIZE + (uint32_t)ETH_FRAME_MAX)
+
+/* The masking above is only a modulo when the size is a power of two. This
+*  fails the build rather than the network if that ever stops being true. */
+typedef char net_rxq_size_is_power_of_two
+             [((NET_RXQ_SIZE & (NET_RXQ_SIZE - 1UL)) == 0) ? 1 : -1];
+
+/* How many frames one net_queue_drain() call will handle before returning.
+*
+*  Not a limit on throughput: the task calls it again immediately while it
+*  returns a full burst. It exists so that the function always terminates,
+*  even against a sender that can fill the queue faster than we empty it --
+*  an unbounded loop would be at the mercy of the wire for when it ends. */
+#define NET_DRAIN_BURST   64
+
+/* How long the drain task sleeps once the queue is empty, in milliseconds.
+*
+*  There are no wait queues in this kernel, so the task is not woken when a
+*  frame arrives: it polls. One tick is the shortest poll the 1000 Hz timer
+*  can express and it is what this uses, because the interval is pure added
+*  latency on every acknowledgement, every echo reply and every DNS answer,
+*  and one millisecond is already more than the round trip to a gateway on
+*  the same segment.
+*
+*  What it costs is a wakeup per tick, and that is genuinely small: the
+*  timer interrupt happens at that rate regardless, the task's whole turn
+*  when the queue is empty is one comparison, and sleep() spends the rest of
+*  it in hlt. What the interval does NOT cost is throughput, because the
+*  task drains until the queue is empty before it sleeps at all -- only the
+*  first frame after an idle period waits, never the second and the
+*  hundredth of a burst.
+*
+*  The honest caveat, and it is the bigger half: this interval is not what
+*  decides the latency. The scheduler is round robin with a fixed slice per
+*  task and no notion of one task being more urgent than another, and a task
+*  waiting in sleep() still holds its slice to the end -- so the distance
+*  between two drains is the sum of every other runnable task's slice. With
+*  the console at 20 ticks and the status bar at 10, that is about 31 ms,
+*  and it shows: the same ping that answers in 0 ms with the protocol work
+*  in the interrupt answers in 33 ms with it in a task. That is the price of
+*  this change, it is paid to the scheduler rather than to the queue, and no
+*  sleep interval can undo it. What the interval has to do is not be the
+*  term that decides -- one tick against thirty is not. */
+#define NET_DRAIN_SLEEP_MS 1
+
+static uint8_t *rxq_buf   = 0;      /* the ring, NET_RXQ_SIZE bytes         */
+static uint8_t *rxq_frame = 0;      /* staging for one frame, behind it     */
+
+static volatile uint32_t rxq_head = 0;   /* irq writes,  task reads         */
+static volatile uint32_t rxq_tail = 0;   /* task writes, irq reads          */
+static volatile uint32_t rxq_in   = 0;   /* irq writes,  task reads         */
+static volatile uint32_t rxq_out  = 0;   /* task writes, irq never reads    */
+static volatile uint32_t rxq_peak = 0;   /* irq writes                      */
+
+/* Held while a task is inside net_queue_drain(). See the note there. */
+static int rxq_draining = 0;
+
+/* The pid of the drain task, or -1. Kept so a second net_init() does not
+*  create a second drainer -- two of them would be exactly the case the
+*  single writer rule above forbids -- and so that it can be made runnable
+*  later than it is created; see net_drain_start() for why it has to be. */
+static int rxq_task    = -1;
+static int rxq_running = 0;
+
+/* Makes the drain task runnable, once and not before it is safe to.
+*
+*  Creating the task in net_init() is free -- taskmgr_add_task() leaves the
+*  slot suspended and the scheduler cannot elect what it cannot see -- but
+*  STARTING it there is not, and the reason is worth writing down because
+*  the symptom is a machine that boots to a blank screen with a perfectly
+*  working network on it.
+*
+*  net_init() runs on the boot path, from kernel.c's network_init(), which
+*  is called before the console task is created. That path is not a task: it
+*  runs on the boot stack. schedule() saves the context it was interrupted
+*  from only when there is a current task to save it into, and until the
+*  first switch there is none -- so the first tick after ANY task becomes
+*  runnable elects that task and throws the boot away. Everything kernel.c
+*  does after network_init(), the console task included, would never happen.
+*
+*  So the task is made runnable at the first moment the scheduler is
+*  demonstrably already running: taskmgr_get_currpid() returns -1 until it
+*  has elected somebody, and the somebody it elects first is the console
+*  task, because that is the first task the kernel creates. Testing it costs
+*  a load and a branch, and only until the answer is yes.
+*
+*  The two callers are net_send() and net_receive(), which is every use of
+*  the stack in either direction. Whichever comes first starts the drain,
+*  and until one of them does there is nothing for it to drain. */
+static void net_drain_start(void)
+{
+    if(rxq_running || rxq_task < 0)
+        return;
+    if(taskmgr_get_currpid() < 0)
+        return;
+
+    rxq_running = 1;
+    taskmgr_task_start(rxq_task);
+}
+
+/* Keeps the compiler from moving the stores that fill a record past the
+*  store that publishes it. Nothing is emitted; the clobber is the point. */
+static void net_barrier(void)
+{
+    __asm__ __volatile__ ("" : : : "memory");
+}
+
+/* len bytes into the ring at the free running position at, split across the
+*  end when it lands there. The one thing that matters about both of these
+*  is that neither may touch a byte outside the ring, whatever position and
+*  length they are handed -- a length of zero and a position on the last
+*  byte included, neither of which the receive path produces but both of
+*  which the split arithmetic has to survive. */
+static void rxq_put(uint32_t at, const uint8_t *src, uint32_t len)
+{
+    uint32_t off;
+    uint32_t first;
+
+    off = at & NET_RXQ_MASK;
+    first = NET_RXQ_SIZE - off;
+    if(first > len)
+        first = len;
+
+    memcpy((void *)(rxq_buf + off), (const void *)src, (size_t)first);
+    if(len > first)
+        memcpy((void *)rxq_buf, (const void *)(src + first),
+               (size_t)(len - first));
+}
+
+static void rxq_get(uint32_t at, uint8_t *dst, uint32_t len)
+{
+    uint32_t off;
+    uint32_t first;
+
+    off = at & NET_RXQ_MASK;
+    first = NET_RXQ_SIZE - off;
+    if(first > len)
+        first = len;
+
+    memcpy((void *)dst, (const void *)(rxq_buf + off), (size_t)first);
+    if(len > first)
+        memcpy((void *)(dst + first), (const void *)rxq_buf,
+               (size_t)(len - first));
+}
+
+/* Allocates the queue. Returns 0 when the heap has nothing, which is not a
+*  crash and not a panic: net_init() reports it and leaves the stack down. */
+static int net_queue_init(void)
+{
+    rxq_head = 0;
+    rxq_tail = 0;
+    rxq_in = 0;
+    rxq_out = 0;
+    rxq_peak = 0;
+    rxq_draining = 0;
+
+    if(rxq_buf != 0)
+        return 1;                /* a second net_init(); keep the one queue */
+
+    rxq_buf = (uint8_t *)malloc((size_t)NET_RXQ_ALLOC);
+    if(rxq_buf == 0)
+    {
+        rxq_frame = 0;
+        return 0;
+    }
+
+    rxq_frame = rxq_buf + NET_RXQ_SIZE;
+    return 1;
+}
+
+static void net_queue_free(void)
+{
+    uint8_t *p;
+
+    p = rxq_buf;
+    rxq_buf = 0;
+    rxq_frame = 0;
+    free((void *)p);
+}
+
+uint32_t net_queue_capacity(void)
+{
+    return (rxq_buf == 0) ? 0UL : NET_RXQ_SIZE;
+}
+
+uint32_t net_queue_used(void)
+{
+    return rxq_head - rxq_tail;
+}
+
+uint32_t net_queue_peak(void)
+{
+    return rxq_peak;
+}
+
+int net_queue_frames(void)
+{
+    return (int)(rxq_in - rxq_out);
+}
+
+uint32_t net_rx_overrun(void)
+{
+    return stat_overrun;
+}
+
+/* The task. Drain until there is nothing left, then wait a tick.
+*
+*  Draining to empty rather than once per sleep is what keeps a burst from
+*  being paced at one frame per millisecond, which would be slower than the
+*  interrupt handler it replaces and would show up as a stalled download
+*  rather than as a statistic. Under a sustained flood the inner loop simply
+*  does not end and the task never sleeps -- correct, and not a hang: the
+*  timer still preempts it, and every other task keeps its share. */
+static void net_rx_task(void)
+{
+    for(;;)
+    {
+        while(net_queue_drain() > 0)
+            ;
+
+        sleep(NET_DRAIN_SLEEP_MS);
+    }
+}
+
 /* --- Configuration -------------------------------------------------------- */
 
 void net_init(void)
@@ -316,7 +670,9 @@ void net_init(void)
 
     stat_rx = 0;
     stat_tx = 0;
-    stat_drop = 0;
+    stat_drop_irq = 0;
+    stat_drop_tsk = 0;
+    stat_overrun = 0;
     net_is_up = 0;
     memset((char *)net_hwaddr, 0, ETH_ALEN);
 
@@ -349,6 +705,45 @@ void net_init(void)
         memset((char *)net_hwaddr, 0, ETH_ALEN);
         return;
     }
+
+    /* The queue and the task that drains it. Neither existed when this file
+    *  was written and the stack cannot run without them any more: with no
+    *  queue there is nowhere to put an arriving frame, and with no drain
+    *  nobody would ever look at one. Both failures are reported the same
+    *  way as a missing card -- the machine boots, ifconfig says the stack
+    *  is down, and nothing else in the kernel is any the wiser.
+    *
+    *  Order matters in one direction only: the buffer has to exist before
+    *  the task can run, since the task calls net_queue_drain() immediately.
+    *  net_is_up stays false until both are in place, which is what keeps
+    *  net_receive() from filling a queue nobody drains. */
+    if(!net_queue_init())
+    {
+        printf("net: no memory for the receive queue, stack stays down\n");
+        return;
+    }
+
+    /* TASK_PRIORITY_LOW, and that is not modesty. Priority in this kernel
+    *  is the length of a task's slice, not a right to run before anybody
+    *  else: the scheduler is round robin over every runnable slot, so what
+    *  decides how soon a frame is looked at is how long the OTHER tasks
+    *  hold the CPU, and the only thing a bigger slice here would do is
+    *  lengthen that cycle for everyone. One tick is the smallest
+    *  contribution to it and is still far more than a drain needs -- the
+    *  whole queue is 21 frames at its worst, and the task sleeps as soon as
+    *  it is empty. */
+    if(rxq_task < 0)
+        rxq_task = taskmgr_add_task((void *)net_rx_task, "NET RX",
+                                    TASK_PRIORITY_LOW);
+    if(rxq_task < 0)
+    {
+        printf("net: no task for the receive queue, stack stays down\n");
+        net_queue_free();
+        return;
+    }
+
+    /* Not started here. See net_drain_start(). */
+    net_drain_start();
 
     net_is_up = 1;
 
@@ -401,7 +796,7 @@ uint32_t net_tx_packets(void)
 
 uint32_t net_rx_dropped(void)
 {
-    return stat_drop;
+    return stat_drop_irq + stat_drop_tsk;
 }
 
 /* --- Sending -------------------------------------------------------------
@@ -429,6 +824,10 @@ int net_send(const uint8_t dst_mac[ETH_ALEN], uint16_t type,
         return -1;
     if(len > 0 && payload == 0)
         return -1;
+
+    /* Task context, and the earliest point at which anything uses the
+    *  stack: the right moment to let the drain run. */
+    net_drain_start();
 
     flags = irq_save();
 
@@ -748,7 +1147,15 @@ int arp_cache_get(int index, uint32_t *ip, uint8_t mac[ETH_ALEN])
 
 /* Answers a request aimed at us. Without this nothing on the segment can
 *  start a conversation with this machine: it would ask who has our address,
-*  hear nothing, and never send the packet it wanted to. */
+*  hear nothing, and never send the packet it wanted to.
+*
+*  This is a send from the drain, so it is a send from TASK context now,
+*  where it used to be one from the card's interrupt. It reaches the wire
+*  through net_send() rather than ip_send(), and net_send() builds its frame
+*  with interrupts off -- which on a uniprocessor also means the scheduler
+*  cannot take the CPU away in the middle of it. The shared build buffer is
+*  therefore as safe against the timer preempting this task as it was
+*  against the card preempting a task, and for the same reason. */
 static void arp_reply(const arp_packet *req, uint32_t sender_ip)
 {
     arp_packet pkt;
@@ -768,7 +1175,9 @@ static void arp_reply(const arp_packet *req, uint32_t sender_ip)
     net_send(req->sender_mac, ETH_TYPE_ARP, (const void *)&pkt, ARP_PKT_LEN);
 }
 
-/* Everything that arrives with ethertype 0x0806. Interrupt context. */
+/* Everything that arrives with ethertype 0x0806. Task context, out of the
+*  drain -- the ARP cache it touches is shared with arp_lookup(), which is
+*  why every access to it goes through irq_save(). */
 static void arp_receive(const uint8_t *data, uint32_t len)
 {
     const arp_packet *pkt;
@@ -779,7 +1188,7 @@ static void arp_receive(const uint8_t *data, uint32_t len)
 
     if(len < ARP_PKT_LEN)
     {
-        stat_drop++;
+        stat_drop_tsk++;
         return;
     }
 
@@ -793,7 +1202,7 @@ static void arp_receive(const uint8_t *data, uint32_t len)
        pkt->hw_len != ETH_ALEN ||
        pkt->proto_len != 4)
     {
-        stat_drop++;
+        stat_drop_tsk++;
         return;
     }
 
@@ -813,43 +1222,50 @@ static void arp_receive(const uint8_t *data, uint32_t len)
     *  already handled by the same call. */
 }
 
-/* --- Receiving -----------------------------------------------------------
+/* --- Receiving: the producer ---------------------------------------------
 *
-*  The driver calls this from its interrupt handler, once per frame.
+*  The driver calls this from its interrupt handler, once per frame, and it
+*  does two things and no more: it decides whether the frame is worth
+*  keeping, and it copies it into the queue.
 *
-*  Doing the protocol work here, rather than queueing the frame for a
-*  softirq or a kernel thread, is a deliberate simplification and it holds
-*  only because every path from here is short and finite: a length check, a
-*  16 entry cache walk, at most one frame copied into the card's transmit
-*  slot. Nothing prints, nothing allocates, nothing waits on the timer, and
-*  the frame is never handed to code that could sleep.
+*  Everything it decides is a fixed number of comparisons over the fourteen
+*  bytes of the ethernet header, and the copy is one or two memcpys. There
+*  is no cache walk, no reply built, no checksum and nothing that follows a
+*  pointer out of the frame -- all of that moved to net_queue_drain(). What
+*  was a bug in interrupt context, where a spin hangs the machine, is now a
+*  bug in a task, where it hangs a task.
 *
-*  What we pay for it is that a burst of frames is processed with interrupts
-*  effectively serialised behind the card, and that a bug anywhere above --
-*  in ARP or in ip.c -- is a bug in interrupt context, where a spin is a
-*  hung machine rather than a hung process. A receive queue would be the
-*  right next step: net_receive() would then do the addressing check, copy
-*  the frame into a ring and return, and a kernel task would drain it with
-*  interrupts on, which is also what makes it safe to eventually print,
-*  allocate or block up here. It is not built because a queue needs a task
-*  to drain it and a policy for what to do when it overflows, and neither
-*  belongs in the same change as the first packet that works.
+*  Why the ethertype is filtered HERE rather than in the drain, when the
+*  addressing is the only check net.h promises: a segment carrying IPv6 or
+*  VLAN tagged traffic would otherwise fill the queue with frames whose only
+*  destiny is to be counted and thrown away, and pushing out frames that
+*  were for us to make room for frames that were not is the wrong trade for
+*  the sake of a tidier split. It costs one comparison against a value that
+*  has already been loaded.
+*
+*  The frame belongs to the driver's receive ring and is reused the moment
+*  this returns, which is the whole reason it is copied rather than
+*  remembered.
 */
 void net_receive(const uint8_t *frame, uint32_t len)
 {
     const eth_header *eth;
+    uint8_t  hdr[NET_RXQ_HDR];
+    uint32_t head;
+    uint32_t used;
+    uint32_t need;
     uint16_t type;
 
-    if(frame == 0 || !net_is_up)
+    if(frame == 0 || !net_is_up || rxq_buf == 0)
     {
-        stat_drop++;
+        stat_drop_irq++;
         return;
     }
 
     /* Long enough to contain a header before anything reads one. */
     if(len < ETH_HDR_LEN || len > ETH_FRAME_MAX)
     {
-        stat_drop++;
+        stat_drop_irq++;
         return;
     }
 
@@ -860,7 +1276,7 @@ void net_receive(const uint8_t *frame, uint32_t len)
     *  stack from answering another machine's traffic. */
     if(!mac_equal(eth->dst, net_hwaddr) && !mac_equal(eth->dst, mac_broadcast))
     {
-        stat_drop++;
+        stat_drop_irq++;
         return;
     }
 
@@ -869,28 +1285,201 @@ void net_receive(const uint8_t *frame, uint32_t len)
     *  with it. */
     if(mac_equal(eth->src, net_hwaddr))
     {
-        stat_drop++;
+        stat_drop_irq++;
         return;
     }
 
     stat_rx++;
+
+    /* A machine that only listens still needs its drain. Nothing here is
+    *  reached before the scheduler is running -- net_drain_start() checks
+    *  that itself -- and all it does then is set a state byte. */
+    net_drain_start();
+
     type = ntohs(eth->type);
-
-    switch(type)
+    if(type != ETH_TYPE_ARP && type != ETH_TYPE_IP)
     {
-        case ETH_TYPE_ARP:
-            arp_receive(frame + ETH_HDR_LEN, len - ETH_HDR_LEN);
-            break;
-
-        case ETH_TYPE_IP:
-            ip_receive(frame + ETH_HDR_LEN, len - ETH_HDR_LEN);
-            break;
-
-        default:
-            /* IPv6, VLAN tags, whatever else the segment carries. Counted,
-            *  not printed -- this is the common case on a real network and
-            *  a printf here would bury the machine in interrupt context. */
-            stat_drop++;
-            break;
+        /* IPv6, VLAN tags, whatever else the segment carries. Counted, not
+        *  printed -- this is the common case on a real network and a printf
+        *  here would bury the machine in interrupt context. */
+        stat_drop_irq++;
+        return;
     }
+
+    /* Enqueue. rxq_head is ours; rxq_tail is read exactly once, into a local
+    *  through the difference below, and a value the task has just moved on
+    *  only makes us believe the queue is fuller than it is. */
+    need = NET_RXQ_HDR + len;
+    head = rxq_head;
+    used = head - rxq_tail;
+
+    if(NET_RXQ_SIZE - used < need)
+    {
+        /* No room: the newest frame is the one that goes. See the overflow
+        *  note above -- this is not net_rx_dropped(), it is the machine
+        *  failing to keep up with the wire. */
+        stat_overrun++;
+        return;
+    }
+
+    hdr[0] = (uint8_t)(len & 0xFFUL);
+    hdr[1] = (uint8_t)((len >> 8) & 0xFFUL);
+
+    rxq_put(head, hdr, NET_RXQ_HDR);
+    rxq_put(head + NET_RXQ_HDR, frame, len);
+
+    /* Length and bytes first, the index that publishes them last. Until this
+    *  store the consumer does not look at any of it. */
+    net_barrier();
+    rxq_head = head + need;
+    rxq_in = rxq_in + 1;
+
+    if(used + need > rxq_peak)
+        rxq_peak = used + need;
+}
+
+/* --- Receiving: the consumer ---------------------------------------------
+*
+*  Takes the oldest frame out of the queue into the staging buffer and
+*  advances rxq_tail past it. Returns its length, or 0 when the queue is
+*  empty -- a stored frame is never shorter than ETH_HDR_LEN, so zero is
+*  free to mean "nothing".
+*
+*  The frame is copied out BEFORE rxq_tail moves, and that order is not
+*  cosmetic: the moment the tail passes a record, the interrupt is entitled
+*  to write a new frame over it. Dispatching straight out of the ring would
+*  also mean handing ip.c a pointer to something that may be split across
+*  the wrap.
+*/
+static uint32_t rxq_take(void)
+{
+    uint8_t  hdr[NET_RXQ_HDR];
+    uint32_t tail;
+    uint32_t head;
+    uint32_t in;
+    uint32_t avail;
+    uint32_t len;
+
+    tail = rxq_tail;
+
+    /* One read of each of the producer's indices, in this order. Frames it
+    *  publishes after these reads are simply seen by the next call -- and
+    *  the order matters for the recovery below, where in must not be newer
+    *  than head. */
+    in = rxq_in;
+    head = rxq_head;
+
+    avail = head - tail;
+    if(avail < NET_RXQ_HDR)
+        return 0;
+
+    rxq_get(tail, hdr, NET_RXQ_HDR);
+    len = (uint32_t)hdr[0] | ((uint32_t)hdr[1] << 8);
+
+    /* Cannot happen: the producer publishes a record only once all of it is
+    *  written, and it never writes a length it did not check. If it does
+    *  happen the ring is no longer describable and the honest answer is to
+    *  drop what is in it rather than to walk it further -- the same answer
+    *  the driver gives a corrupt receive header.
+    *
+    *  Both of the consumer's variables are put back on a basis that cannot
+    *  be ahead of the producer: in was read before head, so it counts no
+    *  more frames than head's bytes contain, and net_queue_frames() can
+    *  therefore be left reporting one frame too many but never a negative
+    *  number. Nothing else here is allowed to leave the queue in a state
+    *  the display code has to defend itself against. */
+    if(len < ETH_HDR_LEN || len > (uint32_t)ETH_FRAME_MAX ||
+       avail < NET_RXQ_HDR + len)
+    {
+        stat_drop_tsk++;
+        rxq_out = in;
+        rxq_tail = head;
+        return 0;
+    }
+
+    rxq_get(tail + NET_RXQ_HDR, rxq_frame, len);
+
+    /* The bytes are out of the ring before the space is given back. */
+    net_barrier();
+    rxq_tail = tail + NET_RXQ_HDR + len;
+    rxq_out = rxq_out + 1;
+
+    return len;
+}
+
+/* Runs the protocol work for the frames the queue holds, in task context,
+*  with interrupts on. Returns how many frames it handled.
+*
+*  One caller at a time. rxq_tail is advanced with a read, a change and a
+*  store, which is safe against the interrupt -- the interrupt never writes
+*  it -- but not against a second TASK doing the same thing, and net.h makes
+*  this function public. A second caller is therefore turned away rather
+*  than allowed to lose an update; taking the flag is the one place in the
+*  receive path that masks interrupts, once per call rather than once per
+*  frame, and it is there to exclude a task rather than the card.
+*
+*  Nothing here prints. It could now -- that is half the point of being in a
+*  task -- but a busy segment would bury the console, so the reporting is
+*  left to the counters.
+*
+*  One thing this changed for the layer above, and it is worth being exact
+*  about because ip.c cannot see it from where it stands. An echo reply and
+*  an ARP reply are now sent from a TASK, where they used to be sent from
+*  the card's interrupt. ip.c's ip_tx_busy guard is still needed and still
+*  does its job -- a second writer of the shared packet buffer is refused
+*  rather than allowed to corrupt the first -- but the kind of preemption it
+*  faces has changed: an interrupt ran to completion between two of a task's
+*  instructions, whereas the timer can now stop this task anywhere. That is
+*  fine for the buffer, which is only written after the flag is taken, and
+*  it leaves ONE window that did not exist before: two tasks can both pass
+*  the test before either does the store, because the test and the store are
+*  not one instruction. The fix is a cli around those two lines in ip.c,
+*  which is not this file's to make; it is written down here so that the
+*  next person to open ip.c knows it is now reachable. Everything that made
+*  a refused send harmless still holds -- data is covered by the
+*  retransmission timer and a pure ACK is re-sent from tcp_poll(). */
+int net_queue_drain(void)
+{
+    const eth_header *eth;
+    uint32_t flags;
+    uint32_t len;
+    uint16_t type;
+    int handled;
+
+    if(rxq_buf == 0)
+        return 0;
+
+    flags = irq_save();
+    if(rxq_draining)
+    {
+        irq_restore(flags);
+        return 0;
+    }
+    rxq_draining = 1;
+    irq_restore(flags);
+
+    handled = 0;
+    while(handled < NET_DRAIN_BURST)
+    {
+        len = rxq_take();
+        if(len == 0)
+            break;
+
+        handled++;
+
+        eth = (const eth_header *)rxq_frame;
+        type = ntohs(eth->type);
+
+        /* The producer let nothing else through, so the default is a frame
+        *  that cannot be here at all. */
+        if(type == ETH_TYPE_ARP)
+            arp_receive(rxq_frame + ETH_HDR_LEN, len - ETH_HDR_LEN);
+        else if(type == ETH_TYPE_IP)
+            ip_receive(rxq_frame + ETH_HDR_LEN, len - ETH_HDR_LEN);
+        else
+            stat_drop_tsk++;
+    }
+
+    rxq_draining = 0;
+    return handled;
 }

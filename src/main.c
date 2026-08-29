@@ -397,6 +397,13 @@ extern char usertext_end[];
 *  and for the same reason: printf() has no "%-15s". */
 #define NET_INFO_LABEL   17
 
+/* When a peak occupancy of the receive queue is worth calling "most of it".
+*  Three quarters rather than nine tenths, because the whole point of the
+*  peak is that it is seen BEFORE frames are lost: a queue that has already
+*  been three quarters full absorbed a burst it only just fitted, and the
+*  next one of those is the one that does not fit. */
+#define NET_QUEUE_HIGH   75
+
 /* Which card the driver drives. rtl8139.c owns these two numbers; they are
 *  repeated here for one purpose only, namely to point at the line in the
 *  "lspci" table that is the network card. */
@@ -4317,7 +4324,14 @@ static void net_show_pci(void)
 *  The counters are the honest part of this: net_rx_packets() counts what the
 *  card's interrupt handed up, net_rx_dropped() what the stack threw away
 *  again, and the two together say a great deal more about a network that is
-*  not working than any status word does. */
+*  not working than any status word does.
+*
+*  There are three of them on that row now. The overrun count is the one
+*  number out of the receive queue that could not be left to "ifconfig -q" --
+*  see net_show_queue() for why the rest of them are there and not here --
+*  because it is the only counter on this screen that says the fault is in
+*  this machine rather than out on the network. It costs no row: it is a
+*  third column on a line that had two. */
 static void net_show_interface(void)
 {
 	char text[NET_MAC_TEXT];
@@ -4413,6 +4427,8 @@ static void net_show_interface(void)
 	mem_print_right(net_rx_packets(), 8);
 	printf("   dropped: ");
 	mem_print_right(net_rx_dropped(), 8);
+	printf("   overrun: ");
+	mem_print_right(net_rx_overrun(), 8);
 	printf("\n");
 
 	printf("  TX packets: ");
@@ -4422,9 +4438,9 @@ static void net_show_interface(void)
 	/* The UDP counters belong here, one layer up though they are: this
 	   command is where one looks when the network does not work, and since
 	   DHCP the interesting failure is a datagram that the card counted and
-	   UDP then dropped -- a wrong checksum, a port nobody bound. Two rows of
-	   the same three columns as above show that difference at a glance, and
-	   they are cheap: four lines that are read together. */
+	   UDP then dropped -- a wrong checksum, a port nobody bound. Two rows in
+	   the same columns as the two above show that difference at a glance,
+	   and they are cheap: four lines that are read together. */
 	printf("  UDP     rx: ");
 	mem_print_right(udp_rx_packets(), 8);
 	printf("   dropped: ");
@@ -4441,9 +4457,158 @@ static void net_show_interface(void)
 	   command's counters with its command, and this display is already at
 	   the height of the screen. */
 
+	/* What the third column of the first row means, said only when it is not
+	   zero -- the way "netstat" explains TIME_WAIT only while a row is
+	   sitting in it. A zero there needs no words, and two rows of prose for
+	   a zero is exactly what this display has no room for. Anything else is
+	   worth the two rows, because two counters standing beside each other
+	   are read as one kind of number and these are not: a drop is ordinary,
+	   an overrun is the machine falling behind. The rest of the queue is one
+	   command away and is named here, so that somebody who has just been
+	   told the queue was full can go and see how full it gets. */
+	if(net_rx_overrun() != 0)
+	{
+		printf("  Overrun is frames the card's interrupt had nowhere to put,\n");
+		printf("  the receive queue being full. \"ifconfig -q\" shows the queue.\n");
+	}
+
 	/* A row of zeroes explains nothing by itself, so when the interface
 	   cannot carry a packet it says why underneath. */
 	if(!rtl8139_present() || !net_up() || !configured)
+	{
+		printf("\n");
+		net_explain_down();
+	}
+}
+
+/* --- the receive queue ---------------------------------------------------
+*
+*  Where these numbers go, and why they are not in the display above.
+*
+*  The queue belongs to the interface. It is eth0's backlog and nothing
+*  else's, and there is no second thing it could be filed under -- so it
+*  keeps the interface's command word instead of getting one of its own, the
+*  same way "gfx -i" is a second display under "gfx" rather than a command
+*  called "gfxinfo". A new word in "help" buys nothing when the word it would
+*  be next to is already the right one.
+*
+*  But it does not belong in what "ifconfig" prints by itself. That is what
+*  one reads to find out whether the network works, and these five numbers do
+*  not answer that question: they are detail about HOW the receiving is done,
+*  and on a machine that is working most of them are zero. The display is
+*  already fourteen rows on a screen with twenty-five -- the DNS counters
+*  were kept out of it for that reason, and TCP's went to "netstat" for the
+*  same one -- and five more rows would push the interface itself off the top
+*  of the screen to show them.
+*
+*  So the option gets the queue and the ordinary display gains no row at all.
+*  It gains one COLUMN: the overrun count, beside the drop count that has
+*  always been there, because that single number must not wait behind an
+*  option that nobody types when they have no reason to suspect a queue
+*  exists. It is also the only place where an overrun can be read for what it
+*  is, which is not what the number next to it is.
+*
+*  What the two numbers here are for, since neither is obvious:
+*
+*  The peak is the only evidence that the drain keeps up with the wire. Used
+*  is a sample -- by the time it is printed the drain has almost certainly
+*  emptied the queue, so it reads zero on a machine under load and on a
+*  machine doing nothing alike. The peak remembers the worst moment since
+*  boot, and the distance between it and the capacity is the margin the
+*  machine has left. A queue that never fills is working. One whose peak is
+*  approaching capacity is about to start losing frames, and the whole value
+*  of the number is that it says so BEFORE the first one is lost.
+*
+*  An overrun is a different failure from a drop, and printing them as one
+*  number would hide the only one that means anything is wrong.
+*  net_rx_dropped() counts frames the protocol layers rejected -- not for us,
+*  failed a check -- which is ordinary and happens on any shared wire.
+*  net_rx_overrun() counts frames the interrupt threw away because there was
+*  no room, which means this machine could not keep up with its own card. */
+
+/* "ifconfig -q": the queue between the card's interrupt and the task that
+*  does the protocol work. */
+static void net_show_queue(void)
+{
+	uint32_t capacity;
+	uint32_t used;
+	uint32_t peak;
+	uint32_t percent;
+	uint32_t overrun;
+
+	capacity = net_queue_capacity();
+	used = net_queue_used();
+	peak = net_queue_peak();
+	overrun = net_rx_overrun();
+
+	/* A capacity of zero would only come from a queue that is not there, and
+	   dividing by it is not the way to find that out. */
+	percent = 0;
+	if(capacity != 0) percent = (peak * (uint32_t)100) / capacity;
+
+	printf("Receive queue:\n");
+
+	/* The line that earns its space. Without it these are five numbers about
+	   a thing the reader has no reason to know exists, and no amount of
+	   labelling the numbers would tell them what it is for. */
+	printf("  The card's interrupt copies each frame in here and returns; the\n");
+	printf("  protocol work happens afterwards in a task. What is in the queue\n");
+	printf("  is how far behind the wire that task is.\n");
+
+	net_info_label("Capacity:");
+	mem_print_right(capacity, 8);
+	printf(" bytes, %i frames at the %i byte maximum\n",
+	       (int)(capacity / (uint32_t)ETH_FRAME_MAX), ETH_FRAME_MAX);
+
+	/* Almost always zero, and it is here anyway: it is the number that says
+	   what "peak" is the peak OF, and a reader who sees only a high water
+	   mark has no way to tell a queue from a counter. */
+	net_info_label("In use:");
+	mem_print_right(used, 8);
+	printf(" bytes, %i frame(s) waiting now\n", net_queue_frames());
+
+	net_info_label("Peak:");
+	mem_print_right(peak, 8);
+	printf(" bytes, %u percent of capacity\n", (int)percent);
+
+	/* Which of the two things the peak means, said outright. Reading a high
+	   water mark is exactly the skill somebody looking at this for the first
+	   time does not have, and the number is worthless without it. */
+	if(peak == 0)
+	{
+		printf("  Nothing has ever waited here: every frame was drained before\n");
+		printf("  the next one arrived, which is a drain well ahead of the wire.\n");
+	}
+	else if(percent >= NET_QUEUE_HIGH)
+	{
+		printf("  The peak is most of the queue. The drain is only just keeping\n");
+		printf("  up, and the next burst is the one that starts being lost.\n");
+	} else {
+		printf("  The drain has been keeping up: the wire never filled more of\n");
+		printf("  the queue than that, and the rest of it is the margin left.\n");
+	}
+
+	net_info_label("Overrun:");
+	mem_print_right(overrun, 8);
+	printf(" frames, arrived with no room here\n");
+
+	net_info_label("Dropped:");
+	mem_print_right(net_rx_dropped(), 8);
+	printf(" frames, rejected by the protocol layers\n");
+
+	/* The two above are next to each other and are not the same kind of
+	   number, so the difference is spelled out whenever the one that matters
+	   is not zero. */
+	if(overrun != 0)
+	{
+		printf("  An overrun is not a drop. Dropped is ordinary: a frame that\n");
+		printf("  was not for us, or that failed a check. Overrun is this\n");
+		printf("  machine failing to keep up with its own card.\n");
+	}
+
+	/* Numbers about a queue nothing can put anything into explain nothing by
+	   themselves, the same as the row of zeroes in the display above. */
+	if(!rtl8139_present() || !net_up())
 	{
 		printf("\n");
 		net_explain_down();
@@ -4580,6 +4745,7 @@ static int net_ping_once(uint32_t dst, uint16_t sequence, uint32_t *from)
 			printf(" ... ");
 		}
 
+		net_queue_drain();     /* the ARP reply is in there, see below */
 		sleep(NET_ARP_WAIT);
 		rc = icmp_send_echo(dst, NET_PING_ID, sequence);
 	}
@@ -4590,6 +4756,18 @@ static int net_ping_once(uint32_t dst, uint16_t sequence, uint32_t *from)
 
 	for(waited = 0; waited < NET_PING_WAIT; waited += NET_PING_POLL)
 	{
+		/* Take the frame out of the receive queue ourselves, and do it
+		*  BEFORE looking at the mailbox rather than after -- the reply
+		*  arrives during the sleep at the end of the loop, so draining
+		*  afterwards would leave it sitting there for one more round and
+		*  add a whole poll interval to every measurement.
+		*
+		*  The drain task would get to it a full trip round the scheduler
+		*  later, and a ping that reports the scheduler instead of the
+		*  network is worthless. net_queue_drain() refuses re-entry, so
+		*  doing it here alongside that task is safe. */
+		net_queue_drain();
+
 		if(icmp_last_reply(&reply_from, &reply_id, &reply_sequence)
 		   && reply_id == (uint16_t)NET_PING_ID
 		   && reply_sequence == sequence)
@@ -4924,6 +5102,7 @@ static void net_dhcp_run(void)
 
 		if(state == DHCP_STATE_BOUND) break;
 
+		net_queue_drain();     /* the OFFER and the ACK are in there */
 		sleep(DHCP_POLL);
 	}
 
@@ -5058,6 +5237,7 @@ static int net_dns_resolve(const char *what, const char *name,
 
 		if(state == DNS_STATE_DONE || state == DNS_STATE_FAILED) break;
 
+		net_queue_drain();     /* the answer is in there */
 		sleep(DNS_POLL);
 	}
 
@@ -5449,10 +5629,22 @@ void netconfig(char *cmd)
 		return;
 	}
 
+	/* The queue is the interface's, so it is under the interface's word --
+	   see net_show_queue() for why it is behind an option and not in the
+	   display above it. Checked before the count, because one argument that
+	   is not "-q" is a mistyped address list and belongs in the syntax
+	   message with the rest of them. */
+	if(prmc(cmd) == 1 && strcmp(prmv(1, cmd), "-q") == 0)
+	{
+		net_show_queue();
+		return;
+	}
+
 	if(prmc(cmd) != 3)
 	{
-		printf("Syntax: ifconfig [IP NETMASK GATEWAY]\n");
+		printf("Syntax: ifconfig [-q] [IP NETMASK GATEWAY]\n");
 		printf("\t          Show the interface, its addresses and counters\n");
+		printf("\t-q        Show the receive queue the card's interrupt fills\n");
 		printf("\tIP ...    Set all three, for example\n");
 		printf("\t          ifconfig 10.0.2.15 255.255.255.0 10.0.2.2\n");
 		printf("\t          which is what QEMU's user network expects\n");
@@ -5871,7 +6063,8 @@ void help(void)
 	printf("\tgfx       Draw the graphics demo, gfx -t tests mode 13h,\n");
 	printf("\t          gfx -i shows the mode the machine booted into\n");
 	printf("\tlspci     List the devices the PCI enumeration found\n");
-	printf("\tifconfig  Show the interface and its counters,\n");
+	printf("\tifconfig  Show the interface and its counters, ifconfig -q\n");
+	printf("\t          shows the receive queue the card's interrupt fills,\n");
 	printf("\t          ifconfig IP NETMASK GATEWAY sets the addresses\n");
 	printf("\tdhcp      Ask the network for an address instead of typing\n");
 	printf("\t          one, dhcp -f asks again when one is already set\n");

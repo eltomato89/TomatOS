@@ -61,14 +61,57 @@ static uint16_t ip_next_id = 1;
 /* One packet under construction. Static rather than on the stack: 1500
 *  bytes is more than an interrupt stack should carry.
 *
-*  ip_send() is reached from two directions -- the shell sending a ping, and
-*  the receive path answering an echo request from interrupt context. If the
-*  card interrupts the shell halfway through building a packet, both would
-*  write into this buffer. The busy flag catches that: the inner call gives
-*  up instead of corrupting the outer packet. Losing one echo reply costs
-*  the peer a retry, which it does anyway. */
+*  ip_send() is reached from more than one direction, and which directions has
+*  changed. It used to be the shell against the card's interrupt answering an
+*  echo request. Since the receive queue, the protocol work runs in the drain
+*  TASK instead -- so the second writer is now another task, preempted by the
+*  timer rather than by the card. Either way both would write into this buffer,
+*  and the busy flag catches it: the second caller gives up rather than
+*  corrupting the first one's packet. Losing an echo reply costs the peer a
+*  retry, which it does anyway.
+*
+*  The change of direction matters for HOW the flag is taken, see
+*  ip_tx_acquire() below. */
 static uint8_t  ip_tx_packet[IP_HDR_LEN + IP_MAX_PAYLOAD];
 static volatile int ip_tx_busy = 0;
+
+/* Takes the transmit buffer if it is free. Returns 1 on success, 0 if
+*  somebody else has it.
+*
+*  The test and the store have to be one indivisible step, and until the
+*  receive queue landed they did not have to be. The old argument was written
+*  down here and was sound at the time: the only other caller was an interrupt,
+*  and an interrupt landing between the test and the store runs its own send to
+*  completion and clears the flag again before the interrupted instruction
+*  resumes -- serial, never overlapping.
+*
+*  That argument does not survive two TASKS. Task A tests and finds the flag
+*  clear; the timer preempts it before the store; task B tests, also finds it
+*  clear, takes it and starts building; the timer preempts B mid-packet; A
+*  resumes, stores the flag that is already set, and builds into the same
+*  buffer. Two half-packets, one buffer, and nothing refused anybody.
+*
+*  cli closes it. On a uniprocessor that blocks the scheduler as well as the
+*  card, which is exactly the two things that could intervene, and it is held
+*  for two instructions rather than for the whole packet -- the building itself
+*  is still preemptible, which is the point of having a flag at all rather than
+*  just masking interrupts around the send. The flags are saved and restored
+*  rather than ending in sti, because this is also reachable with interrupts
+*  already off. */
+static int ip_tx_acquire(void)
+{
+    uint32_t flags;
+    int      got;
+
+    __asm__ __volatile__ ("pushfl; popl %0; cli" : "=r" (flags) : : "memory");
+
+    got = !ip_tx_busy;
+    if (got) ip_tx_busy = 1;
+
+    __asm__ __volatile__ ("pushl %0; popfl" : : "r" (flags) : "memory", "cc");
+
+    return got;
+}
 
 /* The echo reply we build in the receive path, and the one we send from
 *  icmp_send_echo(). Separate buffers: the first is only ever used in
@@ -180,15 +223,12 @@ int ip_send_from(uint32_t src, uint32_t dst, uint8_t protocol,
     /* Everything above this line only reads. From here on the shared
     *  transmit buffer is written, which is what the flag protects: a send
     *  reached from an interrupt while a task is mid-packet gives up rather
-    *  than overwriting it. The gap between the test and the store is not a
-    *  hole on this machine -- an interrupt landing in it runs its own send
-    *  to completion and clears the flag again before the interrupted
-    *  instruction resumes, and the buffer is untouched until after the
-    *  store. What must not happen is a second writer arriving between the
-    *  store and the release below, and that is refused. */
-    if (ip_tx_busy)
-        return IP_ERR_FAILED;    /* interrupted a send in progress */
-    ip_tx_busy = 1;
+    *  than overwriting it. Taken indivisibly -- see ip_tx_acquire(), which
+    *  explains why the plain test-then-store this used to be stopped being
+    *  enough the moment the receive path moved out of the interrupt and into
+    *  a task of its own. */
+    if (!ip_tx_acquire())
+        return IP_ERR_FAILED;    /* somebody else is mid-packet */
 
     total = IP_HDR_LEN + len;
 

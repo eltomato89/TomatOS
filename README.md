@@ -397,6 +397,69 @@ waiting. A receive queue drained by a task would be the better structure and
 is noted as such in `net.c`; it needs a task and an overflow policy, and
 neither belongs in the same change as the first packet that works.
 
+#### The receive queue
+
+Every protocol added after the first ping ran inside the card's interrupt
+handler, and that held only because each path was short and finite. It stopped
+being true: a DHCP option walk, a DNS name with compression pointers and a TCP
+state machine are not short in the sense that argument needed — and a bug in
+any of them is a hung *machine*, not a hung process, because the handler runs
+with the whole system waiting.
+
+So `net_receive()` now checks the frame is addressed to us, copies it into a
+queue and returns. `net_queue_drain()` does the protocol work afterwards, in a
+task, with interrupts on.
+
+The queue is a **byte ring with length-prefixed frames**, 32 KB from the heap.
+An array of 1518-byte slots would be nine tenths padding for what actually
+arrives — acknowledgements, ARP replies and DNS answers are 60 to 100 bytes —
+and the same memory holds 21 full frames *or* some five hundred small ones.
+Both indices are free-running byte counters and occupancy is their unsigned
+difference, the idiom `tcp.c` already uses for its rings, so there is no
+full/empty ambiguity and no wasted byte. A record that runs past the end is
+split rather than skipped: skipping needs a marker, and a marker is a length
+that is not a length, which every reader would then have to know about.
+
+**Neither side masks interrupts on the common path.** The interrupt writes the
+head and the frame; the task writes the tail. Neither writes the other's, each
+reads the other's exactly once into a local, and every stale read is
+conservative. Publication order is length, bytes, then head. The drop counter
+is two counters, one per context, summed by `net_rx_dropped()` — for exactly
+the same reason.
+
+**Overflow drops the newest** and counts it separately in `net_rx_overrun()`.
+Dropping the oldest would mean the interrupt moving the *consumer's* index,
+which would cost the whole lock-free argument; and losing the tail of a burst
+is what wire loss looks like anyway, which is what TCP is built to handle.
+
+Two things this cost, and what was done about them:
+
+**The boot.** Starting the drain task inside `net_init()` strands the machine.
+`network_init()` runs on the boot stack before the console task exists, and
+`schedule()` saves no context while `current_task < 0` — so the first tick
+after any task becomes runnable throws the boot away. The machine came up with
+a working network and no shell. The task is created there but made runnable
+later, at the first moment there is a current task to switch away from.
+
+**Latency.** A ping's round trip went from 0 ms to 34 ms, and no sleep interval
+fixes that: a task holds its slice even while sleeping, so the gap between
+drains is the sum of the other tasks' slices. The answer is not to poll faster
+but to notice that a task waiting for a packet may as well take it out of the
+queue itself — `net_queue_drain()` is written for task context and refuses
+re-entry, so the ping, DHCP, DNS and system-call wait loops all call it. Back
+to 0 ms on the local network, and 20 ms to a host on the internet, which is
+the network rather than the machine. The drain task stays: it handles what
+nobody is waiting for.
+
+One thing the queue does **not** remove is concurrency. It changes which kind:
+the receive path can no longer preempt a send half way through, but the drain
+task can still be preempted by the timer while another task is inside
+`ip_send()`. That turned up a real defect — `ip_tx_busy` was tested and set in
+two separate steps, which was safe against an interrupt (it runs to completion
+and clears the flag before the interrupted instruction resumes) and is not safe
+against another task, which can be preempted mid-packet. It is taken under
+`cli` now, for two instructions rather than for the whole packet.
+
 #### UDP and DHCP
 
 The point of the DHCP client is that a machine on an unfamiliar network can
