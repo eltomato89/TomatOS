@@ -25,6 +25,7 @@
 #include <system.h>
 #include <stdio.h>
 #include <net.h>
+#include <tcp.h>
 
 /* ------------------------------------------------------------------ */
 /* Constants                                                           */
@@ -448,8 +449,19 @@ void ip_receive(const uint8_t *packet, uint32_t len)
         *  which may still carry ethernet padding. */
         udp_receive(src, dst, packet + header_len, total - header_len);
     }
+    else if (ip->protocol == IP_PROTO_TCP)
+    {
+        /* Same reasoning as UDP above, and the same pseudo header: TCP's
+        *  checksum covers the addresses too. Unlike UDP there is no
+        *  unconfigured case to allow for -- a connection cannot exist before
+        *  the machine has an address -- but the destination is still passed
+        *  as it arrived rather than as net_ip(), so that the one place the
+        *  checksum is computed does not have to know which of the two it is
+        *  looking at. */
+        tcp_receive(src, dst, packet + header_len, total - header_len);
+    }
 
-    /* TCP has nobody to go to. */
+    /* Everything else is dropped: this stack speaks ICMP, UDP and TCP. */
 }
 
 /* One ICMP message, already known to be addressed to us. */

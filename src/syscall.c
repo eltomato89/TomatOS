@@ -24,6 +24,10 @@
 #include <syscall.h>
 #include <fat.h>
 #include <ata.h>
+#include <net.h>
+#include <tcp.h>
+#include <dns.h>
+#include <dhcp.h>
 
 /* The stub in start.asm. It pushes a dummy error code and the interrupt
 *  number, saves the registers and calls syscall_handler(). */
@@ -84,6 +88,107 @@ extern int exec_spawn_path(const char *path, const char *args, int prio);
 *  the ordinary read() contract and lets a caller loop without knowing the
 *  limit. */
 #define SYS_READ_MAX 4096
+
+/* Longest host name SYS_RESOLVE accepts, terminator included.
+*
+*  DNS_NAME_MAX is the protocol's own limit on a whole name, so anything
+*  longer is not a name the resolver could encode -- dns_resolve() would refuse
+*  it after this file had already copied it. Bounding the copy at the same
+*  number means a name that is too long is turned down here, for the reason
+*  user_string_len() gives: at that point the argument is not a host name, and
+*  guessing where it ends is not the kernel's job.
+*
+*  256 bytes is four times what SYS_PATH_MAX costs and it lands on the same 4
+*  KiB kernel stack, which is why it is worth saying that it fits: the deepest
+*  this call goes below itself is dns_resolve(), which works out of static
+*  buffers of its own and does not recurse. */
+#define SYS_HOST_MAX (DNS_NAME_MAX + 1)
+
+/* Most bytes a single SYS_SEND or SYS_RECV may move.
+*
+*  Same argument as SYS_READ_MAX, and the same number for the same reason: one
+*  page is one mapping, one validation walk, and a bound on how long ring 3 can
+*  keep the kernel inside a single trap by passing a big length. It also sits at
+*  or below both connection buffers -- TCP_SND_BUF is 4096 and TCP_RCV_BUF is
+*  8192 -- so it never promises a transfer the stack below could not perform in
+*  one call anyway.
+*
+*  Larger requests are answered short rather than refused. That is what both
+*  calls already have to do (tcp_send() takes what fits, tcp_recv() returns what
+*  has arrived), so a caller that loops until it has what it wants works without
+*  knowing the cap exists. */
+#define SYS_NET_XFER_MAX 4096
+
+/* How long a network call waits before it gives up, in milliseconds, and how
+*  long it sleeps between two looks.
+*
+*  Every one of these five calls blocks, so every one of them needs a number
+*  here: a task waiting on a machine that answers nothing must end in
+*  SYS_ETIMEDOUT rather than never returning at all. The bounds are backstops
+*  wherever the layer below has a schedule of its own -- the useful failure is
+*  the one the resolver or the TCP retransmission timer reports, because it
+*  knows why -- so each is set above that schedule rather than in competition
+*  with it.
+*
+*  SYS_NET_POLL is the sleep between two looks, and it is the shell's 50 ms
+*  from main.c, chosen there for the same reason: a virtual network answers far
+*  faster, but nothing is lost by looking twenty times a second, and the task is
+*  off the CPU in between (see sysnet_pump() for why that is a real yield and
+*  not a spin).
+*
+*  SYS_NET_RESOLVE_MS covers our own lookup. dns.c sends at most
+*  DNS_MAX_ATTEMPTS = 3 queries with a timeout that starts at 1000 ms and
+*  doubles, so it concludes on its own after 1 + 2 + 4 = 7 seconds; ten leaves
+*  that schedule room to finish and report DNS_STATE_FAILED, which is the answer
+*  worth having.
+*
+*  SYS_NET_RESOLVE_BUSY covers the wait for the resolver to be free at all,
+*  which is a separate thing to wait for because dns.c serves one lookup at a
+*  time for the whole machine -- see sysnet_dns_take(). Eight seconds tolerates
+*  exactly one other lookup running its schedule out in front of us. The two
+*  phases add up to eighteen seconds in the worst case, and that case needs a
+*  second task resolving at the same moment; a lookup that has the resolver to
+*  itself is bounded by the ten.
+*
+*  SYS_NET_CONNECT_MS covers the handshake. A SYN that is dropped rather than
+*  refused is retransmitted on the classic 1/2/4 second schedule, so ten seconds
+*  is three attempts plus room for the ARP exchange that has to resolve the
+*  gateway before the very first segment of the first connection after boot can
+*  leave. Short enough that a wrong address reads as a failure rather than as a
+*  hung shell, which a minute would not.
+*
+*  SYS_NET_SEND_MS is the wait for room in the send buffer. That buffer only
+*  stays full while the peer stops acknowledging, so this is not really a
+*  bandwidth limit but a liveness one: ten seconds without a single
+*  acknowledgement, on a link that normally answers in under a millisecond, is a
+*  peer that is gone.
+*
+*  SYS_NET_RECV_MS is longer than the rest on purpose, because it is the only
+*  one waiting on somebody else's thinking. A server that has taken the request
+*  and produced nothing at all for fifteen seconds is not about to; fifteen is
+*  chosen to sit above a slow origin and below the point where a user decides
+*  the machine has crashed. It bounds silence, not the transfer -- each call
+*  brings its own fresh budget, so a download that keeps trickling never trips
+*  it.
+*
+*  SYS_NET_CLOSE_MS is short, and that is the interesting one. It waits for our
+*  FIN to be acknowledged, which takes a round trip, and NOT for the connection
+*  to reach TCP_CLOSED -- TIME_WAIT is twice the maximum segment lifetime and
+*  can be a minute, which is exactly the wait that would make close() look like
+*  a hang. Two seconds is many round trips on any link this kernel will see. */
+#define SYS_NET_POLL             50
+#define SYS_NET_RESOLVE_MS    10000
+#define SYS_NET_RESOLVE_BUSY   8000
+#define SYS_NET_CONNECT_MS    10000
+#define SYS_NET_SEND_MS       10000
+#define SYS_NET_RECV_MS       15000
+#define SYS_NET_CLOSE_MS       2000
+
+/* Largest port number, and the largest handle ring 3 can be given. A handle is
+*  its slot in sysnet_conns[] plus one, so that 0 is never a valid handle --
+*  see sysnet_slot_of(). */
+#define SYS_PORT_MAX          65535
+#define SYS_NET_HANDLE_MAX    TCP_MAX_CONNS
 
 /* Upper bound for the schedule() calls in sys_exit(), same reasoning as
 *  FAULT_SCHEDULE_TRIES in isrs.c: schedule() only switches once the running
@@ -445,6 +550,344 @@ static void field_copy(char *dst, int size, const char *src)
 
 
 /* ------------------------------------------------------------------ */
+/* Network connections owned by ring 3                                 */
+/* ------------------------------------------------------------------ */
+
+/* What one open connection is, from this gate's point of view.
+*
+*  The table exists because a TCP handle from tcp.c is a number and nothing
+*  else. Handing that number straight to ring 3 would make every one of the
+*  four connections on the machine reachable by every program, since a handle
+*  another task obtained is a small integer and guessing it takes four tries.
+*  So the number ring 3 is given indexes THIS table, the table records who
+*  opened the entry, and the kernel handle never crosses the gate in either
+*  direction.
+*
+*  owner is the pid that called SYS_CONNECT. sysnet_slot_of() refuses an entry
+*  whose owner is not the caller, which is what makes the answer to "can a
+*  program reach a connection another task opened" a no rather than a hope.
+*
+*  peer, peer_port and local_port are not bookkeeping for the shell -- they are
+*  an identity. See sysnet_identity_ok() for what they defend against. */
+typedef struct
+{
+	int      used;
+	int      khandle;      /* the handle tcp.c gave us                     */
+	int      owner;        /* pid that opened it                           */
+	uint32_t peer;         /* host order, as passed to tcp_connect()       */
+	uint16_t peer_port;
+	uint16_t local_port;   /* 0 if tcp_conn_get() would not say            */
+} sysnet_conn;
+
+/* One entry per connection tcp.c can hold, so the table is never the tighter
+*  limit of the two and a refusal always means the same thing. */
+static sysnet_conn sysnet_conns[SYS_NET_HANDLE_MAX];
+
+/* Whoever is inside SYS_RESOLVE, and a lock to get there.
+*
+*  dns.c serves ONE lookup at a time for the whole machine: dns_resolve()
+*  refuses while a query is in flight, and the answer lands in a single
+*  dns_result(). With one shell that is a limitation; with several tasks it is a
+*  correctness problem, and not the obvious one. The obvious one is that the
+*  second task's dns_resolve() fails, which is merely inconvenient. The real one
+*  is the race after it succeeds: task A's answer arrives and dns.c moves to
+*  DNS_STATE_DONE, task B wakes first, sees a resolver that is no longer busy
+*  and starts its own lookup, which clears dns_result_ip -- and A then reads
+*  B's address for A's name. Nothing in the sequence is invalid, and the wrong
+*  address is returned without any error anywhere.
+*
+*  A lock held across the whole of "start a lookup, collect its result" is what
+*  closes that, and it has to be taken atomically: vector 0x80 is a trap gate,
+*  so the timer can preempt this file between a test and a set. xchg is the
+*  smallest thing that cannot be preempted in the middle, needs no cli, and is
+*  correct on the single processor this kernel runs on.
+*
+*  The owner is recorded next to the lock so that a task aborted while holding
+*  it does not take the resolver down with it -- see sysnet_reap(). */
+static volatile int sysnet_dns_lock = 0;
+static int sysnet_dns_owner = -1;
+
+/* Milliseconds elapsed since a timer_get_ticks() snapshot.
+*
+*  Unsigned subtraction, like timer_wait()'s own loop, and for the same reason:
+*  timer_get_ticks() counts milliseconds in an int and eventually wraps, but
+*  the difference between two snapshots stays right across the wrap. A plain
+*  "now > start + limit" would be false forever on the wrong side of it, which
+*  is a timeout that never fires -- precisely the failure these bounds exist to
+*  prevent. */
+static uint32_t sysnet_ms_since(uint32_t start)
+{
+	return (uint32_t)timer_get_ticks() - start;
+}
+
+/* One turn of every waiting loop below: drive the state machines, then sleep.
+*
+*  Both polls are called from every wait, not just from the wait that cares
+*  about them. Neither does anything when it has nothing to do -- dns_poll()
+*  returns at once unless a query is in flight, tcp_poll() walks four slots --
+*  and calling both means a task blocked in SYS_RECV keeps another task's
+*  handshake and retransmission timers running rather than freezing them for
+*  fifteen seconds. Nothing else moves them: the receive path only reacts to
+*  segments that do arrive, and the interesting failure is the one where none
+*  does.
+*
+*  The sleep is the part that makes this a wait rather than a spin, and it is
+*  worth being precise about why. sleep() is timer_wait(), which hlts until the
+*  next interrupt instead of turning the CPU over. hlt is only safe because
+*  vector 0x80 is a TRAP gate: IF is whatever the caller had, ring 3 always
+*  arrives with it set, so the timer IRQ is still delivered. And IRQ0 is
+*  handled by irq_handler(), which calls schedule() and returns a different
+*  register frame -- so the tick that ends this sleep is the same tick that
+*  hands the CPU to somebody else. The task is descheduled by preemption for
+*  essentially the whole of a fifty millisecond wait, exactly as SYS_SLEEP and
+*  SYS_GETCH already are.
+*
+*  What it is not, and for the same reason sys_getch() says so, is a blocked
+*  state: the task stays runnable and is re-elected once per time slice only to
+*  hlt again. That costs one wakeup per slice, not a busy loop, and a wait queue
+*  in tasks.c would be the right next step. */
+static void sysnet_pump(void)
+{
+	dns_poll();
+	tcp_poll();
+	sleep(SYS_NET_POLL);
+}
+
+/* Takes the resolver, or reports that somebody else has it. */
+static int sysnet_dns_take(void)
+{
+	int taken;
+
+	taken = 1;
+
+	/* xchg writes 1 and hands back what was there, in one instruction that no
+	*  interrupt can land inside. A zero came back means the lock was free and
+	*  is now ours; a one means it was already held and we changed nothing. */
+	__asm__ __volatile__ ("xchgl %0, %1"
+		: "+r" (taken), "+m" (sysnet_dns_lock)
+		: : "memory");
+
+	if(taken != 0) return 0;
+
+	sysnet_dns_owner = taskmgr_get_currpid();
+	return 1;
+}
+
+/* Gives it back. The owner is cleared first and the lock last, so that a task
+*  which takes it the instant after cannot find a stale owner recorded against
+*  a lock it now holds. */
+static void sysnet_dns_release(void)
+{
+	sysnet_dns_owner = -1;
+	__asm__ __volatile__ ("" : : : "memory");
+	sysnet_dns_lock = 0;
+}
+
+/* Drops everything a task owns: its connections, and the resolver if it was
+*  holding it.
+*
+*  Called from sys_exit() so that a program which returns without closing does
+*  not leak a connection -- there are four on the machine, and a shell that has
+*  run "fetch" four times would otherwise have none left. tcp_abort() rather
+*  than tcp_close() is deliberate and is what tcp.h describes it for: this is a
+*  caller that has given up, the peer should learn the connection failed rather
+*  than ended, and the slot has to come back now rather than after TIME_WAIT.
+*
+*  Also called from sys_spawn() on the pid it was just handed. Task slots are
+*  reused -- find_free_slot() in tasks.c takes an aborted one -- so a pid is not
+*  unique over time, and an entry left behind by a task that died without
+*  reaching sys_exit() would otherwise be inherited by whoever next gets that
+*  number. Clearing at the moment a pid is issued is the one point where that
+*  can be done without a death notification tasks.c does not offer. */
+static void sysnet_release_task(int pid)
+{
+	int i;
+
+	if(pid < 0) return;
+
+	for(i = 0; i < SYS_NET_HANDLE_MAX; i++)
+	{
+		if(!sysnet_conns[i].used) continue;
+		if(sysnet_conns[i].owner != pid) continue;
+
+		tcp_abort(sysnet_conns[i].khandle);
+		sysnet_conns[i].used = 0;
+	}
+
+	if(sysnet_dns_lock != 0 && sysnet_dns_owner == pid) sysnet_dns_release();
+}
+
+/* Collects after tasks that died without saying so.
+*
+*  sys_exit() is the polite path and it is not the only one: a task aborted by
+*  a page fault, or by taskmgr_killall(), never runs another instruction, so
+*  whatever it held is held forever unless somebody notices. Every network call
+*  starts with this sweep, which costs four state lookups.
+*
+*  ABORTED and NULL only. A SUSPENDED task is alive -- the shell suspends
+*  tasks, and exec.c creates them suspended -- and taking its connections away
+*  would be a bug of this file's own making. */
+static void sysnet_reap(void)
+{
+	int i;
+	int state;
+
+	for(i = 0; i < SYS_NET_HANDLE_MAX; i++)
+	{
+		if(!sysnet_conns[i].used) continue;
+
+		state = taskmgr_task_state(sysnet_conns[i].owner);
+		if(state != TASK_STATE_ABORTED && state != TASK_STATE_NULL) continue;
+
+		tcp_abort(sysnet_conns[i].khandle);
+		sysnet_conns[i].used = 0;
+	}
+
+	if(sysnet_dns_lock != 0)
+	{
+		state = taskmgr_task_state(sysnet_dns_owner);
+		if(state == TASK_STATE_ABORTED || state == TASK_STATE_NULL)
+		{
+			/* dns.c is still waiting for an answer nobody will collect. Cancel
+			*  it as well, or the next lookup spends its whole budget waiting
+			*  for a query that belongs to a task that no longer exists. */
+			if(dns_state() == DNS_STATE_QUERY) dns_cancel();
+			sysnet_dns_release();
+		}
+	}
+}
+
+/* The table slot a handle from ring 3 names, or -1.
+*
+*  This is the hostile-input check for the one argument of three of these five
+*  calls, and it asks three things in order.
+*
+*  Is it in range. The handle is the slot plus one, so 0 -- the value an
+*  uninitialised variable in a user program holds, and the value a failed
+*  connect() left in it -- names nothing and is refused rather than quietly
+*  meaning the first connection. Everything outside 1..TCP_MAX_CONNS is refused
+*  on arithmetic, before the table is touched.
+*
+*  Is it open. A handle that was closed, or was never opened, indexes an entry
+*  with used = 0.
+*
+*  Is it the caller's. This is the one that matters. Without it the check above
+*  would be satisfied by any of the four small integers, and a program could
+*  read from -- or write into -- a connection a different task opened simply by
+*  counting to four. With it, a handle is only ever usable by the pid that
+*  obtained it, and a program that guesses learns nothing but SYS_EINVAL: the
+*  same answer it gets for a handle that does not exist, so guessing does not
+*  even reveal that somebody else's connection is there.
+*
+*  A pid of -1 (no task running, i.e. the kernel called this itself) matches no
+*  entry, because every entry is owned by a task that called SYS_CONNECT. */
+static int sysnet_slot_of(int handle)
+{
+	int slot;
+
+	if(handle < 1 || handle > SYS_NET_HANDLE_MAX) return -1;
+
+	slot = handle - 1;
+	if(!sysnet_conns[slot].used) return -1;
+	if(sysnet_conns[slot].owner != taskmgr_get_currpid()) return -1;
+
+	return slot;
+}
+
+/* Non-zero if the kernel handle in this slot is still the connection we opened.
+*
+*  The ownership test above settles who may name a slot. It does not settle
+*  what the slot still points at, and those are different questions, because
+*  the kernel handle inside it can be recycled underneath us. A connection that
+*  the peer resets reaches TCP_CLOSED and its slot in tcp.c becomes free; if
+*  another task connects before this one wakes from its fifty millisecond sleep,
+*  the same small integer now names that task's connection -- and a tcp_recv()
+*  on it would hand this program the other program's bytes. Nothing in the
+*  ownership check sees that, because our table entry never changed.
+*
+*  So identity is checked rather than assumed, out of what tcp.h already
+*  publishes: tcp_conn_get() reports the peer address, the peer port and the
+*  local port of every open connection. The local port is the strong part -- it
+*  is ephemeral and a new connection picks a different one -- and the peer pair
+*  catches the rest. A tuple that does not match the one recorded at connect
+*  time means the handle is not ours any more, whatever it is.
+*
+*  The enumeration walks TCP_MAX_CONNS indices and trusts tcp_conn_get()'s
+*  return value rather than tcp_conn_count(), so it is right whether that count
+*  is the number of live connections or the size of the table.
+*
+*  Not being listed at all is deliberately NOT treated as proof. It is the
+*  ordinary answer for a connection that has been freed, and it is also what a
+*  stack that does not fill the enumeration in would say about every connection
+*  there is -- and this test failing wrongly would break every transfer. So the
+*  fallback is the weaker question tcp_state() answers, which is the check this
+*  file would have had without any of the above: gone if the handle is closed or
+*  refused, still ours otherwise. The strong test costs nothing when it works
+*  and costs nothing when it does not. */
+static int sysnet_identity_ok(int slot)
+{
+	int i;
+	int found;
+	int state;
+	uint32_t peer;
+	uint16_t peer_port;
+	uint16_t local_port;
+
+	for(i = 0; i < TCP_MAX_CONNS; i++)
+	{
+		found     = -1;
+		peer      = 0;
+		peer_port = 0;
+		local_port = 0;
+
+		if(tcp_conn_get(i, &found, &peer, &peer_port, &local_port, 0, 0, 0) != 0)
+			continue;
+		if(found != sysnet_conns[slot].khandle) continue;
+
+		if(peer != sysnet_conns[slot].peer) return 0;
+		if(peer_port != sysnet_conns[slot].peer_port) return 0;
+		if(sysnet_conns[slot].local_port != 0 &&
+		   local_port != sysnet_conns[slot].local_port) return 0;
+
+		return 1;
+	}
+
+	state = tcp_state(sysnet_conns[slot].khandle);
+	if(state < 0 || state == TCP_CLOSED) return 0;
+
+	return 1;
+}
+
+/* Records what the connection just opened is, so that sysnet_identity_ok() has
+*  something to compare against. The local port is asked of tcp.c rather than
+*  guessed; a stack that will not say leaves it 0, which the comparison then
+*  skips rather than failing on. */
+static void sysnet_remember(int slot, int khandle, uint32_t ip, uint16_t port)
+{
+	int i;
+	int found;
+	uint16_t local_port;
+
+	sysnet_conns[slot].khandle    = khandle;
+	sysnet_conns[slot].peer       = ip;
+	sysnet_conns[slot].peer_port  = port;
+	sysnet_conns[slot].local_port = 0;
+
+	for(i = 0; i < TCP_MAX_CONNS; i++)
+	{
+		found      = -1;
+		local_port = 0;
+
+		if(tcp_conn_get(i, &found, 0, 0, &local_port, 0, 0, 0) != 0) continue;
+		if(found != khandle) continue;
+
+		sysnet_conns[slot].local_port = local_port;
+		return;
+	}
+}
+
+
+/* ------------------------------------------------------------------ */
 /* The calls                                                           */
 /* ------------------------------------------------------------------ */
 
@@ -476,6 +919,12 @@ static int sys_exit(struct regs *r)
 		r->eax = (unsigned int)SYS_ENOSYS;
 		return 0;
 	}
+
+	/* Anything the task still holds on the network side goes back now, while
+	*  there is still a pid to look it up by. A program that returns without
+	*  closing is the ordinary case, not the exceptional one, and four
+	*  connections is few enough that leaking one matters. */
+	sysnet_release_task(pid);
 
 	/* The task is marked aborted and loses its remaining time slice, so the
 	*  search below skips it. */
@@ -959,6 +1408,12 @@ static int sys_spawn(struct regs *r)
 		return SYS_ENOMEM;
 	}
 
+	/* The pid may be a reused slot, and a slot is reused after its previous
+	*  occupant was aborted -- which is the one way a task leaves without
+	*  passing through sys_exit(). Anything still recorded against this number
+	*  belongs to that dead task and must not be inherited by this one. */
+	sysnet_release_task(pid);
+
 	/* exec_spawn_path() hands the task back SUSPENDED on purpose, so that the
 	*  shell can look at it -- or take it back down -- before it has executed
 	*  anything. A system call has nothing to look at and nobody to ask, and
@@ -968,6 +1423,510 @@ static int sys_spawn(struct regs *r)
 	taskmgr_task_start(pid);
 
 	return pid;
+}
+
+
+/* Why a network call cannot even be attempted, or 0 if it can.
+*
+*  Three separate things have to be true before any of this works and none of
+*  them is a program's fault: a card was found, an address was configured, and
+*  -- for a name -- a resolver was learned. They collapse to one error code
+*  because syscall.h offers one, but they are asked in order so that the
+*  earliest missing piece is the one that decides, and they are asked BEFORE
+*  anything is attempted so that "there is no network" comes back immediately
+*  instead of after a ten second timeout.
+*
+*  That immediacy is the point of the whole function. SYS_ENETDOWN and
+*  SYS_ETIMEDOUT are the two answers a program most needs to tell apart: the
+*  first means asking again later is pointless until something is configured,
+*  the second means this particular host did not answer and another one might.
+*  A machine with no card that timed out would look exactly like a network with
+*  a dead server. */
+static int sysnet_down(int need_dns)
+{
+	if(!net_up()) return SYS_ENETDOWN;
+	if(net_ip() == IP_ADDR_ANY) return SYS_ENETDOWN;
+	if(need_dns && dhcp_dns() == IP_ADDR_ANY) return SYS_ENETDOWN;
+
+	return 0;
+}
+
+/* resolve(name, uint32_t *ip) -- a host name to an address, in host order.
+*
+*  The address is written through a user pointer, so both arguments are checked
+*  before anything reaches the wire, and for the reason sys_stat() gives: a bad
+*  pointer should cost the caller an error code, not a lookup.
+*
+*  The cache is asked first even though dns_resolve() would consult it too.
+*  That is not a duplicated optimisation -- it is what keeps a cached name from
+*  having to queue behind another task's lookup for the resolver dns.c only has
+*  one of. A hit answers without blocking at all, which is the common case for
+*  the second and third connection a program makes.
+*
+*  The two waits are separate and bounded separately: getting the resolver, and
+*  then getting an answer out of it. See the SYS_NET_RESOLVE_* comments for the
+*  numbers.
+*
+*  DNS_STATE_FAILED is answered with SYS_ENOENT rather than SYS_ETIMEDOUT, and
+*  the distinction is worth keeping even though dns.c cannot make it fully.
+*  SYS_ETIMEDOUT is reserved for OUR bound running out, so a caller can tell
+*  "the resolver reached a conclusion and it was no" from "nobody concluded
+*  anything in the time allowed". What dns.c collapses into that one state is a
+*  name that does not exist and a server that never answered; separating those
+*  needs an error code dns.h does not have, and only dns_last_error() has the
+*  words. */
+static int sys_resolve(struct regs *r)
+{
+	char name[SYS_HOST_MAX];
+	uint32_t out;
+	uint32_t ip;
+	uint32_t start;
+	int down;
+	int state;
+	int held;
+	int started;
+
+	out = (uint32_t)r->ecx;
+
+	if(copy_string_from_user((uint32_t)r->ebx, name, SYS_HOST_MAX) < 0)
+		return SYS_EFAULT;
+	if(!user_range_ok(out, (uint32_t)sizeof(uint32_t), 1)) return SYS_EFAULT;
+
+	if(name[0] == '\0') return SYS_EINVAL;
+
+	sysnet_reap();
+
+	down = sysnet_down(1);
+	if(down != 0) return down;
+
+	ip = dns_lookup_cached(name);
+	if(ip != IP_ADDR_ANY)
+	{
+		copy_to_user(out, &ip, (uint32_t)sizeof(ip));
+		return 0;
+	}
+
+	/* Phase one: the resolver itself. The lock keeps two tasks from
+	*  interleaving lookups; dns_resolve() failing while dns_state() is
+	*  DNS_STATE_QUERY keeps us behind a lookup the shell started without
+	*  going through this gate at all, which the lock cannot see. */
+	held    = 0;
+	started = 0;
+	start   = (uint32_t)timer_get_ticks();
+
+	while(sysnet_ms_since(start) < SYS_NET_RESOLVE_BUSY)
+	{
+		if(!held) held = sysnet_dns_take();
+
+		if(held)
+		{
+			if(dns_resolve(name) == 0)
+			{
+				started = 1;
+				break;
+			}
+
+			if(dns_state() != DNS_STATE_QUERY)
+			{
+				/* Not contention: dns.c refused this name or has nowhere to
+				*  ask. The configuration is re-tested because it can have
+				*  changed while we waited -- a lease can expire. */
+				sysnet_dns_release();
+
+				down = sysnet_down(1);
+				if(down != 0) return down;
+
+				return SYS_EINVAL;
+			}
+		}
+
+		sysnet_pump();
+		sysnet_reap();
+	}
+
+	/* Holding the lock is not the same as having asked. The budget can run out
+	*  with the lock in hand and the resolver still busy with a lookup the shell
+	*  started without passing through this gate, and going on to phase two then
+	*  would mean collecting somebody else's answer under our own name -- the
+	*  exact confusion the lock exists to prevent, arrived at from the other
+	*  side. Only a dns_resolve() that returned 0 means the query in flight is
+	*  ours. */
+	if(!started)
+	{
+		if(held) sysnet_dns_release();
+		return SYS_ETIMEDOUT;
+	}
+
+	/* Phase two: the answer. dns_poll() is the only thing that retransmits and
+	*  the only thing that ever gives up, so it is called on every turn and its
+	*  own conclusion is preferred to ours. */
+	ip    = IP_ADDR_ANY;
+	start = (uint32_t)timer_get_ticks();
+
+	for(;;)
+	{
+		state = dns_poll();
+
+		if(state == DNS_STATE_DONE)
+		{
+			ip = dns_result();
+			break;
+		}
+
+		if(state == DNS_STATE_FAILED)
+		{
+			sysnet_dns_release();
+			return SYS_ENOENT;
+		}
+
+		if(sysnet_ms_since(start) >= SYS_NET_RESOLVE_MS)
+		{
+			/* Abandon the query rather than leaving it in flight. A lookup
+			*  nobody is waiting for would otherwise hold the resolver against
+			*  the next caller for the rest of its own schedule. */
+			dns_cancel();
+			sysnet_dns_release();
+			return SYS_ETIMEDOUT;
+		}
+
+		sysnet_pump();
+	}
+
+	sysnet_dns_release();
+
+	if(ip == IP_ADDR_ANY) return SYS_ENOENT;
+
+	/* Checked once on the way in and once here. The invariant that makes one
+	*  check enough elsewhere in this file -- only the caller edits the caller's
+	*  half, and the caller is parked inside this call -- still holds, but it is
+	*  being leaned on for up to eighteen seconds rather than for the length of
+	*  a disk read, and the re-test is two compares and a page table walk. */
+	if(!user_range_ok(out, (uint32_t)sizeof(ip), 1)) return SYS_EFAULT;
+
+	copy_to_user(out, &ip, (uint32_t)sizeof(ip));
+	return 0;
+}
+
+/* connect(ip, port) -- opens a connection and waits for the handshake.
+*
+*  tcp_connect() does not wait: it puts a SYN on the wire and the handshake
+*  finishes from the card's interrupt. So the kernel side of this call is the
+*  loop tcp.h describes -- watch tcp_state(), call tcp_poll(), sleep -- with a
+*  bound on it, because the interesting failure is a port that is filtered
+*  rather than refused and therefore answers nothing at all.
+*
+*  The table entry is reserved BEFORE tcp_connect() rather than after. A
+*  connection that is opened and then has nowhere to be recorded would have to
+*  be torn down again, and doing that in the window where the peer may already
+*  have answered is more moving parts than reserving a slot that costs nothing
+*  to give back.
+*
+*  Address zero and the broadcast address are refused. Neither is a host: one
+*  is "no address" and the other is delivered to every station on the wire,
+*  where a TCP handshake means nothing. Everything else is passed through,
+*  including addresses that will never answer -- that is what the timeout is
+*  for, and it is not this file's business to have opinions about which parts
+*  of the address space are worth talking to. */
+static int sys_connect(struct regs *r)
+{
+	uint32_t ip;
+	uint32_t start;
+	int port;
+	int slot;
+	int khandle;
+	int state;
+	int down;
+	int i;
+
+	ip   = (uint32_t)r->ebx;
+	port = (int)r->ecx;
+
+	if(ip == IP_ADDR_ANY || ip == IP_ADDR_BROADCAST) return SYS_EINVAL;
+	if(port <= 0 || port > SYS_PORT_MAX) return SYS_EINVAL;
+
+	sysnet_reap();
+
+	down = sysnet_down(0);
+	if(down != 0) return down;
+
+	slot = -1;
+	for(i = 0; i < SYS_NET_HANDLE_MAX; i++)
+	{
+		if(!sysnet_conns[i].used)
+		{
+			slot = i;
+			break;
+		}
+	}
+	if(slot < 0) return SYS_ENOMEM;
+
+	memset(&sysnet_conns[slot], 0, sizeof(sysnet_conns[slot]));
+	sysnet_conns[slot].used  = 1;
+	sysnet_conns[slot].owner = taskmgr_get_currpid();
+
+	khandle = tcp_connect(ip, (uint16_t)port);
+	if(khandle < 0)
+	{
+		sysnet_conns[slot].used = 0;
+
+		/* TCP_ENOCONN is "all four are in use", which is the same shape of
+		*  failure as a full task table and is what SYS_ENOMEM says here.
+		*  Anything else out of tcp_connect() means the stack below is not in a
+		*  state to open anything, since the arguments were checked above. */
+		if(khandle == TCP_ENOCONN) return SYS_ENOMEM;
+		return SYS_ENETDOWN;
+	}
+
+	sysnet_remember(slot, khandle, ip, (uint16_t)port);
+
+	start = (uint32_t)timer_get_ticks();
+
+	for(;;)
+	{
+		state = tcp_state(khandle);
+
+		if(state == TCP_ESTABLISHED) break;
+
+		/* Reaching TCP_CLOSED during a handshake is a refusal: a RST came
+		*  back, or tcp.c gave up on its own. The slot is dropped without
+		*  calling tcp_abort(), and that is deliberate rather than an
+		*  omission. tcp.h says a handle stays valid until TCP_CLOSED, so at
+		*  TCP_CLOSED it is already tcp.c's to reuse -- and aborting a number
+		*  that has since been handed to another task's connect() would tear
+		*  down a stranger's connection. Not reclaiming something that is
+		*  already free is the safe side of that trade. */
+		if(state < 0 || state == TCP_CLOSED)
+		{
+			sysnet_conns[slot].used = 0;
+			return SYS_ECONNRESET;
+		}
+
+		if(sysnet_ms_since(start) >= SYS_NET_CONNECT_MS)
+		{
+			/* Half open on this side and unknown on the other. tcp_abort()
+			*  frees the slot at once and tells a peer that did hear the SYN
+			*  that the connection failed, rather than leaving it to time out
+			*  a connection we have already given up on. */
+			tcp_abort(khandle);
+			sysnet_conns[slot].used = 0;
+			return SYS_ETIMEDOUT;
+		}
+
+		sysnet_pump();
+	}
+
+	/* The local port is only final once the connection exists, so identity is
+	*  recorded again now that it does. */
+	sysnet_remember(slot, khandle, ip, (uint16_t)port);
+
+	return slot + 1;
+}
+
+/* send(handle, buf, len) -- queues data, returns how many bytes were taken.
+*
+*  A short return is the contract, not a failure: tcp_send() takes what fits in
+*  a send buffer that only empties when the peer acknowledges, so a caller
+*  loops. What this call adds is that it does not return ZERO -- it waits until
+*  at least one byte could be taken, or until the bound runs out. A send that
+*  could return 0 would leave a user program with nothing to do but call again
+*  immediately, which is a busy loop in ring 3, and ring 3 has no way to sleep
+*  between attempts that is any better than the one this loop already uses.
+*
+*  The user buffer is handed to tcp_send() directly rather than bounced through
+*  the kernel stack, for the reason sys_read() gives about fat_read(): every
+*  page of it has just been validated as readable from ring 3, tcp_send() copies
+*  it into the connection's own buffer synchronously, and the only code that
+*  could invalidate the mapping is the caller -- which is parked in this call. */
+static int sys_send(struct regs *r)
+{
+	uint32_t buf;
+	uint32_t len;
+	uint32_t start;
+	int slot;
+	int khandle;
+	int state;
+	int took;
+
+	buf = (uint32_t)r->ecx;
+	len = (uint32_t)r->edx;
+
+	slot = sysnet_slot_of((int)r->ebx);
+	if(slot < 0) return SYS_EINVAL;
+
+	if(len > SYS_NET_XFER_MAX) len = SYS_NET_XFER_MAX;
+	if(!user_range_ok(buf, len, 0)) return SYS_EFAULT;
+
+	/* Nothing to take, and no reason to wait for room to put it in. Zero is
+	*  unambiguous here in a way it is not for SYS_RECV: this call's zero means
+	*  "no bytes moved", which is exactly what happened. */
+	if(len == 0) return 0;
+
+	khandle = sysnet_conns[slot].khandle;
+	start   = (uint32_t)timer_get_ticks();
+
+	for(;;)
+	{
+		if(!sysnet_identity_ok(slot)) return SYS_ECONNRESET;
+
+		/* TCP_CLOSE_WAIT is not an error to send in: the peer has closed its
+		*  direction and ours is still open, which is a half open connection
+		*  and a legal one. Anything else means the stream is finished. */
+		state = tcp_state(khandle);
+		if(state != TCP_ESTABLISHED && state != TCP_CLOSE_WAIT)
+			return SYS_ECONNRESET;
+
+		took = tcp_send(khandle, (const void *)buf, len);
+		if(took > 0) return took;
+		if(took < 0) return SYS_ECONNRESET;
+
+		if(sysnet_ms_since(start) >= SYS_NET_SEND_MS) return SYS_ETIMEDOUT;
+
+		sysnet_pump();
+	}
+}
+
+/* recv(handle, buf, len) -- bytes read, or 0 once the stream has ended.
+*
+*  This call exists to map two different kernel answers onto one user-visible
+*  convention, and getting that mapping backwards is the difference between a
+*  program that hangs forever and one that truncates every page it fetches.
+*
+*  tcp_recv() says three things with numbers that look alike:
+*    - a positive count: this much arrived and was copied.
+*    - 0: nothing RIGHT NOW. The connection is open, the peer simply has not
+*      sent anything yet. This is not an answer to give back to ring 3 -- a
+*      program that read 0 as "the stream ended" would stop at the first pause
+*      in the transfer and truncate whatever it was fetching.
+*    - TCP_ECLOSED: the peer has closed AND everything it sent has been read.
+*      This is the end, and it is deliberately the LAST thing tcp_recv() says
+*      rather than the first: data that arrived before the FIN is still handed
+*      over first, so the tail of the stream is not lost to the close.
+*
+*  So the loop below returns the count for a count, waits when told 0, and
+*  returns 0 only for TCP_ECLOSED. The zero that crosses the gate means the
+*  stream ended -- the one thing a caller can loop on until it stops -- and the
+*  zero that comes up from tcp.c never does.
+*
+*  A zero LENGTH request is refused with SYS_EINVAL rather than answered with
+*  0, which is the one place this call departs from read(). Here 0 is not "no
+*  bytes moved", it is "there will never be any more", and a call that returned
+*  it for an empty buffer would be telling a caller the connection is finished
+*  when it is not. read() has the same ambiguity and lives with it because its
+*  0 is rarer; this one is the whole signal.
+*
+*  What cannot be distinguished is an orderly close from a reset that arrived
+*  after everything readable had been read: tcp.h reports both as TCP_ECLOSED,
+*  so both end the stream here. Telling them apart needs a signal tcp.h does not
+*  offer, and the shape of the fix is a separate query, not a fourth meaning for
+*  this return value. */
+static int sys_recv(struct regs *r)
+{
+	uint32_t buf;
+	uint32_t len;
+	uint32_t start;
+	int slot;
+	int khandle;
+	int got;
+
+	buf = (uint32_t)r->ecx;
+	len = (uint32_t)r->edx;
+
+	slot = sysnet_slot_of((int)r->ebx);
+	if(slot < 0) return SYS_EINVAL;
+
+	if(len == 0) return SYS_EINVAL;
+	if(len > SYS_NET_XFER_MAX) len = SYS_NET_XFER_MAX;
+	if(!user_range_ok(buf, len, 1)) return SYS_EFAULT;
+
+	khandle = sysnet_conns[slot].khandle;
+	start   = (uint32_t)timer_get_ticks();
+
+	for(;;)
+	{
+		/* Asked before the read, not after. A handle that has been recycled
+		*  under us would otherwise have already copied somebody else's bytes
+		*  into this program's buffer by the time we noticed. A connection the
+		*  peer has merely closed is still listed and still ours, so this does
+		*  not swallow the end of the stream -- tcp.c only frees the slot once
+		*  we close as well. */
+		if(!sysnet_identity_ok(slot)) return SYS_ECONNRESET;
+
+		got = tcp_recv(khandle, (void *)buf, len);
+
+		if(got > 0) return got;
+		if(got == TCP_ECLOSED) return 0;
+		if(got < 0) return SYS_ECONNRESET;
+
+		if(sysnet_ms_since(start) >= SYS_NET_RECV_MS) return SYS_ETIMEDOUT;
+
+		sysnet_pump();
+	}
+}
+
+/* close(handle) -- closes our direction and gives the handle back.
+*
+*  Two things end here and they end at different times, which is what the wait
+*  is about. The HANDLE ends immediately and unconditionally: whatever happens
+*  below, the slot is released and the number ring 3 was holding stops naming
+*  anything. The CONNECTION ends when TCP says so, and TCP says so at its own
+*  pace -- our FIN has to be acknowledged, and after that TIME_WAIT runs for
+*  twice the maximum segment lifetime so that a lost final acknowledgement can
+*  still be resent.
+*
+*  Waiting for the connection would therefore mean waiting up to a minute for a
+*  call that has nothing left to tell the caller, which is precisely the wait
+*  that makes a shell look hung. So the bound covers the round trip and nothing
+*  more: leave FIN_WAIT_1, CLOSING or LAST_ACK and we are done, because from
+*  TIME_WAIT onwards tcp.c finishes on its own.
+*
+*  If the bound runs out with the FIN still unacknowledged -- or with the peer
+*  keeping its own direction open in FIN_WAIT_2, where nothing will ever read
+*  what it sends again, because the handle that could is gone -- the connection
+*  is aborted. That is not impatience: there are four connections on the
+*  machine, nothing outside a network system call drives tcp_poll(), and a slot
+*  held by a connection no program can reach is a slot the next connect() will
+*  be refused for. A RST also tells a peer that is still sending to stop.
+*
+*  The return is 0 in every one of those cases. The caller closed; the close
+*  happened. Reporting how gracefully it happened would be information no
+*  program can act on -- there is no handle left to retry with. */
+static int sys_close(struct regs *r)
+{
+	uint32_t start;
+	int slot;
+	int khandle;
+	int state;
+
+	slot = sysnet_slot_of((int)r->ebx);
+	if(slot < 0) return SYS_EINVAL;
+
+	khandle = sysnet_conns[slot].khandle;
+
+	if(sysnet_identity_ok(slot))
+	{
+		tcp_close(khandle);
+
+		start = (uint32_t)timer_get_ticks();
+
+		for(;;)
+		{
+			state = tcp_state(khandle);
+
+			if(state < 0 || state == TCP_CLOSED || state == TCP_TIME_WAIT)
+				break;
+
+			if(sysnet_ms_since(start) >= SYS_NET_CLOSE_MS)
+			{
+				tcp_abort(khandle);
+				break;
+			}
+
+			sysnet_pump();
+		}
+	}
+
+	sysnet_conns[slot].used = 0;
+	return 0;
 }
 
 
@@ -995,7 +1954,15 @@ static syscall_fn syscall_table[SYSCALL_MAX] =
 	sys_read,      /* SYS_READ     12 */
 	sys_readdir,   /* SYS_READDIR  13 */
 	sys_spawn,     /* SYS_SPAWN    14 */
-	0              /* 15 -- unassigned, answers SYS_ENOSYS */
+	sys_resolve,   /* SYS_RESOLVE  15 */
+	sys_connect,   /* SYS_CONNECT  16 */
+	sys_send,      /* SYS_SEND     17 */
+	sys_recv,      /* SYS_RECV     18 */
+	sys_close,     /* SYS_CLOSE    19 */
+	0,             /* 20 -- unassigned, answers SYS_ENOSYS */
+	0,             /* 21 */
+	0,             /* 22 */
+	0              /* 23 */
 };
 
 void syscall_handler(struct regs *r)

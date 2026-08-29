@@ -17,7 +17,7 @@
 #include "system.h"
 
 #define SYSCALL_VECTOR   0x80
-#define SYSCALL_MAX      16      /* table size, keep in step with the list */
+#define SYSCALL_MAX      24      /* table size, keep in step with the list */
 
 /* Call numbers. Keep them stable, user code encodes them literally.
 *
@@ -40,6 +40,22 @@
 #define SYS_READDIR     13       /* readdir(path, index, sys_dirent *out)      */
 #define SYS_SPAWN       14       /* spawn(path, args, prio) -> pid             */
 
+/* Networking. These are what let a program do something on its own behalf
+*  rather than asking the shell to do it -- the reason "fetch" is a program on
+*  the disk and not another command compiled into the kernel.
+*
+*  All five BLOCK, with a timeout of their own, and that is a deliberate
+*  simplification: a non-blocking interface would need a way to wait for one of
+*  several things at once, which is a scheduler feature this kernel does not
+*  have. Blocking is honest here because vector 0x80 is a trap gate -- the task
+*  is descheduled while it waits and everything else keeps running.
+*/
+#define SYS_RESOLVE     15       /* resolve(name, uint32_t *ip)                */
+#define SYS_CONNECT     16       /* connect(ip, port) -> handle                */
+#define SYS_SEND        17       /* send(handle, buf, len) -> bytes taken      */
+#define SYS_RECV        18       /* recv(handle, buf, len) -> bytes, 0 = ended */
+#define SYS_CLOSE       19       /* close(handle)                              */
+
 /* Error returns. Negative so a valid result stays distinguishable. */
 #define SYS_ENOSYS       (-1)    /* no such call number                        */
 #define SYS_EFAULT       (-2)    /* argument pointer outside the caller's reach */
@@ -47,6 +63,9 @@
 #define SYS_EIO          (-4)    /* the driver below refused                   */
 #define SYS_EINVAL       (-5)    /* an argument makes no sense                 */
 #define SYS_ENOMEM       (-6)    /* out of memory, or no task slot left        */
+#define SYS_ENETDOWN     (-7)    /* no card, or the stack is not configured    */
+#define SYS_ETIMEDOUT    (-8)    /* nothing answered in the time allowed       */
+#define SYS_ECONNRESET   (-9)    /* the peer refused or reset the connection   */
 
 /* ---------------------------------------------------------------------------
 *  Structures crossing the gate

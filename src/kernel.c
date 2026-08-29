@@ -21,6 +21,7 @@
 #include <rtl8139.h>
 #include <net.h>
 #include <dns.h>
+#include <tcp.h>
 #define cpuid(in, a, b, c, d) __asm__("cpuid": "=a" (a), "=b" (b), "=c" (c), "=d" (d) : "a" (in));
 
 void *memcpy(void *dest, const void *src, size_t count)
@@ -534,6 +535,11 @@ static void network_init(void)
 	*  does not need the address yet -- the DNS server's address comes from
 	*  the DHCP lease, which is obtained later and from the shell. */
 	dns_init();
+
+	/* TCP allocates nothing here either: a connection's buffers come from the
+	*  heap when it opens, so an idle machine pays for the table of control
+	*  blocks and nothing else. */
+	tcp_init();
 }
 
 /* Entry point from start.asm. mbi_phys is the pointer the bootloader left in

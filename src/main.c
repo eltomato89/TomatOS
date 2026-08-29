@@ -18,6 +18,7 @@
 #include <net.h>
 #include <dhcp.h>
 #include <dns.h>
+#include <tcp.h>
 //#include <wmessages.h>
 
 #define NULL 0
@@ -521,6 +522,31 @@ typedef struct
 	int      ms;      /* how long the exchange took, 0 for a cache hit     */
 } net_dns_answer;
 
+/* --- tcp -----------------------------------------------------------------
+*
+*  Column widths of the table "netstat" prints. printf() has no field widths,
+*  so every column is padded by hand out of ps_print_left() and
+*  fs_print_right_text(), exactly as the "ps", "df", "arp" and "nslookup"
+*  tables are.
+*
+*  The row is two leading spaces plus 7 + 7 + 23 + 14 + 10 + 10 = 73 columns,
+*  which leaves the eighty column line intact. The two that are not obvious:
+*  a peer needs 21 characters at worst ("255.255.255.255:65535") and gets 23
+*  so there are always two spaces after it, and a state needs 11 at worst
+*  ("ESTABLISHED") and gets 14 for the same reason. Neither number may shrink
+*  -- a truncated state name is precisely the field somebody is reading. */
+#define NET_TCP_HANDLE_WIDTH  7
+#define NET_TCP_PORT_WIDTH    7
+#define NET_TCP_PEER_WIDTH   23
+#define NET_TCP_STATE_WIDTH  14
+#define NET_TCP_BYTES_WIDTH  10
+
+/* Text buffer sizes, the same idea as NET_IP_TEXT: there is no sprintf()
+*  here, so a value that has to be padded into a column is written into a
+*  buffer of its own first. */
+#define NET_TCP_PEER_TEXT    22   /* "255.255.255.255:65535" and the end   */
+#define NET_TCP_NUM_TEXT     11   /* ten digits of a uint32_t and the end  */
+
 /* --- what the bootloader reported ----------------------------------------
 *
 *  kernel.c owns this record: it reads the framebuffer fields out of the
@@ -568,6 +594,7 @@ void dhcpclient(char *cmd);
 void arptable(char *cmd);
 void pinghost(char *cmd);
 void nslookup(char *cmd);
+void netstat(char *cmd);
 void help(void);
 
 static void mem_print_right(uint32_t value, int width);
@@ -657,6 +684,10 @@ static int  net_dns_resolve(const char *what, const char *name,
                             net_dns_answer *answer);
 static void net_dns_show_cache(void);
 
+static char *net_put_uint(char *p, uint32_t value);
+static void net_tcp_endpoint_text(uint32_t ip, uint16_t port, char *text);
+static void net_show_tcp(void);
+
 /* Self-test counters, maintained by mem_check(). */
 static int mem_tests_run = 0;
 static int mem_tests_ok = 0;
@@ -733,6 +764,7 @@ void main()
 		else if(strcmp(word, "arp") == 0) arptable(cmd);
 		else if(strcmp(word, "ping") == 0) pinghost(cmd);
 		else if(strcmp(word, "nslookup") == 0) nslookup(cmd);
+		else if(strcmp(word, "netstat") == 0) netstat(cmd);
 		else if(strcmp(word, "reboot") == 0) reboot();
 		else if(strcmp(word, "help") == 0) help();
 		else if(strcmp(word, "start") == 0) taskmgr_task_start(taskmgr_add_task( task, "Test Task", TASK_PRIORITY_LOW ));
@@ -4400,6 +4432,12 @@ static void net_show_interface(void)
 	mem_print_right(udp_tx_packets(), 8);
 	printf("\n");
 
+	/* And no TCP rows under those, deliberately -- see the note above
+	   net_show_tcp(). UDP is here because it has no command of its own;
+	   TCP has "netstat", the DNS counters set the precedent for leaving a
+	   command's counters with its command, and this display is already at
+	   the height of the screen. */
+
 	/* A row of zeroes explains nothing by itself, so when the interface
 	   cannot carry a packet it says why underneath. */
 	if(!rtl8139_present() || !net_up() || !configured)
@@ -5151,6 +5189,234 @@ static void net_dns_show_cache(void)
 	printf("\n");
 }
 
+/* --- netstat -------------------------------------------------------------
+*
+*  What connections exist -- a question none of the other network commands
+*  can answer, because none of the other protocols here has anything to ask
+*  it about. An ARP request, an echo, a DHCP offer, a DNS answer: each is one
+*  message, and by the time the shell prints anything the exchange is over.
+*  A TCP connection is not a message. It persists between commands, it moves
+*  from state to state on its own while nobody is looking, and it can stop
+*  moving -- and that last case is the whole reason this command exists. It
+*  is what one runs when a transfer hangs, so it is built around the field
+*  that says where it hangs.
+*
+*  The state names are RFC 793's, unchanged. Somebody debugging TCP already
+*  knows what FIN_WAIT_2 means, and a friendlier word invented here would
+*  only have to be translated back before it was any use -- so the column is
+*  wide enough for the longest of them and nothing is abbreviated.
+*
+*  Where the counters go, and why NOT in "ifconfig". The UDP ones are in
+*  "ifconfig" because UDP has no command of its own; that was the only place
+*  they could be. The DNS ones are not, and the reasons given there apply
+*  again word for word: that display is already fourteen rows on a screen
+*  with twenty-five, and counters read better beside the thing they count.
+*  TCP now has a command of its own, so it follows the DNS precedent rather
+*  than the UDP one and "ifconfig" is left exactly as it was. Retransmits
+*  would be the one number worth crossing the screen for, and they say very
+*  little without the connection they belong to sitting above them.
+*
+*  One call here is not a read, and it has to be. Nothing outside a network
+*  system call drives tcp_poll() on this machine -- src/syscall.c says so in
+*  as many words -- so a connection whose TIME_WAIT ran out ten seconds ago
+*  is still sitting in the table with nothing to notice. Printing that row
+*  would be answering "is this stuck?" with one that only looks stuck because
+*  nobody had asked the stack to look. So the table is polled once before it
+*  is read: it walks four slots, it sends nothing the stack did not already
+*  owe, and it is what makes the answer true at the moment it is printed.
+*/
+
+/* One decimal number, no leading zeroes. net_put_byte() does this for the
+*  four parts of an address and stops at 255, which is exactly right for a
+*  dotted quad and not enough for a port. Returns the position after the
+*  digits it wrote, so callers chain it the same way. */
+static char *net_put_uint(char *p, uint32_t value)
+{
+	char digits[NET_TCP_NUM_TEXT];
+	int n;
+
+	/* Written out backwards and reversed, because the number of digits is
+	   not known before the last division. */
+	n = 0;
+	do
+	{
+		digits[n] = (char)('0' + (int)(value % 10));
+		n++;
+		value = value / 10;
+	} while(value != 0 && n < NET_TCP_NUM_TEXT - 1);
+
+	while(n > 0)
+	{
+		n--;
+		*p = digits[n];
+		p++;
+	}
+
+	return p;
+}
+
+/* An endpoint as "address:port", which is the form a peer is worth reading
+*  in -- the two halves identify a connection together and separating them
+*  into two columns would only make the eye put them back. text holds
+*  NET_TCP_PEER_TEXT bytes. The address half is net_ip_text()'s work: there
+*  is one dotted quad printer in this file and this is not a second one. */
+static void net_tcp_endpoint_text(uint32_t ip, uint16_t port, char *text)
+{
+	char *p;
+
+	net_ip_text(ip, text);
+
+	p = text + strlen(text);
+	*p = ':';
+	p++;
+	p = net_put_uint(p, (uint32_t)port);
+	*p = EOS;
+}
+
+/* "netstat": the connections, and what the stack has actually moved. */
+static void net_show_tcp(void)
+{
+	char handle_text[NET_TCP_NUM_TEXT];
+	char port_text[NET_TCP_NUM_TEXT];
+	char peer_text[NET_TCP_PEER_TEXT];
+	char *p;
+	uint32_t peer;
+	uint32_t sent;
+	uint32_t received;
+	uint16_t peer_port;
+	uint16_t local_port;
+	int handle;
+	int state;
+	int connections;
+	int time_wait;
+	int closed;
+	int shown;
+	int i;
+
+	/* Before anything is read, so that what is read is current -- see the
+	   note above. A retransmission that was due goes out here rather than
+	   the next time a program happens to make a network call, and a
+	   TIME_WAIT that has run its ten seconds is gone before the table is
+	   printed instead of after somebody has worried about it. */
+	tcp_poll();
+
+	connections = tcp_conn_count();
+	time_wait = 0;
+	closed = 0;
+
+	printf("TCP connections:\n");
+
+	/* Nothing open is the ordinary state on this machine, not an error and
+	   not an empty table: a header with no rows under it reads like a
+	   failure, so it is said in words instead -- the same choice "arp" and
+	   "nslookup" make about their caches. */
+	if(connections <= 0)
+	{
+		printf("  None are open.\n");
+
+		if(!rtl8139_present() || !net_up() || net_ip() == 0)
+		{
+			net_explain_down();
+		} else {
+			printf("  Nothing in the kernel holds a connection between commands,\n");
+			printf("  so this is what it looks like when no program is using one.\n");
+			printf("  A row appears here while a ring 3 program that opened one\n");
+			printf("  with connect() is running, and for a short while after.\n");
+		}
+	} else {
+		printf("  ");
+		ps_print_left("Handle", NET_TCP_HANDLE_WIDTH);
+		ps_print_left("Local", NET_TCP_PORT_WIDTH);
+		ps_print_left("Peer", NET_TCP_PEER_WIDTH);
+		ps_print_left("State", NET_TCP_STATE_WIDTH);
+		fs_print_right_text("Sent", NET_TCP_BYTES_WIDTH);
+		fs_print_right_text("Received", NET_TCP_BYTES_WIDTH);
+		printf("\n");
+
+		/* tcp_conn_get() answers 0 for an index it filled in, the same way
+		   round as arp_cache_get() and dns_cache_get() and the same way
+		   round as the eye does not expect. The loop is bounded by the
+		   table size rather than by the count, so a connection that closes
+		   between the two calls -- a TIME_WAIT running out is enough --
+		   cannot run it off the end. */
+		shown = 0;
+		for(i = 0; i < TCP_MAX_CONNS; i++)
+		{
+			if(tcp_conn_get(i, &handle, &peer, &peer_port, &local_port,
+			                &state, &sent, &received) != 0)
+			{
+				break;
+			}
+
+			p = net_put_uint(handle_text, (uint32_t)handle);
+			*p = EOS;
+			p = net_put_uint(port_text, (uint32_t)local_port);
+			*p = EOS;
+			net_tcp_endpoint_text(peer, peer_port, peer_text);
+
+			printf("  ");
+			ps_print_left(handle_text, NET_TCP_HANDLE_WIDTH);
+			ps_print_left(port_text, NET_TCP_PORT_WIDTH);
+			ps_print_left(peer_text, NET_TCP_PEER_WIDTH);
+			ps_print_left(tcp_state_name(state), NET_TCP_STATE_WIDTH);
+			mem_print_right(sent, NET_TCP_BYTES_WIDTH);
+			mem_print_right(received, NET_TCP_BYTES_WIDTH);
+			printf("\n");
+
+			if(state == TCP_TIME_WAIT) time_wait++;
+			if(state == TCP_CLOSED) closed++;
+			shown++;
+		}
+
+		printf("  %i of %i connection(s) in use.\n", shown, TCP_MAX_CONNS);
+
+		/* The two states that look like a fault and are not. Both are said
+		   only when one is actually on the screen: an explanation of
+		   something nobody is looking at is just another row, but when
+		   there IS one, this is the line that stops somebody hunting for a
+		   leak that does not exist. */
+		if(time_wait != 0)
+		{
+			printf("  TIME_WAIT is finished, not stuck: the side that closed\n");
+			printf("  first waits there in case its last acknowledgement was\n");
+			printf("  lost and the peer resends its FIN. It ends on its own.\n");
+		}
+
+		if(closed != 0)
+		{
+			printf("  CLOSED is finished too. The slot is held a little longer\n");
+			printf("  so a program still reading can see the end of the stream,\n");
+			printf("  and is then given back.\n");
+		}
+	}
+
+	/* Always, whether anything is open or not: they are what the stack has
+	   done since it came up, and after a transfer has ended they are all
+	   that is left of it. */
+	printf("  Segments tx: ");
+	mem_print_right(tcp_segments_sent(), 8);
+	printf("   rx: ");
+	mem_print_right(tcp_segments_received(), 8);
+	printf("   dropped: ");
+	mem_print_right(tcp_segments_dropped(), 8);
+	printf("\n");
+
+	printf("  Retransmits: ");
+	mem_print_right(tcp_retransmits(), 8);
+	printf("\n");
+
+	/* Retransmitting is how a lost segment is recovered, so the count is not
+	   a fault by itself -- but it is the number that separates a slow link
+	   from a broken stack, and that only helps somebody who knows which it
+	   is. Said once, when there is something to say it about. */
+	if(tcp_retransmits() != 0)
+	{
+		printf("  A retransmit is a segment nobody acknowledged, sent again.\n");
+		printf("  A few are a lossy link; a count climbing through one\n");
+		printf("  transfer is the link, not the stack.\n");
+	}
+}
+
 /* --- the commands themselves --------------------------------------------- */
 
 void listpci(char *cmd)
@@ -5481,6 +5747,21 @@ void nslookup(char *cmd)
 	}
 }
 
+void netstat(char *cmd)
+{
+	/* No arguments and no options. There is nothing here to filter -- four
+	   connections at most, and every one of them is worth seeing when the
+	   question is why a transfer has stopped. */
+	if(prmc(cmd) != 0)
+	{
+		printf("Syntax: netstat\n");
+		printf("\t          Show the open TCP connections and the TCP counters\n");
+		return;
+	}
+
+	net_show_tcp();
+}
+
 /* The other half of what can be typed: the programs in BIN_DIR.
 *
 *  Read off the disk rather than written out here, and that is worth the
@@ -5596,6 +5877,8 @@ void help(void)
 	printf("\t          nslookup alone or -c shows the cache, -f empties it\n");
 	printf("\tping      ping HOST sends echo requests and times the replies,\n");
 	printf("\t          HOST is an address or a name to look up first\n");
+	printf("\tnetstat   Show the open TCP connections, the state each one is\n");
+	printf("\t          in, and what the TCP layer has sent and resent\n");
 	printf("\treboot    Restart the computer\n");
 	printf("\texit      Exit the shell\n");
 

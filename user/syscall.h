@@ -42,6 +42,11 @@
 #define SYS_READ    12       /* read(path, offset, len, buf) -> bytes read  */
 #define SYS_READDIR 13       /* readdir(path, index, sys_dirent *out)       */
 #define SYS_SPAWN   14       /* spawn(path, args, prio) -> pid              */
+#define SYS_RESOLVE 15       /* resolve(name, unsigned long *ip)            */
+#define SYS_CONNECT 16       /* connect(ip, port) -> handle                 */
+#define SYS_SEND    17       /* send(handle, buf, len) -> bytes taken       */
+#define SYS_RECV    18       /* recv(handle, buf, len) -> bytes, 0 = ended  */
+#define SYS_CLOSE   19       /* close(handle)                               */
 
 /* --- Error returns -- mirror of src/include/syscall.h ------------------- */
 #define SYS_ENOSYS   (-1)    /* no such call number                         */
@@ -50,6 +55,9 @@
 #define SYS_EIO      (-4)    /* the driver below refused                    */
 #define SYS_EINVAL   (-5)    /* an argument makes no sense                  */
 #define SYS_ENOMEM   (-6)    /* out of memory, or no task slot left         */
+#define SYS_ENETDOWN (-7)    /* no card, or the stack is not configured     */
+#define SYS_ETIMEDOUT (-8)   /* nothing answered in the time allowed        */
+#define SYS_ECONNRESET (-9)  /* the peer refused or reset the connection    */
 
 /* --- Structures crossing the gate -- mirror of src/include/syscall.h ----
 *
@@ -262,6 +270,52 @@ static __inline__ int sys_readdir(const char *path, int index, sys_dirent *out)
 static __inline__ int sys_spawn(const char *path, const char *args, int prio)
 {
 	return syscall3(SYS_SPAWN, (int)path, (int)args, prio);
+}
+
+/* --- Networking --------------------------------------------------------
+*
+*  All five block, each with a timeout of its own. That is deliberate: a
+*  non-blocking interface would need a way to wait for several things at once,
+*  which this kernel's scheduler cannot express. Blocking costs nothing here --
+*  the task is descheduled while it waits and everything else keeps running.
+*/
+
+/* Turns a name into an address. Returns 0 and fills in *ip, or a negative
+*  error -- SYS_ENETDOWN when no DNS server is known, which means no lease has
+*  been obtained yet. */
+static __inline__ int sys_resolve(const char *name, unsigned long *ip)
+{
+	return syscall2(SYS_RESOLVE, (int)name, (int)ip);
+}
+
+/* Opens a TCP connection and waits for the handshake. Returns a handle, or a
+*  negative error: SYS_ECONNRESET when the peer refused, SYS_ETIMEDOUT when
+*  nothing answered at all. The address is in host order, as everywhere. */
+static __inline__ int sys_connect(unsigned long ip, int port)
+{
+	return syscall2(SYS_CONNECT, (int)ip, port);
+}
+
+/* Sends. Returns how many bytes were taken, which can be fewer than offered --
+*  the caller sends the rest afterwards. */
+static __inline__ int sys_send(int handle, const void *buf, unsigned long len)
+{
+	return syscall3(SYS_SEND, handle, (int)buf, (int)len);
+}
+
+/* Receives. Blocks until something arrives. Returns the number of bytes, or
+*  0 once the peer has closed and everything it sent has been read -- 0 is the
+*  end of the stream, not an error, and a reader stops there. */
+static __inline__ int sys_recv(int handle, void *buf, unsigned long len)
+{
+	return syscall3(SYS_RECV, handle, (int)buf, (int)len);
+}
+
+/* Closes our end. The connection may linger in the kernel afterwards, which is
+*  the protocol working correctly and not a leak. */
+static __inline__ int sys_close(int handle)
+{
+	return syscall1(SYS_CLOSE, handle);
 }
 
 #endif

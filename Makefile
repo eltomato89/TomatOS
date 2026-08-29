@@ -116,7 +116,7 @@ LDFLAGS  := -m elf_i386 -T $(LINKER_SCRIPT) -nostdlib -no-pie
 # command. Keep the names to eight characters: they end up as 8.3 entries on a
 # FAT16 volume, and a longer one would need a VFAT long name entry, which the
 # kernel's directory reader skips.
-USER_PROGS := hello ls cat
+USER_PROGS := hello ls cat fetch
 
 # The C library every program links against: user/lib.c, holding _start (which
 # calls main), printf, the string routines and the file helpers. It is a plain

@@ -338,6 +338,17 @@ ping example.com
 `ping` takes a name or an address. `nslookup` alone shows the cache; `-f`
 empties it.
 
+And with TCP there is something to fetch:
+
+```
+fetch example.com
+fetch 10.0.2.2 /index.html 8080
+```
+
+`fetch` is **not a shell command** — it is `/BIN/FETCH.ELF`, a ring 3 program
+that opens the connection itself through system calls. `netstat` shows what is
+open, which is the kernel's business and stays in the kernel.
+
 `lspci` lists what the bus enumeration found — the command to run when the
 card is not detected. `arp` shows the cache, `ifconfig` without arguments the
 interface and its counters.
@@ -471,9 +482,70 @@ Matching a reply uses the id, the ephemeral source port, the server address and
 the echoed question. With no random source on this machine that is roughly 30
 bits of material, and the code says so plainly rather than implying more.
 
-Deliberately absent: renewing a lease before it expires, RELEASE, DECLINE, TCP,
-AAAA and everything but A records, reverse lookups, and any form of fragment
-reassembly.
+#### TCP
+
+Everything else in this stack is a message: an ARP request, an echo, a DHCP
+offer, a DNS answer. Losing one means asking again. TCP is different in kind,
+and that is why it is the largest piece here: the two ends have to agree on
+what has arrived, keep agreeing while packets go missing, and take the
+connection down in a way that survives the last message being lost.
+
+**Sequence numbers wrap**, and that shapes every comparison. A 32-bit counter
+passes 4 GB and starts again, so `a > b` is wrong; it is written
+`(int32_t)(a - b) > 0`, which holds as long as the two are less than 2 GB
+apart — and they always are, because a window is at most 64 KB. A plain `>`
+is a bug that hides for hours of transfer and then corrupts a stream. That the
+implementation contains none was established three ways: a mechanical audit of
+all 76 lines containing a relational operator, a reference test whose cases are
+built so the true ordering is known independently (and which asserts that 1024
+of its 4800 cases are ones a plain `<` gets wrong, so it cannot pass for the
+wrong reason), and mutation testing — 20 of 21 mutants caught, the survivor
+provably equivalent.
+
+**Closing is not one event.** Each side closes its own direction, so a
+half-open connection is normal — it is exactly what an HTTP client does after
+sending its request. The side that closes first then waits in `TIME_WAIT`,
+because its final acknowledgement may have been lost and the peer may resend a
+FIN that would otherwise reach a machine which has forgotten the connection.
+`netstat` says so under the table, because a connection sitting there looks
+stuck and is not.
+
+Three bugs from this work are worth recording, because each was invisible to a
+test that looked reasonable:
+
+**One byte too many at the end of every stream.** `rcv_nxt` is the end of the
+*sequence space* and is advanced by the peer's FIN, since a FIN occupies a
+sequence number without being data. Computing the readable amount from it
+handed out one stale byte from the ring — after the FIN, and only then. Split
+into `rcv_end` (end of the data) and `rcv_nxt` (end of the sequence space):
+what talks to the peer uses one, what talks to the caller uses the other.
+
+**A FIN refused by our own closed window.** A stream whose last byte exactly
+fills the receive buffer leaves the window at zero, and RFC 793's literal
+acceptability test then rejects the bare FIN as a one-octet segment against a
+shut window — adding a full retransmission timeout to the end of every such
+response.
+
+**Acknowledgements thrown away as being for bytes we had not sent.** The
+control block was updated *after* `ip_send()` returned. On a virtual link the
+peer answers in a tenth of a millisecond, so the card's interrupt runs
+*inside* that call, and the acknowledgement was judged against a `snd_nxt`
+that still described the state before the segment. It was the only
+acknowledgement those bytes would ever get, so the data was retransmitted and
+every connection ended in a RST instead of a clean close. The control block is
+now brought up to date before the segment leaves.
+
+The third one is the interesting one: **the host test harness could not
+produce it**, because a scripted peer answers *between* calls into the module
+while a real card answers *inside* one. The harness gained a hook that fires
+the interrupt from within `ip_send()`, and that is where a third of its fuzz
+traffic now goes.
+
+Deliberately absent: passive open (this connects, it does not listen), out of
+order reassembly, Nagle, delayed acknowledgement, window scaling, selective
+acknowledgement, urgent data, congestion control beyond a retransmission timer,
+renewing a DHCP lease, RELEASE, DECLINE, AAAA and everything but A records,
+reverse lookups, and any form of fragment reassembly.
 
 ### What is in the kernel, and what is not
 
