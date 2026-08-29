@@ -282,6 +282,77 @@ and only where cells actually differ. Measured: 0.27 ms against 1.16 ms for a
 pixel move at 1024x768x32 — and the real margin is wider, because moving
 pixels means *reading* an uncached framebuffer. The framebuffer is never read.
 
+### Networking
+
+`ping` works, in both directions. The run targets attach an **RTL8139** to
+QEMU's user mode network, which needs neither root nor a TAP device — QEMU
+emulates a small network in userspace behind a NAT. The addresses in it are
+fixed:
+
+| Address | |
+|---|---|
+| `10.0.2.15` | the guest |
+| `10.0.2.2` | gateway — answers ARP and ICMP echo |
+| `10.0.2.3` | DNS forwarder |
+| `255.255.255.0` | netmask |
+
+There is no DHCP client, so the address is set from the shell:
+
+```
+ifconfig 10.0.2.15 255.255.255.0 10.0.2.2
+ping 10.0.2.2
+```
+
+`lspci` lists what the bus enumeration found — the command to run when the
+card is not detected. `arp` shows the cache, `ifconfig` without arguments the
+interface and its counters.
+
+`make run NET=0` runs without a card. That is a normal state, not a failure:
+the stack reports why it is down instead of showing zeros. `make run
+NETDUMP=1` writes every frame to `build/net.pcap`, readable with Wireshark or
+`tcpdump -r` — that capture is the arbiter when a packet leaves the kernel and
+nothing answers, since it shows whether the frame reached the wire at all and
+whether its byte order is what you think it is.
+
+Five layers, and a few decisions worth knowing about:
+
+**PCI enumeration walks from bus 0 through the bridges** rather than sweeping
+all 256 buses — 163 configuration reads instead of 65536 on a two-bus machine,
+and it never asks a chipset about buses it does not implement. Configuration
+space is dword addressed, so a 16-bit access reads the containing dword and
+shifts; a 16-bit *write* is read-modify-write, because writing a whole dword
+to the command register would clear the status register sharing it.
+
+**Everything the card sees is a physical address.** The RTL8139 does not go
+through the MMU. Its buffers come from the frame allocator, which hands out
+physical addresses directly, and every kernel access to them goes through
+`P2V()`. The receive ring is 32 KiB plus the 16 bytes the hardware demands and
+1536 bytes of slack, with `RCR.WRAP` left clear — the card then runs a frame
+past the end of the ring into that slack instead of splitting it, which is why
+the read path has no wrap case at all. `CAPR` carries its documented 16-byte
+offset; getting that wrong is the classic driver that receives exactly one
+packet and then goes quiet.
+
+**ARP entries expire after 120 s**, an unanswered request after 3 s, and
+requests for one address are rate limited to one per second. The contract is
+that the caller retries, so without that limit a polling loop turns into a
+broadcast storm. Every ARP packet on the wire is learned from, but an
+overheard one never evicts a valid entry.
+
+**IP addresses are in host byte order everywhere outside a packed header.**
+Conversion happens once per field, at the header boundary. Fragments are
+dropped rather than silently mishandled — `DF` alone passes, it is a sender's
+instruction and not a fragment marker. The ICMP checksum spans the whole
+message, IP's only its own header.
+
+The protocol work runs **in the card's interrupt handler**, which holds only
+because every path from it is short and finite: no printing, no allocation, no
+waiting. A receive queue drained by a task would be the better structure and
+is noted as such in `net.c`; it needs a task and an overflow policy, and
+neither belongs in the same change as the first packet that works.
+
+Deliberately absent: DHCP, TCP, and any form of fragment reassembly.
+
 ## On real hardware
 
 `make iso` produces an image that boots via **legacy BIOS/CSM**. It goes onto
