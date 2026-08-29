@@ -4,7 +4,7 @@ A 32-bit x86 hobby kernel (Multiboot 1) — preemptive scheduler, VGA text
 console, PS/2 keyboard with German layout, PIT timer, CMOS clock, physical
 frame allocator, kernel heap, paging, ring 3 with system calls, per-task
 address spaces, loadable programs, an ATA driver with a FAT12/16 filesystem,
-VGA graphics, and a small shell. Originally written between
+VGA graphics, a framebuffer console at 1024x768, and a small shell. Originally written between
 2006 and 2011, ported to a current Linux toolchain in 2026.
 
 ## Requirements
@@ -254,6 +254,33 @@ boot paths therefore remain available, and the kernel cannot tell them apart.
 can be set — from protected mode it is unreachable without a v86 monitor.
 The kernel cannot establish a high resolution mode by itself, so whoever
 boots it has to.
+
+### The framebuffer console
+
+Booted from `make run-bootdisk`, stage 2 establishes a 1024x768 VBE mode and
+the console renders text into it — **128x48 characters** against the 80x25 of
+text mode. `gfx -i` reports the mode, the mapping and the console geometry.
+
+Three things make it work:
+
+The framebuffer is **not reachable when the first line is printed**. Paging is
+on from `start.asm`, but its boot directory maps only the low 4 MiB, and a
+card's framebuffer sits far outside the direct mapping — QEMU puts it at
+`0xFD000000`. So the console writes into a **shadow buffer** in `.bss` from
+the very first character and paints the whole thing once `vmm_map_mmio()` can
+map the memory. Nothing said during early boot is lost, which is exactly when
+losing it would hurt.
+
+The page tables for that MMIO window are created **while `vmm_init()` runs**,
+before any address space exists. The kernel half is shared between address
+spaces at page *directory entry* granularity, so a mapping needing a fresh
+page table would otherwise live only in whichever directory was active — and
+the console would fault the moment the scheduler switched tasks.
+
+**Scrolling re-rasterises from the shadow buffer** rather than moving pixels,
+and only where cells actually differ. Measured: 0.27 ms against 1.16 ms for a
+pixel move at 1024x768x32 — and the real margin is wider, because moving
+pixels means *reading* an uncached framebuffer. The framebuffer is never read.
 
 ## On real hardware
 

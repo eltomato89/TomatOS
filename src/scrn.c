@@ -8,16 +8,46 @@
 #include <string.h>
 #include <mm.h>
 #include <vmm.h>
+#include <fbcon.h>
 
 /* Physical address of the VGA text mode buffer. Memory mapped hardware, not
 *  RAM -- the kernel reaches it through the direct mapping at P2V(). */
 #define VGA_TEXT_PHYS   0xB8000
+
+/* The geometry of the VGA text mode buffer. These are properties of the
+*  hardware behind 0xB8000 and never change; the geometry of the CONSOLE is a
+*  different question and is asked through screen_cols()/screen_rows(). */
+#define TEXT_COLS       80
+#define TEXT_ROWS       25
 
 /* These define our textpointer, our background and foreground
 *  colors (attributes), and x and y cursor coordinates */
 volatile unsigned short *textmemptr;
 int attrib = 0x0F;
 int csr_x = 0, csr_y = 0;
+
+/* --- Screen geometry ------------------------------------------------------
+*
+*  Text mode is 80x25 and always was, so the numbers used to be written into
+*  the code. A framebuffer console is whatever the mode the bootloader picked
+*  works out to -- 1024x768 with an 8x16 cell is 128x48 -- so nothing may
+*  assume 80 or 25 any more. Everything that needs the size of the screen
+*  asks these two, and they answer for whichever console is in charge.
+*
+*  Both are cheap enough to call per character: fbcon_active() reads one
+*  variable, and when it is false neither fbcon_cols() nor fbcon_rows() is
+*  reached at all. */
+static int screen_cols(void)
+{
+	if(fbcon_active()) return fbcon_cols();
+	return TEXT_COLS;
+}
+
+static int screen_rows(void)
+{
+	if(fbcon_active()) return fbcon_rows();
+	return TEXT_ROWS;
+}
 
 /* --- The console lock -----------------------------------------------------
 *
@@ -63,26 +93,41 @@ static void console_unlock(unsigned int flags)
 void scroll(void)
 {
     unsigned blank, temp;
+    int rows;
 
     /* A blank is defined as a space... we need to give it
     *  backcolor too */
     blank = 0x20 | (attrib << 8);
 
-    /* Row 25 is the end, this means we need to scroll up */
-    if(csr_y >= 25)
-    {
-        /* Move the current text chunk that makes up the screen
-        *  back in the buffer by a line */
-        temp = csr_y - 25 + 1;
-        memcpy ((void *)textmemptr, (const void *)(textmemptr + temp * 80), (25 - temp) * 80 * 2);
+    /* The last row is the end, this means we need to scroll up. Which row
+    *  that is depends on the console: 25 in text mode, whatever the
+    *  framebuffer mode works out to otherwise. */
+    rows = screen_rows();
+    if(csr_y < rows) return;
 
-        /* Finally, we set the chunk of memory that occupies
-        *  the last line of text to our 'blank' character */
-        memsetw ((unsigned short *)(textmemptr + (25 - temp) * 80), blank, 80);
-        csr_y = 25 - 1;
+    if(fbcon_active())
+    {
+        /* The framebuffer console scrolls its own shadow buffer and repaints
+        *  as it sees fit; it moves one line per call, so a cursor that ran
+        *  several lines past the bottom takes several. In practice it is
+        *  never more than one. */
+        while(csr_y >= rows)
+        {
+            fbcon_scroll(attrib);
+            csr_y--;
+        }
+        return;
     }
-	
-	
+
+    /* Move the current text chunk that makes up the screen
+    *  back in the buffer by a line */
+    temp = csr_y - rows + 1;
+    memcpy ((void *)textmemptr, (const void *)(textmemptr + temp * TEXT_COLS), (rows - temp) * TEXT_COLS * 2);
+
+    /* Finally, we set the chunk of memory that occupies
+    *  the last line of text to our 'blank' character */
+    memsetw ((unsigned short *)(textmemptr + (rows - temp) * TEXT_COLS), blank, TEXT_COLS);
+    csr_y = rows - 1;
 }
 
 /* Updates the hardware cursor: the little blinking line
@@ -91,10 +136,18 @@ void move_csr(void)
 {
     unsigned temp;
 
+    /* There is no CRT controller in a graphics mode and no hardware cursor to
+    *  program: the framebuffer console draws its own. */
+    if(fbcon_active())
+    {
+        fbcon_cursor(csr_x, csr_y);
+        return;
+    }
+
     /* The equation for finding the index in a linear
     *  chunk of memory can be represented by:
     *  Index = [(y * width) + x] */
-    temp = csr_y * 80 + csr_x;
+    temp = csr_y * TEXT_COLS + csr_x;
 
     /* This sends a command to indicies 14 and 15 in the
     *  CRT Control Register of the VGA controller. These
@@ -126,8 +179,15 @@ void cls(void)
 
     /* Sets the entire screen to spaces in our current
     *  color */
-    for(i = 0; i < 25; i++)
-        memsetw ((unsigned short *)(textmemptr + i * 80), blank, 80);
+    if(fbcon_active())
+    {
+        fbcon_clear(attrib);
+    }
+    else
+    {
+        for(i = 0; i < TEXT_ROWS; i++)
+            memsetw ((unsigned short *)(textmemptr + i * TEXT_COLS), blank, TEXT_COLS);
+    }
 
     /* Update out virtual cursor, and then move the
     *  hardware cursor */
@@ -144,9 +204,11 @@ void putch(unsigned char c)
     volatile unsigned short *where;
     unsigned att;
     unsigned int flags;
+    int cols;
 
     flags = console_lock();
     att = attrib << 8;
+    cols = screen_cols();
 
     /* Handle a backspace, by moving the cursor back one space */
     if(c == 0x08)
@@ -179,14 +241,24 @@ void putch(unsigned char c)
     *  Index = [(y * width) + x] */
     else if(c >= ' ')
     {
-        where = textmemptr + (csr_y * 80 + csr_x);
-        *where = c | att;	/* Character AND attributes: color */
+        /* The framebuffer console wants a column and a row rather than an
+        *  offset into a linear buffer -- it has to know the cell to be able
+        *  to draw the glyph. */
+        if(fbcon_active())
+        {
+            fbcon_putc(csr_x, csr_y, c, attrib);
+        }
+        else
+        {
+            where = textmemptr + (csr_y * TEXT_COLS + csr_x);
+            *where = c | att;	/* Character AND attributes: color */
+        }
         csr_x++;
     }
 
     /* If the cursor has reached the edge of the screen's width, we
     *  insert a new line in there */
-    if(csr_x >= 80)
+    if(csr_x >= cols)
     {
         csr_x = 0;
         csr_y++;
@@ -367,33 +439,51 @@ int printf(char * string, ...)
 /* Status bar                                                          */
 /* ------------------------------------------------------------------ */
 
-/* The bar is the topmost line of the screen and therefore exactly 80
-*  columns wide. */
-#define STATUSBAR_WIDTH     80
-
-/* The clock is right aligned: "hh:mm:ss" occupies eight columns starting at
-*  column 70, the last two columns stay empty (they used to hold the
-*  terminating zero of the time string, which showed up as a space). */
+/* The bar is the topmost line of the screen and therefore exactly as wide as
+*  the screen is -- 80 columns in text mode, 128 in a 1024x768 framebuffer.
+*  There is no STATUSBAR_WIDTH any more: the width is read once per update
+*  from screen_cols() and carried through in a local, so that every column in
+*  one line is measured against the same number.
+*
+*  The clock is right aligned: "hh:mm:ss" occupies eight columns ending two
+*  columns short of the right edge -- those two stay empty (they used to hold
+*  the terminating zero of the time string, which showed up as a space). */
 #define STATUSBAR_CLOCK_LEN 8
-#define STATUSBAR_CLOCK_COL (STATUSBAR_WIDTH - 2 - STATUSBAR_CLOCK_LEN)
+#define STATUSBAR_CLOCK_COL(width) ((width) - 2 - STATUSBAR_CLOCK_LEN)
 
 /* Frames per megabyte: 1 MiB / 4 KiB = 256. The display deliberately counts
 *  in frames rather than in bytes -- a byte value would overflow at 4 GiB,
 *  while the number of frames always fits comfortably into 32 bits. */
 #define STATUSBAR_FRAMES_PER_MB (1024 * 1024 / PMM_FRAME_SIZE)
 
-/* Writes text with the currently set attrib into the bar starting at column
-*  col and returns the first free column. Anything that would run into the
-*  area of the clock is discarded: that way neither a long number nor a high
-*  task count can blow up the line or overflow into the next one. */
-static int statusbar_puts(int col, const char *text)
+/* Writes one cell of the bar with the currently set attrib. The bar is row 0
+*  in either mode, so this is the one place that has to know which console is
+*  in charge -- everything above it works in columns and stays the same. */
+static void statusbar_cell(int col, unsigned char c)
 {
 	volatile unsigned short *pos;
 
-	while(*text != EOS && col < STATUSBAR_CLOCK_COL)
+	if(fbcon_active())
 	{
-		pos = textmemptr + col;
-		*pos = (unsigned char)*text | (attrib << 8);
+		fbcon_putc(col, 0, c, attrib);
+		return;
+	}
+
+	pos = textmemptr + col;
+	*pos = c | (attrib << 8);
+}
+
+/* Writes text with the currently set attrib into the bar starting at column
+*  col and returns the first free column. Anything that would run into the
+*  area of the clock is discarded: that way neither a long number nor a high
+*  task count can blow up the line or overflow into the next one. The limit
+*  is passed in rather than looked up, because on a framebuffer it depends on
+*  a screen width the caller has already determined. */
+static int statusbar_puts(int col, int limit, const char *text)
+{
+	while(*text != EOS && col < limit)
+	{
+		statusbar_cell(col, (unsigned char)*text);
 		col++;
 		text++;
 	}
@@ -403,14 +493,11 @@ static int statusbar_puts(int col, const char *text)
 
 /* Like statusbar_puts(), but for a single character -- needed for the
 *  activity dot 0xFE, which does not appear in any ordinary string. */
-static int statusbar_putc(int col, unsigned char c)
+static int statusbar_putc(int col, int limit, unsigned char c)
 {
-	volatile unsigned short *pos;
-
-	if(col < STATUSBAR_CLOCK_COL)
+	if(col < limit)
 	{
-		pos = textmemptr + col;
-		*pos = c | (attrib << 8);
+		statusbar_cell(col, c);
 		col++;
 	}
 
@@ -419,12 +506,13 @@ static int statusbar_putc(int col, unsigned char c)
 
 void display_update_statusbar()
 {
-	volatile unsigned short *pos;
-	unsigned long flags;
+	unsigned int flags;
 	int org_attrib;
 	int i;
 	int x;
 	int back = 0x7;
+	int width;
+	int clock_col;
 	int taskcount;
 	uint32_t total_frames;
 	uint32_t used_frames;
@@ -437,14 +525,24 @@ void display_update_statusbar()
 	*  Waiting inside our own cli would hold the lock unnecessarily long. */
 	now = cmos_readtime();
 
-	/* Save EFLAGS and only then disable. An unconditional sti at the end
-	*  would enable the interrupts even when the caller had deliberately
-	*  disabled them. The lock itself is necessary because we write directly
-	*  into the VGA buffer here, while the console task does the same via
-	*  putch(). */
-	__asm__ __volatile__ ("pushfl; popl %0; cli" : "=r" (flags) : : "memory");
+	/* The very same lock putch() takes, for the very same reason: this runs
+	*  as its own task, and everything below touches state the console task
+	*  and any ring 3 task using SYS_WRITE touch as well -- the global attrib,
+	*  the static buffer itoa() hands back, and row 0 of whichever console is
+	*  active. On a framebuffer that last one now means the shadow buffer and
+	*  the pixels behind it, which putch() writes through too, so the lock
+	*  matters more here than it did in text mode, not less. It saves EFLAGS
+	*  rather than ending with sti, so a caller that had deliberately masked
+	*  the interrupts gets them back masked. */
+	flags = console_lock();
 
 	org_attrib = attrib;
+
+	/* The width of the bar is the width of the screen. Read it once: every
+	*  column below is measured against it, and they all have to agree. */
+	width = screen_cols();
+	clock_col = STATUSBAR_CLOCK_COL(width);
+	if(clock_col < 0) clock_col = 0;
 
 	/* The metrics and the number formatting belong inside the critical
 	*  section: itoa() returns a pointer to a static buffer that all tasks
@@ -475,40 +573,39 @@ void display_update_statusbar()
 
 	/* Background of the whole line: black text on light grey. */
 	settextcolor(0x00, 0x7);
-	for(i = 0; i < STATUSBAR_WIDTH; i++)
+	for(i = 0; i < width; i++)
 	{
-		pos = textmemptr + i;
-		*pos = ' ' | (attrib << 8);
+		statusbar_cell(i, ' ');
 	}
 
 	i = 0;
 
 	/* [cpu: .] -- brackets black, label white */
-	i = statusbar_puts(i, "[");
+	i = statusbar_puts(i, clock_col, "[");
 	settextcolor(15, back);
-	i = statusbar_puts(i, "cpu: ");
-	i = statusbar_putc(i, 0xFE);	/* activity dot, CPU */
+	i = statusbar_puts(i, clock_col, "cpu: ");
+	i = statusbar_putc(i, clock_col, 0xFE);	/* activity dot, CPU */
 	settextcolor(0x00, 0x7);
-	i = statusbar_puts(i, "] ");
+	i = statusbar_puts(i, clock_col, "] ");
 
 	/* [mem: used/total mb] */
-	i = statusbar_puts(i, "[");
+	i = statusbar_puts(i, clock_col, "[");
 	settextcolor(15, back);
-	i = statusbar_puts(i, "mem: ");
-	i = statusbar_puts(i, mem);
+	i = statusbar_puts(i, clock_col, "mem: ");
+	i = statusbar_puts(i, clock_col, mem);
 	settextcolor(0x00, 0x7);
-	i = statusbar_puts(i, "] ");
+	i = statusbar_puts(i, clock_col, "] ");
 
 	/* [task: ..] -- one dot per running task */
-	i = statusbar_puts(i, "[");
+	i = statusbar_puts(i, clock_col, "[");
 	settextcolor(15, back);
-	i = statusbar_puts(i, "task: ");
+	i = statusbar_puts(i, clock_col, "task: ");
 	for(x = 0; x < taskcount; x++)
 	{
-		i = statusbar_putc(i, 0xFE);
+		i = statusbar_putc(i, clock_col, 0xFE);
 	}
 	settextcolor(0x00, 0x7);
-	i = statusbar_puts(i, "]");
+	i = statusbar_puts(i, clock_col, "]");
 
 	/* Clock, right aligned. attrib is already set to black/light grey. */
 	if(now.hours < 10) {
@@ -534,15 +631,14 @@ void display_update_statusbar()
 
 	for(x = 0; x < STATUSBAR_CLOCK_LEN; x++)
 	{
-		pos = textmemptr + (STATUSBAR_CLOCK_COL + x);
-		*pos = time[x] | (attrib << 8);
+		statusbar_cell(clock_col + x, (unsigned char)time[x]);
 	}
 
 	attrib = org_attrib;
 
 	/* EFLAGS back -- afterwards the interrupts are disabled or enabled
 	*  exactly as they were on entry. */
-	__asm__ __volatile__ ("pushl %0; popfl" : : "r" (flags) : "memory", "cc");
+	console_unlock(flags);
 }
 
 void panic(char *desc)

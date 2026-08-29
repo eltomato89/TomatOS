@@ -13,6 +13,7 @@
 #include <mm.h>
 #include <syscall.h>
 #include <vmm.h>
+#include <fbcon.h>
 #include <exec.h>
 #include <ata.h>
 #include <fat.h>
@@ -207,6 +208,51 @@ int fb_usable(void)
 		&& fb_mapped;
 }
 
+/* Hands the mode over to the framebuffer console, before a single character
+*  has been printed. This is the first thing kernel() does with the multiboot
+*  info, and the position is the point of it.
+*
+*  fbcon_describe() touches nothing but a shadow buffer in .bss. It needs no
+*  mapping, no vmm and no heap, so the only thing keeping it from being the
+*  very first statement of the kernel is that mbi has to be a validated and
+*  converted pointer first - which is why the two multiboot checks moved
+*  ahead of the banner rather than this call moving behind them.
+*
+*  What is at stake is everything printed before it. On a machine that came
+*  up in a graphics mode there is no text buffer behind 0xB8000 that anybody
+*  looks at: characters written there are simply gone, and they are not in
+*  the shadow buffer either, so fbcon_activate() cannot replay them later.
+*  Every line that would tell one why a boot went wrong is exactly the kind
+*  of line one loses that way.
+*
+*  init_video() is behind this call for the same reason. Its cls() is console
+*  output like any other - scrn.c asks fbcon_active() which screen to clear -
+*  so it only clears the right one once the console knows what it drives. Run
+*  the other way round, cls() would blank a text buffer nobody displays and
+*  leave the shadow buffer full of the NUL bytes .bss starts out with.
+*
+*  A framebuffer above 4 GiB is passed on as address zero rather than as its
+*  truncated low half: a 32-bit kernel cannot map it at all, and half an
+*  address is worse than none. The console then stays in text mode, which is
+*  what the no-framebuffer case below does as well - both are documented as
+*  safe by fbcon.h. */
+static void framebuffer_describe(multiboot_info *mbi)
+{
+	uint32_t addr;
+
+	if(!(mbi->flags & MULTIBOOT_INFO_FRAMEBUFFER))
+	{
+		fbcon_describe(0, 0, 0, 0, 0, MULTIBOOT_FRAMEBUFFER_EGA_TEXT);
+		return;
+	}
+
+	addr = (mbi->framebuffer_addr_high == 0) ? mbi->framebuffer_addr_low : 0;
+
+	fbcon_describe(addr, mbi->framebuffer_pitch,
+		mbi->framebuffer_width, mbi->framebuffer_height,
+		(uint8_t)mbi->framebuffer_bpp, (uint8_t)mbi->framebuffer_type);
+}
+
 /* Records what the bootloader reported and says so in one line.
 *
 *  Needs a live vmm: the second of the two checks below asks vmm_is_mapped(),
@@ -284,7 +330,16 @@ static void framebuffer_init(multiboot_info *mbi)
 	else
 		printf("0x%X", fb_addr);
 
-	printf(" (%s)\n", status);
+	/* The last field is the one thing here that is not a property of the
+	*  hardware but a decision: fbcon_activate() ran a few lines further up
+	*  and either took the screen over or did not. Worth saying in the same
+	*  line, because the two halves explain each other - "outside the direct
+	*  mapping, console active" is not a contradiction, it is the console
+	*  having mapped what P2V() cannot name. Two words rather than the
+	*  geometry, so the EGA text case stays inside 80 columns; the shell
+	*  reports the full mode with "gfx -i". */
+	printf(" (%s, %s)\n", status,
+		fbcon_active() ? "console active" : "text mode");
 }
 
 /* Reports the modules the bootloader loaded alongside the kernel, in exactly
@@ -443,19 +498,35 @@ int kernel(uint32_t magic, multiboot_info *mbi_phys)
 	multiboot_info *mbi;
 	int task_console;
 
-    init_video();
-    printf("\n\nTomatOS/x86 boot v0.2\n");
-
-	/* One line on the split, because it is exactly what one wants to see
-	*  first when a higher half mapping goes wrong. */
-	printf("Higher half: kernel 0x%X virt = 0x%X phys\n",
-		KERNEL_VIRTUAL_START, V2P(KERNEL_VIRTUAL_START));
-
-	/* Without the magic we do not know whether ebx points at a multiboot
+	/* The two multiboot checks come first, ahead of the banner, and that is
+	*  a consequence of the framebuffer console rather than a tidy-up.
+	*
+	*  Nothing may be printed before framebuffer_describe() has run, or it is
+	*  lost on a graphics mode boot (see the comment there). The description
+	*  can only be read out of mbi, and mbi is only a pointer worth
+	*  dereferencing once these two checks have passed - so they have to
+	*  happen before any output, not after the first three lines of it.
+	*
+	*  That leaves exactly one thing that still goes to text mode alone: the
+	*  failure messages of these two checks. It is not a hole that can be
+	*  closed. Without a usable multiboot info there is no geometry to
+	*  describe, so there is no framebuffer console to say them on either,
+	*  and on a machine that booted into a graphics mode the panic screen is
+	*  invisible. The condition it reports - a bootloader that did not leave
+	*  a multiboot info behind - is not one a graphics mode makes any more
+	*  likely, and our own stage 2, which is what sets a VBE mode in the
+	*  first place, is precisely the code that gets both of these right.
+	*
+	*  Each branch brings the text console up itself. init_video() cannot be
+	*  hoisted above them for that: it clears the screen, and cls() asks
+	*  fbcon_active() which screen it is clearing.
+	*
+	*  Without the magic we do not know whether ebx points at a multiboot
 	*  info structure at all. Everything beyond this would be guesswork.
 	*  Checked before the conversion: P2V() on garbage yields garbage. */
 	if(magic != MULTIBOOT_BOOTLOADER_MAGIC)
 	{
+		init_video();
 		printf("Multiboot magic: expected %X, got %X\n",
 			MULTIBOOT_BOOTLOADER_MAGIC, magic);
 		panic("No multiboot compliant bootloader.\nTomatOS needs the memory information from the bootloader.");
@@ -469,6 +540,7 @@ int kernel(uint32_t magic, multiboot_info *mbi_phys)
 	*  print_memory_map() with no handler installed yet. */
 	if((uint32_t)mbi_phys == 0 || (uint32_t)mbi_phys > DIRECT_MAP_LIMIT)
 	{
+		init_video();
 		printf("Multiboot info at 0x%X, outside the direct mapping\n",
 			(uint32_t)mbi_phys);
 		panic("Multiboot info pointer out of range.\nTomatOS cannot reach the memory information.");
@@ -476,6 +548,27 @@ int kernel(uint32_t magic, multiboot_info *mbi_phys)
 	}
 
 	mbi = (multiboot_info *)P2V(mbi_phys);
+
+	/* The earliest point the console can be told what it drives, and
+	*  therefore the point it is told. Everything below this is recorded in
+	*  the shadow buffer and survives to be painted; everything above it
+	*  would not. */
+	framebuffer_describe(mbi);
+
+	/* Now the screen may be cleared - and on a graphics boot this is the
+	*  clear that counts. There is no 80x25 buffer on such a machine, so
+	*  cls() blanks the shadow buffer instead of 0xB8000, and the pixels
+	*  follow when fbcon_activate() paints it. The leading blank lines of the
+	*  banner are for the text case, where they separate our output from the
+	*  bootloader's; a framebuffer console has 48 rows and does not miss the
+	*  two. */
+	init_video();
+	printf("\n\nTomatOS/x86 boot v0.2\n");
+
+	/* One line on the split, because it is exactly what one wants to see
+	*  first when a higher half mapping goes wrong. */
+	printf("Higher half: kernel 0x%X virt = 0x%X phys\n",
+		KERNEL_VIRTUAL_START, V2P(KERNEL_VIRTUAL_START));
 
 	detect_cpu();
 	if(checkCPUID()==1)
@@ -597,27 +690,64 @@ int kernel(uint32_t magic, multiboot_info *mbi_phys)
 	*  pointer dereferences, writes into the read-only kernel text - and
 	*  those all happen well after isrs_install().
 	*
-	*  framebuffer_init() sits directly behind vmm_init() and that position is
-	*  the whole point of it. Reading the multiboot fields needs nothing but
-	*  the converted mbi and could happen anywhere above; deciding whether the
-	*  framebuffer may be TOUCHED cannot. The address the bootloader reports
-	*  is physical and belongs to memory mapped hardware, so two things have
-	*  to hold before a single byte is written there: P2V() must be defined
-	*  for it (below DIRECT_MAP_LIMIT, and not a 64-bit address), and the page
-	*  must actually be present - vmm_init() maps RAM as the memory map
-	*  reports it, and a graphics card at 0xFD000000 is not in that map.
-	*  vmm_is_mapped() can only answer once vmm_init() has built the tables,
-	*  hence here and not one line earlier. It only records and reports; the
-	*  mapping, if one turns out to be needed, is a step of its own and would
-	*  belong immediately after, in front of mt_install(), because a fresh
-	*  kernel page table must exist before the first task space is created -
-	*  the same rule the block above states for every other kernel mapping. */
+	*  The framebuffer console is split across this chain in two places, and
+	*  neither of them is negotiable.
+	*
+	*  framebuffer_describe() is already done, far above, before the first
+	*  character - see the comment on it. What is left here is
+	*  fbcon_activate(), which maps the framebuffer and paints the shadow
+	*  buffer onto it, and it is bounded from both sides.
+	*
+	*  Its lower bound is vmm_init(). The address the bootloader reports is
+	*  physical and belongs to memory mapped hardware, not to RAM: QEMU's
+	*  card answers at 0xFD000000, which is above DIRECT_MAP_LIMIT, so P2V()
+	*  has no name for it, and it appears in no memory map, so vmm_init()
+	*  never mapped it. It has to be given a mapping of its own with
+	*  vmm_map_mmio(), and there is nothing to map with before vmm_init() has
+	*  built the tables. Hence the call one line behind it, which is the
+	*  earliest instruction at which it can succeed at all.
+	*
+	*  Its upper bound is mt_install(), and that is the rule the block above
+	*  states, hitting a real case for the first time. The kernel half is
+	*  shared between address spaces at page DIRECTORY ENTRY granularity, so
+	*  a kernel mapping that needs a brand new page table lands only in the
+	*  directory that was active when it was made. The framebuffer window is
+	*  exactly such a mapping - it is nowhere near the direct mapping and no
+	*  existing kernel table covers it. Made after the first task space
+	*  exists, it would be present in whichever directory happened to be
+	*  loaded and absent from every other, and the console would page fault
+	*  the moment the scheduler switched into a task with a space of its own.
+	*  Doing it here means every directory vmm_create_space() makes later
+	*  copies the entry along with the rest of the kernel half.
+	*
+	*  vmm.h now also reserves the page tables for that window inside
+	*  vmm_init() for the same reason, which makes the upper bound belt and
+	*  braces rather than the only thing standing between us and the fault.
+	*  The call stays here regardless: relying on a reservation elsewhere to
+	*  make a late mapping safe is how the rule gets forgotten the next time
+	*  something wants a kernel range of its own.
+	*
+	*  Painting happens here as well, which is why the boot output is on the
+	*  screen from this line onwards rather than from the shell. Everything
+	*  above - the memory map, the higher half line, even the banner - was
+	*  written into the shadow buffer and is drawn in one go.
+	*
+	*  framebuffer_init() then reports, and it reports afterwards on purpose:
+	*  its last field says whether the console took the framebuffer over, and
+	*  that is only knowable once fbcon_activate() has returned. Its own two
+	*  checks are unchanged and still answer a different question - whether
+	*  the direct mapping reaches the framebuffer, which is what fb_usable()
+	*  is about - and vmm_is_mapped() still needs the tables vmm_init() built.
+	*/
 	print_memory_map(mbi);
 	pmm_init(mbi);
 	vmm_init();
+	fbcon_activate();
 	/* No extra line for the address space: the directory this prints IS the
 	*  kernel space, so naming it here costs nothing, while a second message
-	*  would cost one of the 25 rows the boot output has to fit into. */
+	*  would cost one of the 25 rows the boot output has to fit into. The
+	*  table count already includes whatever fbcon_activate() needed for the
+	*  framebuffer window. */
 	printf("Paging on: %i page tables, kernel space 0x%X\n",
 		vmm_table_count(), vmm_kernel_space());
 	framebuffer_init(mbi);

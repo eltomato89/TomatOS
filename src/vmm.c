@@ -24,6 +24,9 @@
 *      P2V(0) = 0xC0000000
 *    - the kernel's own code (text_start .. text_end, virtual symbols now) is
 *      mapped present but not writable
+*    - the top 16 MiB, 0xFF000000 upwards, are not part of the direct mapping
+*      at all. They are the window vmm_map_mmio() hands out for memory mapped
+*      hardware that lies outside RAM, such as a card's linear framebuffer
 *
 *  Because the kernel runs in ring 0, a read-only mapping only bites when
 *  CR0.WP is set as well - without that bit the processor lets supervisor
@@ -75,6 +78,50 @@ extern char text_end[];
 #define KERNEL_DIR_FIRST   (KERNEL_VIRTUAL_BASE >> 22)              /* 768 */
 #define KERNEL_DIR_ENTRIES (PAGE_ENTRIES - KERNEL_DIR_FIRST)        /* 256 */
 
+/* --- The MMIO window ------------------------------------------------------
+*
+*  Memory mapped hardware is not RAM. A card's linear framebuffer sits wherever
+*  the chipset decoded it - QEMU's stdvga puts it at 0xFD000000 - which is far
+*  above the top of RAM and usually above the whole direct mapping. P2V() says
+*  nothing about it and vmm_init() never maps it, because the pmm has never
+*  heard of those frames. Such a range therefore needs a virtual address that
+*  the vmm hands out itself.
+*
+*  Where to put it. Three requirements, and together they leave exactly one
+*  sensible answer:
+*
+*    - above KERNEL_VIRTUAL_BASE. The framebuffer console prints from any
+*      context, including from an interrupt taken while a ring 3 task is
+*      current, so its window has to exist in EVERY address space. Only the
+*      kernel half is shared, so only the kernel half will do.
+*    - clear of the direct mapping, which claims KERNEL_VIRTUAL_BASE + p for
+*      every physical frame p the pmm knows. Nominally that reaches all the way
+*      to 0xFFFFFFFF, so the window can only be carved out of the top by
+*      *shortening* the direct mapping - see DIRECT_MAP_TOP below.
+*    - at a fixed, compile time known base, so that the page tables covering it
+*      can be created once, up front. That is what makes the mapping visible in
+*      every space; the reasoning is at mmio_reserve_tables().
+*
+*  So: the top 16 MiB of the address space, 0xFF000000..0xFFFFFFFF, four whole
+*  directory entries (1020..1023). Ranges are handed out sequentially from the
+*  base with a bump pointer and are never reclaimed - there is no
+*  vmm_unmap_mmio(). Hardware windows are claimed once during bring-up and kept
+*  for the lifetime of the system, so a free list would be bookkeeping for a
+*  case that does not occur. 16 MiB is room for five framebuffers of the
+*  1024x768x32 size (768 pages, 3 MiB) the console asks for. */
+#define MMIO_WINDOW_BASE   0xFF000000u
+#define MMIO_WINDOW_PAGES  4096u                                    /* 16 MiB */
+#define MMIO_DIR_FIRST     (MMIO_WINDOW_BASE >> 22)                 /* 1020 */
+
+/* Where the direct mapping now stops. Physical memory from here up has no
+*  virtual alias any more: its slot at KERNEL_VIRTUAL_BASE + p belongs to the
+*  MMIO window. That costs the last 16 MiB of a machine with more than 1008 MiB
+*  of RAM, which is the cheapest currency available - the alternative is a
+*  framebuffer no task but the current one can see. Everything that walks the
+*  direct mapping (page tables, page directories, P2V() on a pmm frame) has to
+*  respect this limit, which is why reachable_limit() reports it. */
+#define DIRECT_MAP_TOP     (MMIO_WINDOW_BASE - KERNEL_VIRTUAL_BASE) /* 0x3F000000 */
+
 /* --- State ---------------------------------------------------------------- */
 
 static uint32_t *page_directory = 0;    /* VIRTUAL pointer to the directory   */
@@ -82,6 +129,7 @@ static uint32_t  directory_phys = 0;    /* PHYSICAL address, as CR3 wants it  */
 static int       paging_active  = 0;    /* set once our own tables are live   */
 static uint32_t  tables_in_use  = 0;    /* page tables allocated so far       */
 static uint32_t  pages_mapped   = 0;    /* present entries across all tables  */
+static uint32_t  mmio_next_page = 0;    /* bump pointer into the MMIO window  */
 
 /* --- Small helpers -------------------------------------------------------- */
 
@@ -139,7 +187,7 @@ static uint32_t active_space(void)
 *  one, no matter how much free memory the pmm still reports. */
 static uint32_t reachable_limit(void)
 {
-	if (paging_active) return DIRECT_MAP_LIMIT;
+	if (paging_active) return DIRECT_MAP_TOP - 1;
 	return BOOT_MAP_LIMIT - 1;
 }
 
@@ -442,6 +490,69 @@ static void paging_switch_on(uint32_t dir_phys)
 	__asm__ __volatile__("pushl %0 ; popfl" : : "r"(eflags) : "memory", "cc");
 }
 
+/* Creates the four page tables that cover the MMIO window and hangs them into
+*  the kernel directory, empty.
+*
+*  This is the whole answer to the trap vmm.h documents. Sharing between address
+*  spaces happens at DIRECTORY ENTRY granularity: vmm_create_space() copies
+*  entries 768..1023 out of the kernel directory, so a kernel page mapped inside
+*  a table that already exists appears in every space at once, while a kernel
+*  mapping that has to allocate a NEW table writes that table's address into one
+*  directory only - the active one. Every other space would keep an absent entry
+*  there and fault on the framebuffer, which for a console printing from a ring 3
+*  task's interrupt is a fault inside the fault handler.
+*
+*  So the tables are created here, once, at a fixed base, before the first
+*  address space exists. From then on every vmm_create_space() copies the four
+*  entries along with the rest of the kernel half, and vmm_map_mmio() only ever
+*  writes PAGE TABLE entries into tables that all spaces already point at. That
+*  removes the timing constraint entirely: an MMIO mapping may be established at
+*  any moment, from any address space, and is immediately visible in all of them.
+*  Costs four frames, 16 KiB, whether or not any hardware is ever mapped.
+*
+*  The tables must be created here in vmm_init() and nowhere else - that is the
+*  one ordering rule. Doing it lazily on the first vmm_map_mmio() would be
+*  correct only as long as no address space had been created yet, which is
+*  precisely the sort of invisible precondition this arrangement is meant to
+*  avoid. Returns 0 on success, -1 if the pmm cannot supply a usable frame. */
+static int mmio_reserve_tables(void)
+{
+	uint32_t  di;
+	uint32_t *table;
+	void     *frame;
+
+	for (di = MMIO_DIR_FIRST; di < PAGE_ENTRIES; di++)
+	{
+		if (page_directory[di] & PAGE_PRESENT) continue;
+
+		frame = pmm_alloc_frame();
+		if (frame == 0) return -1;
+
+		/* Same requirement as any other page table: the kernel writes it,
+		*  so it has to have an alias in the direct mapping. */
+		if ((uint32_t)frame > reachable_limit())
+		{
+			pmm_free_frame(frame);
+			return -1;
+		}
+
+		table = (uint32_t *)P2V(frame);
+		memset(table, (char)0, (size_t)PAGE_SIZE);
+
+		/* Empty and present. An empty table maps nothing - every entry has
+		*  bit 0 clear - so the window stays unmapped until somebody asks
+		*  for a range, and a stray access into it still faults.
+		*
+		*  No PAGE_USER: hardware windows are kernel only, and the entry is
+		*  copied verbatim into every task's directory. */
+		page_directory[di] = (V2P(table) & PAGE_ADDR_MASK) |
+		                     PAGE_PRESENT | PAGE_WRITE;
+		tables_in_use++;
+	}
+
+	return 0;
+}
+
 void vmm_init(void)
 {
 	uint32_t frames;
@@ -516,8 +627,14 @@ void vmm_init(void)
 	/* The direct mapping ends where the address space does: physical
 	*  memory above DIRECT_MAP_LIMIT has no room left below 4 GiB. Such a
 	*  machine needs a real high-memory scheme; until then the surplus
-	*  stays unmapped rather than wrapping around into the low half. */
-	frame_limit = (DIRECT_MAP_LIMIT + 1) >> 12;
+	*  stays unmapped rather than wrapping around into the low half.
+	*
+	*  It stops a little earlier still, at DIRECT_MAP_TOP, because the top
+	*  16 MiB of linear space are reserved for the MMIO window - see there.
+	*  On a machine with 1008 MiB of RAM or less this changes nothing at
+	*  all; above that, the last frames lose their alias instead of the
+	*  framebuffer losing its address. */
+	frame_limit = DIRECT_MAP_TOP >> 12;
 	if (frames > frame_limit) frames = frame_limit;
 
 	for (i = 0; i < frames; i++)
@@ -552,8 +669,116 @@ void vmm_init(void)
 	paging_switch_on(directory_phys);
 	paging_active = 1;
 
+	/* After the switch, so the four tables may come from anywhere in the
+	*  direct mapping rather than from the low 4 MiB the boot directory
+	*  covers, and still before any task address space can exist. */
+	if (mmio_reserve_tables() != 0)
+	{
+		panic("VMM: no frame for the MMIO window page tables");
+		return;
+	}
+
 	printf("VMM: paging on, %d pages in %d tables, page 0 left unmapped\n",
 	       (int)pages_mapped, (int)tables_in_use);
+}
+
+/* --- Memory mapped I/O ----------------------------------------------------- */
+
+/* Maps a physical hardware range into the kernel's MMIO window and returns a
+*  pointer to it, or 0 on failure.
+*
+*  Declared in vmm.h as:
+*      extern void *vmm_map_mmio(uint32_t phys, uint32_t size);
+*
+*  phys need not be page aligned. The mapping is rounded down to the page that
+*  contains it and extended to cover phys + size - 1, and the offset inside the
+*  first page is added back to the result, so the caller gets a pointer to the
+*  very byte it asked about and never has to think about the rounding.
+*
+*  The frames are deliberately NOT marked used in the pmm. They are not RAM; the
+*  pmm's bitmap has no bit for them, has never handed them out and must never be
+*  told about them - a pmm_free_frame() on a framebuffer frame would clear a bit
+*  belonging to some completely unrelated frame and hand that one out twice.
+*  Nothing here allocates physical memory at all; the only frames involved are
+*  the page tables, and those were taken during vmm_init().
+*
+*  Cache attributes: PAGE_NOCACHE together with PAGE_WRITETHROUGH, i.e. the
+*  strongest uncached type the processor offers without PAT or MTRR setup. A
+*  framebuffer left write-back is the classic "the picture updates late, or
+*  only when something else happens to evict the line" bug: the writes sit in
+*  the cache, the card has not seen them, and there is no coherency mechanism
+*  that would tell it. PCD is the bit that actually forbids caching; PWT is set
+*  as well so that the entry names the fully uncached type rather than the
+*  weaker UC- in the default PAT layout, which is the deterministic choice while
+*  nothing in this kernel programs MTRRs. Should write combining ever be worth
+*  the trouble - and for a framebuffer it is, byte by byte writes to uncached
+*  memory are slow - the change is to drop PWT here and let a WC MTRR or a PAT
+*  entry take effect over UC-.
+*
+*  PAGE_WRITE, no PAGE_USER: the window is kernel only, and its four directory
+*  entries are copied into every task's directory. */
+void *vmm_map_mmio(uint32_t phys, uint32_t size)
+{
+	uint32_t offset;
+	uint32_t base;
+	uint32_t pages;
+	uint32_t first;
+	uint32_t flags;
+	uint32_t i;
+	uint32_t virt;
+
+	if (page_directory == 0 || size == 0) return 0;
+
+	/* The range must stay inside the 4 GiB physical address space; a
+	*  request that wraps around is a caller bug, not a mapping. */
+	if (phys > 0xFFFFFFFFu - (size - 1)) return 0;
+
+	/* Nothing larger than the window can ever be satisfied, and rejecting
+	*  it here also keeps the page count below from overflowing. */
+	if (size > (MMIO_WINDOW_PAGES << 12)) return 0;
+
+	offset = phys & PAGE_FLAG_MASK;
+	base   = phys & PAGE_ADDR_MASK;
+
+	/* Pages spanned by [phys, phys+size), rounded up. offset is below 4096
+	*  and size is at most 16 MiB, so the sum stays well inside 32 bits. */
+	pages = (offset + size + (PAGE_SIZE - 1)) >> 12;
+
+	/* Room left in the window. Written as a subtraction rather than as
+	*  mmio_next_page + pages, which could wrap. */
+	if (pages > MMIO_WINDOW_PAGES - mmio_next_page) return 0;
+
+	first = mmio_next_page;
+	flags = PAGE_PRESENT | PAGE_WRITE | PAGE_NOCACHE | PAGE_WRITETHROUGH;
+
+	for (i = 0; i < pages; i++)
+	{
+		virt = MMIO_WINDOW_BASE + ((first + i) << 12);
+
+		/* The active space is as good as any other here: the table
+		*  behind this address is the same physical table in every
+		*  directory, so the entry lands in all of them at once, and
+		*  going through the active one gets the invlpg for free. The
+		*  call cannot need a new table - mmio_reserve_tables() made
+		*  them all - so the pmm is not touched. */
+		if (map_page(active_space(), virt, base + (i << 12), flags) != 0)
+		{
+			/* Should not happen. Undo the partial mapping and leave
+			*  the bump pointer where it was, so the window does not
+			*  leak on a failed request. */
+			while (i > 0)
+			{
+				i--;
+				unmap_page(active_space(),
+				           MMIO_WINDOW_BASE + ((first + i) << 12));
+			}
+			return 0;
+		}
+	}
+
+	mmio_next_page += pages;
+
+	return (void *)(MMIO_WINDOW_BASE + (first << 12) + offset);
 }
 
 /* --- Address spaces -------------------------------------------------------
@@ -576,6 +801,16 @@ void vmm_init(void)
 *  entries do not belong to the space that holds them. Handing one of their
 *  tables back to the pmm would pull the kernel's own mapping out from under
 *  every other space at once.
+*
+*  The second consequence is that a space only ever learns about kernel
+*  directory entries that existed when it was created. A kernel mapping placed
+*  into an existing table is seen everywhere immediately; one that needs a new
+*  table is seen only by the directory that was in CR3 at the time. All of RAM
+*  is mapped by vmm_init(), and so are the four empty tables of the MMIO window
+*  - see mmio_reserve_tables() - so every kernel table this system will ever use
+*  exists before the first vmm_create_space(). Any future kernel range that
+*  needs its own table has to be reserved the same way, in vmm_init(); adding
+*  one later is the bug this note exists to prevent.
 */
 
 addrspace_t vmm_kernel_space(void)

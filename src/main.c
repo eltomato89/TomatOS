@@ -13,6 +13,8 @@
 #include <ata.h>
 #include <fat.h>
 #include <vga.h>
+#include <fbcon.h>
+#include <multiboot.h>
 //#include <wmessages.h>
 
 #define NULL 0
@@ -344,6 +346,31 @@ extern char usertext_end[];
 /* The text screen is 80 by 25 cells of one character plus one attribute. */
 #define GFX_TEXT_CELLS   (80 * 25)
 
+/* Width of the label column of "gfx -i", counted from the start of the line
+*  including the two leading spaces. The labels below carry their padding
+*  literally, the way every other table in this file does -- printf() has no
+*  field widths, so a "%-15s" is not available and would only hide where the
+*  column actually is. */
+#define GFX_INFO_LABEL   17
+
+/* --- what the bootloader reported ----------------------------------------
+*
+*  kernel.c owns this record: it reads the framebuffer fields out of the
+*  multiboot info once, at boot, and hands them out through these accessors.
+*  There is no framebuffer.h yet -- the comment above framebuffer_init() in
+*  kernel.c says why, and says that a user declares what it needs until there
+*  is one. This is that declaration.
+*
+*  The values are what the BOOTLOADER said. Whether the framebuffer console
+*  is actually driving the screen is a different question and is asked of
+*  fbcon.h, which is why "gfx -i" prints both. */
+extern uint32_t fb_base(void);           /* physical base, 0 = none reported */
+extern uint32_t fb_pitch_bytes(void);    /* bytes per row, NOT width * bpp/8 */
+extern uint32_t fb_pixel_width(void);
+extern uint32_t fb_pixel_height(void);
+extern uint32_t fb_bits_per_pixel(void);
+extern uint32_t fb_kind(void);           /* MULTIBOOT_FRAMEBUFFER_*          */
+
 void update_infobar() {
 	while(1)
 	{
@@ -419,6 +446,9 @@ static void gfx_draw_picture(void);
 static void gfx_show(void);
 static void gfx_selftest(void);
 static void gfx_check(int ok);
+static const char *gfx_mode_kind(void);
+static void gfx_info_label(const char *label);
+static void gfx_show_mode(void);
 
 /* Self-test counters, maintained by mem_check(). */
 static int mem_tests_run = 0;
@@ -3298,6 +3328,169 @@ static void gfx_show(void)
 	       VGA_WIDTH, VGA_HEIGHT);
 }
 
+/* --- gfx -i: the mode the machine actually came up in ---------------------
+*
+*  Two different things are reported here and they must not be conflated.
+*  What the BOOTLOADER set is a property of the machine: kernel.c read it out
+*  of the multiboot info at boot and hands it out through fb_base() and its
+*  neighbours. Whether the framebuffer CONSOLE took that mode over is a
+*  decision fbcon_activate() made afterwards, and it can perfectly well have
+*  gone the other way -- a mode was reported and the mapping failed, or the
+*  mode is the EGA text buffer and there was never anything to take over.
+*  Both halves are printed, and the last line says how they came out.
+*
+*  It reads on a text mode boot too, which is still the normal case for
+*  "make run" and for the GRUB path: the framebuffer block is simply left
+*  out when nothing was reported, and the console lines then say the VGA text
+*  console has the screen. */
+
+/* Name of a multiboot framebuffer type. The same four cases kernel.c prints
+*  in its boot line; kept here rather than exported because the string is
+*  presentation, not state. */
+static const char *gfx_mode_kind(void)
+{
+	switch(fb_kind())
+	{
+		case MULTIBOOT_FRAMEBUFFER_INDEXED:  return "indexed";
+		case MULTIBOOT_FRAMEBUFFER_RGB:      return "RGB";
+		case MULTIBOOT_FRAMEBUFFER_EGA_TEXT: return "EGA text";
+		default:                             return "unknown";
+	}
+}
+
+/* The label column: two spaces, the label, and blanks up to GFX_INFO_LABEL.
+*  printf() has no field widths, so the padding is counted out here -- the
+*  same idea as mem_print_right(), only on the other side of the text. The
+*  labels differ in length by seven characters, and a column maintained by
+*  hand in nine format strings is a column that drifts. */
+static void gfx_info_label(const char *label)
+{
+	int used;
+
+	printf("  %s", label);
+
+	used = 2 + (int)strlen(label);
+	while(used < GFX_INFO_LABEL)
+	{
+		putch(' ');
+		used++;
+	}
+}
+
+static void gfx_show_mode(void)
+{
+	const char *info;
+	uint32_t phys;
+	uint32_t virt;
+	int reported;
+	int graphics_mode;
+
+	phys = fb_base();
+	info = fbcon_info();
+	if(info == 0) info = "no description";
+
+	/* A base address of zero is the "nothing reported" case: kernel.c leaves
+	   its record untouched when the multiboot info carries no framebuffer
+	   bit, which is what GRUB Legacy always does and what GRUB 2 does for a
+	   boot that asked for no video mode. A REPORTED EGA text framebuffer is
+	   something else again -- GRUB 2 describes the 80x25 buffer at 0xB8000
+	   that way -- and it is a framebuffer with an address and a pitch that
+	   simply must not be drawn into. Hence two flags, not one. */
+	reported = (phys != 0);
+	graphics_mode = (reported && fb_kind() != MULTIBOOT_FRAMEBUFFER_EGA_TEXT);
+
+	printf("Framebuffer mode:\n");
+
+	gfx_info_label("Reported:");
+
+	if(!reported)
+	{
+		printf("nothing, the bootloader set no video mode\n");
+	}
+	else
+	{
+		printf("%s (multiboot type %i)\n", gfx_mode_kind(), (int)fb_kind());
+
+		gfx_info_label("Resolution:");
+		mem_print_right(fb_pixel_width(), 5);
+		printf(" x ");
+		mem_print_right(fb_pixel_height(), 5);
+		printf(", ");
+		mem_print_right(fb_bits_per_pixel(), 3);
+		printf(" bpp\n");
+
+		/* The pitch is the one number that cannot be derived: rows are
+		   commonly padded, so it is not width * bpp / 8, and computing a row
+		   offset from the width is the classic way to get a picture that
+		   slants across the screen. The total behind it is pitch times
+		   height, i.e. the memory the mode really occupies. */
+		gfx_info_label("Pitch:");
+		mem_print_right(fb_pitch_bytes(), 5);
+		printf(" bytes per row, ");
+		mem_print_right((fb_pitch_bytes() * fb_pixel_height()) / 1024u, 6);
+		printf(" KiB total\n");
+
+		gfx_info_label("Physical:");
+		page_print_hex(phys, 8);
+		printf("\n");
+
+		/* Two different virtual addresses could answer here, and conflating
+		   them would be the mistake. A framebuffer inside the direct mapping
+		   -- the EGA text buffer at 0xB8000 is one -- has an alias P2V()
+		   names, and that alias is the answer. QEMU's card at 0xFD000000 is
+		   above DIRECT_MAP_LIMIT and has no alias at all; it is reachable
+		   only through the window fbcon_activate() mapped for it. That
+		   address belongs to fbcon, so the fbcon line below names it rather
+		   than this one inventing a second source of truth for it. */
+		virt = (phys <= DIRECT_MAP_LIMIT) ? (uint32_t)P2V(phys) : 0;
+
+		gfx_info_label("Virtual:");
+		if(virt != 0 && vmm_is_mapped(virt))
+		{
+			page_print_hex(virt, 8);
+			printf(" (direct mapping)\n");
+		} else {
+			printf("no direct mapping, see the fbcon line\n");
+		}
+	}
+
+	/* The console geometry is fbcon's own and is zero whenever there is no
+	   framebuffer console -- which, read next to the line under it, says
+	   exactly the right thing rather than looking like a missing number. */
+	gfx_info_label("Console:");
+	mem_print_right((uint32_t)fbcon_cols(), 5);
+	printf(" x ");
+	mem_print_right((uint32_t)fbcon_rows(), 5);
+	printf(" characters\n");
+
+	gfx_info_label("In charge:");
+	if(fbcon_active())
+	{
+		printf("framebuffer console\n");
+	} else {
+		printf("VGA text console, 80 x 25 characters\n");
+	}
+
+	gfx_info_label("fbcon:");
+	printf("%s\n", info);
+
+	/* The marker only appears where there is a pass and a fail to tell
+	   apart. A text mode boot is the normal case for "make run" and for the
+	   GRUB path, not a failure, so it gets no [FAILED]. A graphics mode that
+	   was reported and then not taken over is the case worth flagging: the
+	   screen would be showing nothing at all, and this line would be one of
+	   the things nobody could read. */
+	if(graphics_mode)
+	{
+		if(fbcon_active())
+		{
+			printf("  [  OK  ] The reported graphics mode is on the screen.\n");
+		} else {
+			printf("  [FAILED] The graphics mode was not taken over.\n");
+		}
+	}
+}
+
 /* Records the result of a check, like mem_check() does for the heap. */
 static void gfx_check(int ok)
 {
@@ -3436,10 +3629,15 @@ void graphics(char *cmd)
 	if(strcmp(opt, "-t") == 0)
 	{
 		gfx_selftest();
+	}
+	else if(strcmp(opt, "-i") == 0)
+	{
+		gfx_show_mode();
 	} else {
-		printf("Syntax: gfx [-t]\n");
+		printf("Syntax: gfx [-t] [-i]\n");
 		printf("\t          Draw the demo picture, any key returns\n");
 		printf("\t-t        Run the graphics mode self-test\n");
+		printf("\t-i        Show the mode the machine booted into\n");
 	}
 }
 
@@ -3459,7 +3657,8 @@ void help(void)
 	printf("\tls        ls [PATH] lists a directory, the root without PATH\n");
 	printf("\tcat       cat PATH prints a file as text\n");
 	printf("\tdf        Show the mounted filesystem and the drives found\n");
-	printf("\tgfx       Draw the graphics demo, gfx -t tests mode 13h\n");
+	printf("\tgfx       Draw the graphics demo, gfx -t tests mode 13h,\n");
+	printf("\t          gfx -i shows the mode the machine booted into\n");
 	printf("\treboot    Restart the computer\n");
 	printf("\texit      Exit the shell\n");
 }

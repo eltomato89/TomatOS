@@ -99,6 +99,22 @@ extern uint32_t vmm_directory_phys(void);
 /* Faulting address of the last page fault, taken from CR2 by the handler. */
 extern uint32_t vmm_read_cr2(void);
 
+/* Maps memory mapped hardware that is NOT RAM -- a card's linear
+*  framebuffer, for instance. Such a range lies outside everything the pmm
+*  knows, so P2V() says nothing about it and nothing maps it on its own.
+*
+*  Returns a kernel pointer to the byte at phys, or 0. phys need not be page
+*  aligned; the offset within the page is preserved. The mapping is
+*  uncached, lives in a window at the top of the kernel half, and is never
+*  released -- hardware windows are claimed once at bring-up.
+*
+*  It is visible in every address space, because the page tables covering
+*  that window are created while vmm_init() runs and are therefore copied
+*  into every space made later. Any future kernel range needing a fresh
+*  page table has to be reserved the same way and at the same time, or it
+*  would exist only in whichever directory happened to be active. */
+extern void *vmm_map_mmio(uint32_t phys, uint32_t size);
+
 /* --- Address spaces ------------------------------------------------------
 *
 *  Every task can own a page directory. The upper quarter of it -- entries
