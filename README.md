@@ -228,6 +228,33 @@ by the hardware in that mode, but they would still move the cursor and
 scroll a screen the saved copy no longer matches. The status bar task is
 suspended for the duration for the same reason.
 
+### Booting without GRUB
+
+`make bootdisk` builds `build/tomatos_boot.img`, which carries its own boot
+chain — no GRUB involved. `make run-bootdisk` boots it as a hard disk.
+
+```
+LBA 0        stage 1, sharing the boot sector with the FAT16 BPB
+LBA 1 .. 16  stage 2
+LBA 17 ..    the kernel, as a flat image
+LBA 528 ..   the FAT16 filesystem the kernel then mounts
+```
+
+Stage 2 and the kernel live in the volume's **reserved sectors**, the area
+a FAT filesystem sets aside before its first FAT. So the boot chain needs no
+FAT reader in assembly, and the filesystem stays perfectly ordinary.
+
+The handover is deliberately identical to GRUB's: `eax = 0x2BADB002` and
+`ebx` pointing at a multiboot info structure that stage 2 fills in itself —
+memory map from `int 15h/E820`, and the framebuffer fields from VBE. Both
+boot paths therefore remain available, and the kernel cannot tell them apart.
+
+**The reason for doing this at all:** stage 2 runs in real mode, where
+`int 0x10` is available. That is the only place a VBE mode such as 1024x768
+can be set — from protected mode it is unreachable without a v86 monitor.
+The kernel cannot establish a high resolution mode by itself, so whoever
+boots it has to.
+
 ## On real hardware
 
 `make iso` produces an image that boots via **legacy BIOS/CSM**. It goes onto

@@ -44,9 +44,11 @@ AS          := nasm
 LD          := ld
 QEMU        := qemu-system-i386
 GRUB_MKRESCUE := grub-mkrescue
+OBJCOPY     := objcopy
 MCOPY       := mcopy
 MFORMAT     := mformat
 MMD         := mmd
+MDIR        := mdir
 
 # mtools refuses to touch a plain file that does not look like a device it
 # knows unless told not to check. Every mtools call below is on a regular
@@ -228,6 +230,138 @@ DISK_SIZE_MB    := $(shell expr \( $(DISK_TOTAL_SECS) + 1024 \) / 2048)
 # BIOS boot order does have to be forced there, see the run-iso target.
 QEMU_DISK := -drive file=$(notdir $(DISK)),format=raw,index=0,media=disk
 
+# ===========================================================================
+#  The own boot chain -- stage 1, stage 2, flat kernel, all on one disk
+#
+#  This is the GRUB-free path: the BIOS loads LBA 0, stage 1 loads stage 2,
+#  stage 2 loads the kernel and enters it with the Multiboot register
+#  contract GRUB would have used. See boot/layout.inc, which is the single
+#  source of truth for the sector layout -- the numbers below are READ OUT of
+#  it rather than repeated here, so the two cannot drift apart.
+#
+#      LBA 0            stage 1, sharing the boot sector with the FAT16 BPB
+#      LBA 1 .. 16      stage 2                       (8 KiB)
+#      LBA 17 .. 527    kernel, flat image            (255 KiB)
+#      LBA 528 ..       the FAT16 filesystem proper
+#
+#  The ISO path deliberately keeps GRUB. The kernel is entered identically
+#  either way, so having both is a check on the handover, not duplication.
+# ===========================================================================
+BOOT_DIR    := boot
+LAYOUT_INC  := $(BOOT_DIR)/layout.inc
+
+STAGE1_SRC  := $(BOOT_DIR)/stage1.asm
+STAGE2_SRC  := $(BOOT_DIR)/stage2.asm
+
+# Every .inc in boot/ is an include candidate for both stages (layout.inc,
+# vbe.inc, ...). Wildcarded, so a new one is picked up without editing this
+# file and a not-yet-written one does not break the parse.
+BOOT_INCS   := $(wildcard $(BOOT_DIR)/*.inc)
+
+STAGE1_BIN  := $(BUILD_DIR)/stage1.bin
+STAGE2_BIN  := $(BUILD_DIR)/stage2.bin
+KERNEL_BIN  := $(BUILD_DIR)/kernel.bin
+BOOTIMG     := $(BUILD_DIR)/tomatos_boot.img
+
+# Pull one "NAME equ <decimal>" out of layout.inc. The fallback after the
+# comma is what the layout said when this block was written; it only ever
+# applies if layout.inc has gone missing, in which case the size checks
+# below would otherwise silently compare against nothing.
+layout_value = $(or $(shell awk '$$1 == "$(1)" && $$2 == "equ" { print $$3; exit }' \
+                            $(LAYOUT_INC) 2>/dev/null),$(2))
+
+STAGE2_LBA         := $(call layout_value,STAGE2_LBA,1)
+STAGE2_SECTORS     := $(call layout_value,STAGE2_SECTORS,16)
+KERNEL_LBA         := $(call layout_value,KERNEL_LBA,17)
+KERNEL_MAX_SECTORS := $(call layout_value,KERNEL_MAX_SECTORS,511)
+RESERVED_SECTORS   := $(call layout_value,RESERVED_SECTORS,528)
+
+KERNEL_MAX_BYTES   := $(shell expr $(KERNEL_MAX_SECTORS) \* 512)
+
+# ---------------------------------------------------------------------------
+#  >>> HOW THE KERNEL'S SIZE REACHES STAGE 2 <<<
+#  >>> the contract between this file and boot/stage2.asm -- change one and <<<
+#  >>> you must change the other <<<
+#
+#  Stage 2 must not read 511 sectors when the kernel is 168: everything past
+#  the image is filesystem, reading it is slow, and a flat image has no
+#  length of its own once objcopy has thrown the ELF headers away. So the
+#  BUILD writes the length down and stage 2 reads it back out of itself.
+#
+#  stage2.asm opens with a small patchable header, deliberately at the very
+#  front where nothing can move underneath it:
+#
+#      file offset  0 ..  3   jmp s2_start, padded to 4 bytes
+#      file offset  4 .. 11   the ASCII magic "TOMATOS2"
+#      file offset 12 .. 15   dd, kernel size in 512 byte sectors, LE
+#
+#  The Makefile patches offset 12 IN THE IMAGE, not in $(STAGE2_BIN): the
+#  .bin stays exactly what nasm produced, and the copy at LBA $(STAGE2_LBA) of
+#  $(BOOTIMG) carries the real number. Disk byte offset of the field:
+#
+#      $(STAGE2_LBA) * 512 + 12
+#
+#  The magic at offset 4 is checked before the patch is written. It is the
+#  entire safety net -- without it a reordered stage2.asm would have four of
+#  its instruction bytes silently replaced by a sector count, and the failure
+#  would show up as a triple fault with no explanation.
+#
+#  Stage 2's built-in default is KERNEL_MAX_SECTORS, so an UNPATCHED
+#  stage2.bin still boots; it just reads the whole reserved area. That is why
+#  the patch has to be verified rather than trusted to be obviously missing.
+#
+#  Stage 2 also clamps the value to KERNEL_MAX_SECTORS at run time, so a
+#  corrupt field cannot make it read past LBA $(RESERVED_SECTORS) into the
+#  filesystem.
+# ---------------------------------------------------------------------------
+S2HDR_MAGIC      := TOMATOS2
+S2HDR_MAGIC_OFF  := 4
+S2HDR_SECTORS_OFF := 12
+# Where those two live in the finished image.
+S2HDR_MAGIC_DISK_OFF   := $(shell expr $(STAGE2_LBA) \* 512 + $(S2HDR_MAGIC_OFF))
+S2HDR_SECTORS_DISK_OFF := $(shell expr $(STAGE2_LBA) \* 512 + $(S2HDR_SECTORS_OFF))
+
+# ---------------------------------------------------------------------------
+#  How big stage 2 is allowed to get
+#
+#  Two ceilings, and the lower one wins:
+#
+#    1. the sectors layout.inc reserves,  STAGE2_SECTORS * 512
+#    2. the distance from STAGE2_ORG up to DISK_BUFFER
+#
+#  The second one exists because stage 2 is loaded at STAGE2_ORG and then
+#  reads disk sectors into DISK_BUFFER. If the buffer sits inside the span
+#  stage 1 loaded, everything stage 2 has above it is overwritten by its own
+#  first read -- and only once stage 2 has grown that far, which is a
+#  spectacularly unpleasant way to find out. layout.inc has DISK_BUFFER at
+#  0xA000, immediately above the 8 KiB at 0x8000, so today the two ceilings
+#  coincide at 8192 and nothing is wasted. Both are read out of layout.inc
+#  rather than written down, so moving either one here needs no edit.
+#
+#  stage2.asm asserts the same thing itself with a %error at s2_end. The
+#  check in the $(STAGE2_BIN) rule is the second line of defence, so a build
+#  still breaks with a readable message if that assertion is ever removed.
+# ---------------------------------------------------------------------------
+# Same as layout_value, but for the hex constants.
+layout_hex = $(shell awk '$$1 == "$(1)" && $$2 == "equ" { print strtonum($$3); exit }' \
+                     $(LAYOUT_INC) 2>/dev/null)
+
+STAGE2_ORG         := $(or $(call layout_hex,STAGE2_ORG),32768)
+DISK_BUFFER        := $(or $(call layout_hex,DISK_BUFFER),40960)
+
+STAGE2_AREA_BYTES  := $(shell expr $(STAGE2_SECTORS) \* 512)
+STAGE2_HEADROOM    := $(shell expr $(DISK_BUFFER) - $(STAGE2_ORG))
+STAGE2_MAX_BYTES   := $(shell if [ $(STAGE2_HEADROOM) -lt $(STAGE2_AREA_BYTES) ]; \
+                              then echo $(STAGE2_HEADROOM); \
+                              else echo $(STAGE2_AREA_BYTES); fi)
+
+# How the boot image is handed to QEMU: the same IDE 0 master the kernel's
+# ata.c talks to, only now the BIOS boots from it as well. No -kernel, no
+# -initrd, no -cdrom, no GRUB anywhere -- the whole point of the target.
+# -boot c is the default already; it is spelled out so nothing in the
+# neighbouring -boot d of run-iso can be mistaken for load bearing here.
+QEMU_BOOTDISK := -drive file=$(notdir $(BOOTIMG)),format=raw,index=0,media=disk -boot c
+
 # ---------------------------------------------------------------------------
 #  Multiboot modules under "-kernel"
 #
@@ -375,7 +509,8 @@ endef
 # ===========================================================================
 #  Targets
 # ===========================================================================
-.PHONY: all user run iso run-iso floppy run-floppy disk debug usb clean help
+.PHONY: all user run iso run-iso floppy run-floppy disk bootdisk run-bootdisk \
+        debug usb clean help
 
 all: $(KERNEL) user
 
@@ -514,21 +649,37 @@ run-floppy: $(FLOPPY)
 # eight characters and this stays true.
 disk: $(DISK)
 
-# Makefile is a prerequisite because the text files below live in this file:
-# editing their content has to rebuild the image, and so does changing the
-# geometry.
-$(DISK): $(USER_ELFS) Makefile | $(BUILD_DIR)
+# mformat a FAT16 volume into a plain file.
+#   $(1) = image file, $(2) = number of reserved sectors
+#
+# $(DISK) passes 1 (the boot sector and nothing else). $(BOOTIMG) passes
+# $(RESERVED_SECTORS) = 528, which is what keeps the filesystem out of the
+# boot chain's sectors -- mformat then starts the first FAT at LBA 528 and
+# the area below it is ours to write with dd.
+#
+# Raising the reserved count does not endanger the FAT16 classification the
+# geometry block above argues for: it costs 527 sectors out of 65520, so
+#   (65520 - 528 - 2*64 - 32) / 4 = 16208 clusters
+# instead of 16339. Both sit in the middle of the 4085..65524 band. Confirm
+# with "minfo -i <image> ::" -- it prints the reserved count and the type.
+define fat_format
 	$(call need,$(MFORMAT),mtools)
-	@echo "  IMG     $@  ($(DISK_SIZE_MB) MB, C/H/S $(DISK_CYLS)/$(DISK_HEADS)/$(DISK_SECS), FAT16)"
-	@rm -f $@
-	$(MTOOLS_ENV) $(MFORMAT) -C -i $@ \
+	@rm -f $(1)
+	$(MTOOLS_ENV) $(MFORMAT) -C -i $(1) \
 		-t $(DISK_CYLS) -h $(DISK_HEADS) -s $(DISK_SECS) \
-		-c $(DISK_CLUSTER) -H 0 -m $(DISK_MEDIA) -v $(DISK_LABEL) ::
-	@$(MTOOLS_ENV) $(MMD) -i $@ ::/BIN ::/DOCS
+		-c $(DISK_CLUSTER) -H 0 -m $(DISK_MEDIA) -R $(2) -v $(DISK_LABEL) ::
+endef
+
+# Fill a formatted volume with the tree the shell walks. Shared verbatim by
+# $(DISK) and $(BOOTIMG) so the two images differ only in their boot chain,
+# never in their contents.
+#   $(1) = image file
+define fat_populate
+	@$(MTOOLS_ENV) $(MMD) -i $(1) ::/BIN ::/DOCS
 	@for p in $(USER_PROGS); do \
 		u=`echo $$p | tr 'a-z' 'A-Z'`; \
 		echo "  DISK    /BIN/$$u.ELF"; \
-		$(MTOOLS_ENV) $(MCOPY) -o -i $@ $(BUILD_DIR)/$$p.elf ::/BIN/$$u.ELF; \
+		$(MTOOLS_ENV) $(MCOPY) -o -i $(1) $(BUILD_DIR)/$$p.elf ::/BIN/$$u.ELF; \
 	done
 	@echo "  DISK    /README.TXT /MOTD.TXT /DOCS/DISK.TXT"
 	@{ \
@@ -543,11 +694,11 @@ $(DISK): $(USER_ELFS) Makefile | $(BUILD_DIR)
 		echo '  /DOCS   text files, one level down'; \
 		echo ''; \
 		echo 'Rebuild it with "make disk".'; \
-	} | $(MTOOLS_ENV) $(MCOPY) -o -i $@ - ::/README.TXT
+	} | $(MTOOLS_ENV) $(MCOPY) -o -i $(1) - ::/README.TXT
 	@{ \
 		echo 'Welcome to TomatOS.'; \
 		echo 'Ripe since 2011.'; \
-	} | $(MTOOLS_ENV) $(MCOPY) -o -i $@ - ::/MOTD.TXT
+	} | $(MTOOLS_ENV) $(MCOPY) -o -i $(1) - ::/MOTD.TXT
 	@{ \
 		echo 'Disk geometry'; \
 		echo '-------------'; \
@@ -562,8 +713,231 @@ $(DISK): $(USER_ELFS) Makefile | $(BUILD_DIR)
 		echo 'at LBA 0.'; \
 		echo ''; \
 		echo 'If you can read this, directory traversal works.'; \
-	} | $(MTOOLS_ENV) $(MCOPY) -o -i $@ - ::/DOCS/DISK.TXT
+	} | $(MTOOLS_ENV) $(MCOPY) -o -i $(1) - ::/DOCS/DISK.TXT
+endef
+
+# Makefile is a prerequisite because the text files above live in this file:
+# editing their content has to rebuild the image, and so does changing the
+# geometry.
+$(DISK): $(USER_ELFS) Makefile | $(BUILD_DIR)
+	@echo "  IMG     $@  ($(DISK_SIZE_MB) MB, C/H/S $(DISK_CYLS)/$(DISK_HEADS)/$(DISK_SECS), FAT16)"
+	$(call fat_format,$@,1)
+	$(call fat_populate,$@)
 	@echo "  Disk ready: $@"
+
+# ===========================================================================
+#  The own boot chain
+# ===========================================================================
+
+# --- stage 1 ---------------------------------------------------------------
+# 512 bytes exactly, ending in 0x55AA. Not "at most 512": stage 1 IS the boot
+# sector, so a short binary would mean the signature is missing and a long
+# one that nasm has silently produced something no BIOS will ever load.
+$(STAGE1_BIN): $(STAGE1_SRC) $(BOOT_INCS) | $(BUILD_DIR)
+	$(call need,$(AS),nasm)
+	@echo "  AS/B    $< -> $@"
+	$(AS) -f bin -I $(BOOT_DIR) $< -o $@
+	@sz=`stat -c%s $@`; \
+	 if [ "$$sz" != "512" ]; then \
+		printf '\nERROR: %s is %s bytes, must be exactly 512.\n' '$@' "$$sz"; \
+		printf '       Stage 1 is the boot sector. Pad it with\n'; \
+		printf '           times 510-($$-$$$$) db 0\n'; \
+		printf '           dw 0xAA55\n'; \
+		printf '       and make sure nothing follows.\n\n'; \
+		rm -f $@; exit 1; \
+	 fi; \
+	 sig=`od -An -tx1 -j 510 -N 2 $@ | tr -d ' \n'`; \
+	 if [ "$$sig" != "55aa" ]; then \
+		printf '\nERROR: %s does not end in the 0x55AA boot signature (found %s).\n\n' '$@' "$$sig"; \
+		rm -f $@; exit 1; \
+	 fi
+
+# --- stage 2 ---------------------------------------------------------------
+# Size capped (see the STAGE2_MAX_BYTES block at the top), and the patchable
+# header checked: the "TOMATOS2" magic at offset 4 has to be there, because
+# the boot image rule is about to overwrite offset 12..15 with the kernel's
+# sector count and has no other way of knowing it is aiming at the right
+# bytes.
+$(STAGE2_BIN): $(STAGE2_SRC) $(BOOT_INCS) | $(BUILD_DIR)
+	$(call need,$(AS),nasm)
+	@echo "  AS/B    $< -> $@"
+	$(AS) -f bin -I $(BOOT_DIR) $< -o $@
+	@sz=`stat -c%s $@`; \
+	 if [ "$$sz" -gt "$(STAGE2_MAX_BYTES)" ]; then \
+		printf '\nERROR: stage 2 is %s bytes, the limit is %s.\n' "$$sz" '$(STAGE2_MAX_BYTES)'; \
+		printf '       boot/layout.inc reserves %s sectors (%s bytes) at LBA %s,\n' \
+		       '$(STAGE2_SECTORS)' '$(STAGE2_AREA_BYTES)' '$(STAGE2_LBA)'; \
+		printf '       and leaves %s bytes between STAGE2_ORG and DISK_BUFFER.\n' \
+		       '$(STAGE2_HEADROOM)'; \
+		printf '       The smaller of the two is the limit. Refusing to build an\n'; \
+		printf '       image that would be truncated on disk or overwritten in RAM.\n\n'; \
+		rm -f $@; exit 1; \
+	 fi; \
+	 magic=`dd if=$@ bs=1 skip=$(S2HDR_MAGIC_OFF) count=8 status=none`; \
+	 if [ "$$magic" != '$(S2HDR_MAGIC)' ]; then \
+		printf '\nERROR: no "%s" magic at offset %s of %s (found "%s").\n' \
+		       '$(S2HDR_MAGIC)' '$(S2HDR_MAGIC_OFF)' '$@' "$$magic"; \
+		printf '       The kernel size is patched into offset %s of this file,\n' \
+		       '$(S2HDR_SECTORS_OFF)'; \
+		printf '       and the magic is what proves those bytes are the header\n'; \
+		printf '       and not instructions. Restore the s2_magic / \n'; \
+		printf '       s2_kernel_sectors block at the top of %s.\n\n' '$<'; \
+		rm -f $@; exit 1; \
+	 fi; \
+	 echo "  Stage 2: $$sz / $(STAGE2_MAX_BYTES) bytes used, header magic OK"
+
+# --- the kernel as a flat image --------------------------------------------
+# objcopy -O binary walks the ALLOC sections and places each one at
+#   (section LMA - lowest LMA)
+# in the output. That is exactly what stage 2 needs: it can read the file
+# into KERNEL_PHYS (0x00100000) sector by sector and be done, with no ELF
+# parsing in real mode.
+#
+# The higher-half link makes that worth verifying rather than assuming. Every
+# section has a VMA of 0xC01xxxxx and an LMA of 0x001xxxxx; if objcopy went
+# by VMA the image would be identical anyway, because the two differ by the
+# same constant everywhere. The check below is therefore not "did it use the
+# LMA" -- it is the stronger and more useful "does the file that comes out
+# match the program headers", i.e.
+#
+#   1. the flat size equals (highest LMA + FileSiz) - (lowest LMA), so no
+#      section was dropped and no gap was mis-sized, and
+#   2. the first LOAD segment's bytes appear at offset 0 of the flat image,
+#      read straight out of the ELF at its own file offset. .rodata makes
+#      this a real test: its ELF file offset is 0x10000 but its address puts
+#      it at 0x0F000 in the flat image, so a plain "cat of the ELF" or an
+#      off-by-a-section layout could not pass.
+#
+# And the Multiboot header: it must lie within the first 8 KiB of the image,
+# 4 byte aligned. It is NOT at offset 0 -- src/start.asm puts the entry point
+# first and the header just after it, currently at 0x5C -- and that is the
+# right way round here, because stage 2 enters the image at its first byte.
+# The rule prints where it found the magic so a reshuffle of start.asm cannot
+# quietly push it past 8 KiB and break the GRUB path instead.
+$(KERNEL_BIN): $(KERNEL) | $(BUILD_DIR)
+	@echo "  OBJCOPY $< -> $@  (flat, no ELF headers)"
+	$(OBJCOPY) -O binary $< $@
+	@set -e; \
+	 lo=; hi=0; foff=; fsz=; \
+	 for e in `readelf -lW $< | awk '/^  LOAD/ { print $$2 ":" $$4 ":" $$5 }'`; do \
+	   o=$$(( $${e%%:*} )); r=$${e#*:}; l=$$(( $${r%%:*} )); f=$$(( $${r##*:} )); \
+	   if [ -z "$$lo" ] || [ $$l -lt $$lo ]; then lo=$$l; foff=$$o; fsz=$$f; fi; \
+	   if [ $$((l + f)) -gt $$hi ]; then hi=$$((l + f)); fi; \
+	 done; \
+	 span=$$((hi - lo)); actual=`stat -c%s $@`; \
+	 if [ "$$span" != "$$actual" ]; then \
+	   printf '\nERROR: flat image is %s bytes, the load addresses span %s.\n' "$$actual" "$$span"; \
+	   printf '       objcopy did not lay the image out the way the program\n'; \
+	   printf '       headers describe it. Check linker.ld and readelf -l.\n\n'; \
+	   rm -f $@; exit 1; \
+	 fi; \
+	 dd if=$@ bs=1 count=$$fsz status=none > $@.head; \
+	 if ! dd if=$< bs=1 skip=$$foff count=$$fsz status=none | cmp -s - $@.head; then \
+	   printf '\nERROR: the first LOAD segment is not at offset 0 of %s.\n\n' '$@'; \
+	   rm -f $@ $@.head; exit 1; \
+	 fi; \
+	 rm -f $@.head; \
+	 mb=`od -Ad -tx4 -N 8192 -v $@ | \
+	     awk '{ for (i = 2; i <= NF; i++) \
+	              if ($$i == "1badb002") { print $$1 + (i - 2) * 4; exit } }'`; \
+	 if [ -z "$$mb" ]; then \
+	   printf '\nERROR: no Multiboot header (0x1BADB002) in the first 8 KiB of %s.\n' '$@'; \
+	   printf '       The GRUB / -kernel paths would stop booting. Check that\n'; \
+	   printf '       src/start.asm still carries it and that linker.ld keeps\n'; \
+	   printf '       start.o at the front of .text.\n\n'; \
+	   rm -f $@; exit 1; \
+	 fi; \
+	 secs=$$(( (actual + 511) / 512 )); \
+	 if [ "$$secs" -gt "$(KERNEL_MAX_SECTORS)" ]; then \
+	   printf '\nERROR: kernel is %s sectors (%s bytes), the limit is %s.\n' \
+	          "$$secs" "$$actual" '$(KERNEL_MAX_SECTORS)'; \
+	   printf '       boot/layout.inc gives the kernel LBA %s..%s. Growing past\n' \
+	          '$(KERNEL_LBA)' "`expr $(KERNEL_LBA) + $(KERNEL_MAX_SECTORS) - 1`"; \
+	   printf '       that would write into the FAT16 volume at LBA %s.\n' '$(RESERVED_SECTORS)'; \
+	   printf '       Raise KERNEL_MAX_SECTORS and RESERVED_SECTORS together,\n'; \
+	   printf '       or shrink the kernel.\n\n'; \
+	   rm -f $@; exit 1; \
+	 fi; \
+	 echo "  Kernel:  $$actual bytes = $$secs / $(KERNEL_MAX_SECTORS) sectors," \
+	      "Multiboot header at offset $$mb"
+
+# --- the bootable image ----------------------------------------------------
+# Everything the disk image is, plus the boot chain in the reserved sectors.
+#
+# THE BOOT SECTOR IS WRITTEN IN TWO PIECES, and that is the whole trick:
+# mformat has just put a BPB there and the kernel's own fat_mount() reads it
+# back after boot, so overwriting all 512 bytes with stage 1 would produce a
+# disk that boots and then cannot find its filesystem.
+#
+#   bytes 0x00..0x02   the jump over the BPB          -> from stage 1
+#   bytes 0x03..0x3D   OEM name and BPB               -> mformat's, untouched
+#   bytes 0x3E..0x1FF  code and the 0x55AA signature  -> from stage 1
+#
+# So: 3 bytes at offset 0, then 450 bytes at offset 62, both conv=notrunc.
+# Stage 1 must reserve 0x03..0x3D itself (a "times 90-($$-$$$$) db 0" after
+# its jump, or an assembled dummy BPB) -- whatever it puts there is simply
+# not copied.
+bootdisk: $(BOOTIMG)
+
+$(BOOTIMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_BIN) $(USER_ELFS) Makefile | $(BUILD_DIR)
+	@echo "  IMG     $@  ($(DISK_SIZE_MB) MB, FAT16, $(RESERVED_SECTORS) reserved sectors)"
+	$(call fat_format,$@,$(RESERVED_SECTORS))
+	$(call fat_populate,$@)
+	@echo "  BOOT    LBA 0        stage 1  (jump + code, BPB preserved)"
+	@dd if=$(STAGE1_BIN) of=$@ bs=1 count=3 conv=notrunc status=none
+	@dd if=$(STAGE1_BIN) of=$@ bs=1 skip=62 seek=62 count=450 conv=notrunc status=none
+	@echo "  BOOT    LBA $(STAGE2_LBA)        stage 2  (`stat -c%s $(STAGE2_BIN)` bytes)"
+	@dd if=$(STAGE2_BIN) of=$@ bs=512 seek=$(STAGE2_LBA) conv=notrunc status=none
+	@# Patch the kernel's length into stage 2's header ON THE DISK. See the
+	@# ">>> HOW THE KERNEL'S SIZE REACHES STAGE 2 <<<" block at the top.
+	@# Check the magic in the image first -- offset 12 is being overwritten
+	@# and there must be no doubt about what is there.
+	@magic=`dd if=$@ bs=1 skip=$(S2HDR_MAGIC_DISK_OFF) count=8 status=none`; \
+	 [ "$$magic" = '$(S2HDR_MAGIC)' ] || { \
+		printf '\nERROR: no "%s" magic at image offset %s.\n\n' \
+		       '$(S2HDR_MAGIC)' '$(S2HDR_MAGIC_DISK_OFF)'; \
+		exit 1; \
+	 }; \
+	 secs=$$(( (`stat -c%s $(KERNEL_BIN)` + 511) / 512 )); \
+	 printf '%02x%02x%02x%02x' \
+	        $$((secs & 255)) $$((secs >> 8 & 255)) \
+	        $$((secs >> 16 & 255)) $$((secs >> 24 & 255)) \
+	   | xxd -r -p > $@.hdr; \
+	 dd if=$@.hdr of=$@ bs=1 seek=$(S2HDR_SECTORS_DISK_OFF) conv=notrunc status=none; \
+	 rm -f $@.hdr; \
+	 got=`od -An -tu4 -j $(S2HDR_SECTORS_DISK_OFF) -N 4 $@ | tr -d ' \n'`; \
+	 [ "$$got" = "$$secs" ] || { \
+		printf '\nERROR: read back %s sectors from image offset %s, wrote %s.\n\n' \
+		       "$$got" '$(S2HDR_SECTORS_DISK_OFF)' "$$secs"; \
+		exit 1; \
+	 }; \
+	 echo "  BOOT    off $(S2HDR_SECTORS_DISK_OFF)   s2_kernel_sectors = $$secs" \
+	      "(stage2.bin itself keeps its $(KERNEL_MAX_SECTORS) default)"
+	@echo "  BOOT    LBA $(KERNEL_LBA)       kernel   (`stat -c%s $(KERNEL_BIN)` bytes, flat)"
+	@dd if=$(KERNEL_BIN) of=$@ bs=512 seek=$(KERNEL_LBA) conv=notrunc status=none
+	@# Prove the two-piece boot sector write did not break the BPB: if the
+	@# BPB were damaged mdir cannot locate the root directory and fails.
+	@$(MTOOLS_ENV) $(MDIR) -i $@ :: > /dev/null || { \
+		printf '\nERROR: the filesystem in %s is no longer readable.\n' '$@'; \
+		printf '       The BPB at 0x03..0x3D was damaged by the boot sector write.\n\n'; \
+		exit 1; \
+	 }
+	@sig=`od -An -tx1 -j 510 -N 2 $@ | tr -d ' \n'`; \
+	 [ "$$sig" = "55aa" ] || { \
+		printf '\nERROR: boot signature at 0x1FE is %s, expected 55aa.\n\n' "$$sig"; \
+		exit 1; \
+	 }
+	@echo "  Boot image ready: $@   (BPB intact, 0x55AA present)"
+
+# Boot it the way a real machine would: BIOS, LBA 0, stage 1. No -kernel,
+# no -initrd, no GRUB, no CD -- if this reaches the shell prompt then the
+# whole chain in boot/ works on its own.
+#
+# The image is also the kernel's data disk: it is one FAT16 volume with the
+# boot chain living in its reserved sectors, so /BIN/HELLO.ELF and the text
+# files are right there for the shell to read.
+run-bootdisk: $(BOOTIMG)
+	$(call run_qemu,$(QEMU_BOOTDISK))
 
 # --- debugging -------------------------------------------------------------
 debug: $(KERNEL) user $(DISK)
@@ -626,6 +1000,15 @@ help:
 	@echo "              ($(DISK_SIZE_MB) MB, C/H/S $(DISK_CYLS)/$(DISK_HEADS)/$(DISK_SECS), 2 KB clusters,"
 	@echo "              unpartitioned - boot sector at LBA 0). Attached as"
 	@echo "              IDE 0 master by run, run-iso and debug."
+	@echo "  bootdisk    Build $(BOOTIMG) -- the same FAT16 volume,"
+	@echo "              plus TomatOS' OWN boot chain in its reserved sectors:"
+	@echo "                LBA 0        stage 1, sharing the sector with the BPB"
+	@echo "                LBA $(STAGE2_LBA) .. $(shell expr $(STAGE2_LBA) + $(STAGE2_SECTORS) - 1)   stage 2"
+	@echo "                LBA $(KERNEL_LBA) .. $(shell expr $(KERNEL_LBA) + $(KERNEL_MAX_SECTORS) - 1)  kernel, flat (objcopy -O binary)"
+	@echo "                LBA $(RESERVED_SECTORS) ..    the filesystem proper"
+	@echo "  run-bootdisk"
+	@echo "              Boot that image in QEMU as a hard disk. No -kernel,"
+	@echo "              no -initrd, no GRUB: the BIOS starts stage 1."
 	@echo "  debug       Start QEMU halted with a GDB stub on :1234"
 	@echo "  usb         dd the ISO onto a USB stick: make usb DEV=/dev/sdX"
 	@echo "  clean       Remove $(BUILD_DIR)/"
@@ -649,6 +1032,22 @@ help:
 	@echo "  Inspect it without booting:"
 	@echo "      minfo -i $(DISK) ::      geometry and FAT type"
 	@echo "      mdir  -i $(DISK) -/ ::   the whole tree"
+	@echo ""
+	@echo "Boot chain contract (make bootdisk) <-> boot/stage2.asm:"
+	@echo "  The kernel's length is patched into the image by the build, so"
+	@echo "  stage 2 need not read all $(KERNEL_MAX_SECTORS) reserved sectors. stage2.asm"
+	@echo "  opens with a header the Makefile writes into:"
+	@echo "      stage2.bin +0 .. +3    jmp s2_start"
+	@echo "      stage2.bin +$(S2HDR_MAGIC_OFF) .. +11   the magic \"$(S2HDR_MAGIC)\", checked, never written"
+	@echo "      stage2.bin +$(S2HDR_SECTORS_OFF) .. +15  dd, kernel size in sectors, patched"
+	@echo "  Patched at image offset $(S2HDR_SECTORS_DISK_OFF) (LBA $(STAGE2_LBA) + $(S2HDR_SECTORS_OFF)); $(STAGE2_BIN)"
+	@echo "  itself keeps its built-in default of $(KERNEL_MAX_SECTORS), so an unpatched"
+	@echo "  stage 2 still boots and just reads more than it needs."
+	@echo "  Size limits, both hard errors and never a silent truncation:"
+	@echo "      stage 2  $(STAGE2_MAX_BYTES) bytes  (min of $(STAGE2_AREA_BYTES) reserved and"
+	@echo "                            $(STAGE2_HEADROOM) between STAGE2_ORG and DISK_BUFFER)"
+	@echo "      kernel   $(KERNEL_MAX_SECTORS) sectors = $(KERNEL_MAX_BYTES) bytes"
+	@echo "  Inspect:  xxd -s $(S2HDR_MAGIC_DISK_OFF) -l 16 $(BOOTIMG)"
 	@echo ""
 
 # Header dependencies generated by -MMD -MP (kept last on purpose).

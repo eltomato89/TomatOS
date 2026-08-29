@@ -34,6 +34,12 @@ PDE_BOOT_FLAGS      equ (PDE_PRESENT | PDE_WRITE | PDE_PAGE_SIZE)
 CR4_PSE             equ 0x00000010   ; page size extensions -> 4 MiB pages
 CR0_PG              equ 0x80000000   ; paging enable
 
+; Bounds of the .bss section, supplied by linker.ld. As VIRTUAL addresses,
+; like every other linker symbol here, so both need the manual correction
+; while paging is still off.
+extern bss_start
+extern bss_end
+
 global start
 start:
     ; ---------------------------------------------------------------------
@@ -42,24 +48,74 @@ start:
     ; address == physical address for the moment.
     ; ---------------------------------------------------------------------
 
+    ; ---------------------------------------------------------------------
+    ; Zero .bss.
+    ;
+    ; This is the FIRST thing that happens, and it has to be, because every
+    ; other piece of state this routine owns lives in .bss: the two multiboot
+    ; slots below, the boot page directory further down, and the stack that
+    ; higher_half switches to. Zeroing after any of them were set up would
+    ; throw exactly that away again.
+    ;
+    ; Why we do it at all: .bss is NOBITS, i.e. it exists in the ELF program
+    ; headers only as memsz > filesz, and GRUB zeroes that difference for us.
+    ; A FLAT image carries no such information -- stage 2 copies a byte count
+    ; off the disk and stops, so whatever the RAM behind the image happened to
+    ; hold becomes our zero-initialised data. Doing it here makes the kernel
+    ; correct under both loaders and dependent on neither.
+    ;
+    ; Paging is off, so bss_start/bss_end -- linked at 0xC0xxxxxx like
+    ; everything else -- have to be corrected to their load addresses by hand.
+    ;
+    ; Register discipline, and this is the subtle part: eax and ebx still hold
+    ; the multiboot handover (see below) and cannot be saved anywhere yet,
+    ; there being no stack. "rep stosd" insists on eax as the pattern, so the
+    ; magic is parked in esi for the duration; ebx, ecx, edx, esi and edi are
+    ; all untouched by the string instruction itself, so ebx simply survives.
+    ;
+    ; The byte count is split into whole dwords plus a tail of at most three
+    ; bytes rather than rounded up: rounding up would write past bss_end, and
+    ; bss_end is only padded to a page boundary by linker.ld AFTER the symbol.
+    ; ---------------------------------------------------------------------
+    cld
+    mov esi, eax                    ; magic out of the way of "rep stosd"
+
+    mov edi, bss_start - KERNEL_VIRTUAL_BASE
+    mov edx, bss_end   - KERNEL_VIRTUAL_BASE
+    sub edx, edi                    ; size of .bss in bytes
+    xor eax, eax
+
+    mov ecx, edx
+    shr ecx, 2
+    rep stosd                       ; the bulk, four bytes at a time
+
+    mov ecx, edx
+    and ecx, 3
+    rep stosb                       ; .bss need not be a multiple of 4
+
     ; Per the Multiboot specification the bootloader hands us the magic
     ; 0x2BADB002 in eax and the physical address of the info structure in ebx.
-    ; Both are saved away first thing: we do not have a stack of our own yet
-    ; (esp still points into the bootloader), so pushing them is not an
-    ; option. From here on eax/ebx may be overwritten freely.
+    ; Both are saved away as soon as .bss can hold them: we do not have a
+    ; stack of our own yet (esp still points into the bootloader), so pushing
+    ; them was never an option. From here on esi/ebx may be overwritten
+    ; freely.
     ;
     ; The two slots live in .bss and are therefore linked at 0xC0xxxxxx, an
     ; address that does not exist yet. Store through their physical aliases.
-    mov [mboot_magic - KERNEL_VIRTUAL_BASE], eax
+    mov [mboot_magic - KERNEL_VIRTUAL_BASE], esi
     mov [mboot_info  - KERNEL_VIRTUAL_BASE], ebx
 
     ; ---------------------------------------------------------------------
     ; Build the boot page directory.
     ;
-    ; It lives in .bss, so nothing guarantees its contents: the Multiboot
-    ; spec asks the bootloader to zero the bss, but we do not want the boot
-    ; path to depend on that, and a stray present bit here would be a triple
-    ; fault with no output at all. Zero all 1024 entries by hand first.
+    ; It lives in .bss and is therefore already zero -- the loop that used to
+    ; clear its 1024 entries here is gone, because the wholesale zeroing above
+    ; covers it. What that loop was defending against was a bootloader that
+    ; does not clear the bss (a stray present bit here is a triple fault with
+    ; no output at all); that job is now done unconditionally by this same
+    ; routine, ten instructions earlier and in plain sight, instead of being
+    ; hoped for from outside. Only the two entries we actually want are
+    ; written.
     ;
     ; 4 MiB pages (CR4.PSE) are used deliberately: two directory entries and
     ; no second level table at all, which means no extra 4 KiB of aligned
@@ -67,13 +123,6 @@ start:
     ; off. A 4 KiB boot table would need 1024 entries filled in a loop for
     ; no benefit -- these mappings are throwaway, vmm_init() replaces them.
     ; ---------------------------------------------------------------------
-    cld
-    mov edi, boot_page_directory - KERNEL_VIRTUAL_BASE
-    xor eax, eax
-    mov ecx, 1024
-    rep stosd
-
-    ; edi has advanced past the end of the directory, reload it.
     mov edi, boot_page_directory - KERNEL_VIRTUAL_BASE
 
     ; PDE 0: identity map the first 4 MiB (virtual 0x00000000 -> physical 0).

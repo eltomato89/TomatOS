@@ -155,6 +155,138 @@ static void print_memory_map(multiboot_info *mbi)
 		total_kib, (total_kib / 1024u), shown);
 }
 
+/* --- The framebuffer the bootloader handed over ---------------------------
+*
+*  A graphics mode cannot be established from protected mode: a VBE mode needs
+*  int 0x10 and that is real mode only. Whoever boots us therefore sets the
+*  mode and describes the result in the multiboot info, and all this kernel
+*  can do is read what it got. GRUB reports the plain EGA text buffer here
+*  when no video mode was requested; our own stage 2 reports whatever VBE mode
+*  it selected before leaving real mode.
+*
+*  The description is kept in file statics with the accessors below rather
+*  than in a struct in a header, because no header may be touched in this
+*  step. What this really wants to be is one "struct framebuffer" and a
+*  "const struct framebuffer *fb_info(void)" in a src/include/framebuffer.h -
+*  seven accessors for what is one immutable record are six too many, and a
+*  framebuffer console would have to call all of them to draw a single pixel.
+*  Until that header exists, a user declares what it needs:
+*
+*      extern uint32_t fb_base(void);          physical base address
+*      extern uint32_t fb_pitch_bytes(void);   bytes per row
+*      extern uint32_t fb_pixel_width(void);
+*      extern uint32_t fb_pixel_height(void);
+*      extern uint32_t fb_bits_per_pixel(void);
+*      extern uint32_t fb_kind(void);          MULTIBOOT_FRAMEBUFFER_*
+*      extern int      fb_usable(void);        safe to write to right now
+*/
+static uint32_t fb_addr;	/* physical base, 0 = nothing was reported   */
+static uint32_t fb_pitch;	/* bytes per row - NOT width * bpp / 8       */
+static uint32_t fb_width;
+static uint32_t fb_height;
+static uint32_t fb_bpp;
+static uint32_t fb_type = MULTIBOOT_FRAMEBUFFER_EGA_TEXT;
+static int fb_reachable;	/* P2V() can name it at all                  */
+static int fb_mapped;		/* and the page is actually present          */
+
+uint32_t fb_base(void)           { return fb_addr; }
+uint32_t fb_pitch_bytes(void)    { return fb_pitch; }
+uint32_t fb_pixel_width(void)    { return fb_width; }
+uint32_t fb_pixel_height(void)   { return fb_height; }
+uint32_t fb_bits_per_pixel(void) { return fb_bpp; }
+uint32_t fb_kind(void)           { return fb_type; }
+
+/* The only question a caller that wants to draw should ask: a framebuffer
+*  that is a text buffer, that P2V() cannot name, or whose pages are not
+*  present is not something to write into. */
+int fb_usable(void)
+{
+	return fb_addr != 0
+		&& fb_type != MULTIBOOT_FRAMEBUFFER_EGA_TEXT
+		&& fb_reachable
+		&& fb_mapped;
+}
+
+/* Records what the bootloader reported and says so in one line.
+*
+*  Needs a live vmm: the second of the two checks below asks vmm_is_mapped(),
+*  which has nothing to answer with before vmm_init() has built the tables.
+*  Hence its place in kernel() and not next to print_memory_map(). */
+static void framebuffer_init(multiboot_info *mbi)
+{
+	const char *kind;
+	const char *status;
+
+	if(!(mbi->flags & MULTIBOOT_INFO_FRAMEBUFFER))
+	{
+		/* GRUB Legacy never sets the bit, and GRUB 2 leaves it out when
+		*  the multiboot header asks for no video mode. That is not a
+		*  failure - it means the machine is still in the VGA text mode
+		*  scrn.c drives, which is what we want today. */
+		printf("Framebuffer: none reported, VGA text mode\n");
+		return;
+	}
+
+	fb_type   = mbi->framebuffer_type;
+	fb_width  = mbi->framebuffer_width;
+	fb_height = mbi->framebuffer_height;
+	fb_bpp    = mbi->framebuffer_bpp;
+	fb_pitch  = mbi->framebuffer_pitch;
+	fb_addr   = mbi->framebuffer_addr_low;
+
+	switch(fb_type)
+	{
+		case MULTIBOOT_FRAMEBUFFER_INDEXED:  kind = "indexed";  break;
+		case MULTIBOOT_FRAMEBUFFER_RGB:      kind = "RGB";      break;
+		case MULTIBOOT_FRAMEBUFFER_EGA_TEXT: kind = "EGA text"; break;
+		default:                             kind = "unknown";  break;
+	}
+
+	/* Two questions, independent of each other, and neither may be assumed.
+	*
+	*  1. Can P2V() name it? The direct mapping covers physical memory below
+	*     DIRECT_MAP_LIMIT (1 GiB) and nothing else, so a 64-bit address -
+	*     framebuffer_addr_high non-zero - or a low half beyond that limit
+	*     has no virtual alias at all. There is no address to hand out then,
+	*     and none is invented: reaching such a framebuffer means giving it a
+	*     mapping of its own with vmm_map(), which is a follow-up step. */
+	fb_reachable = (mbi->framebuffer_addr_high == 0
+			&& fb_addr != 0
+			&& fb_addr <= DIRECT_MAP_LIMIT);
+
+	/*  2. Is it mapped at all? vmm_init() maps RAM as the memory map reports
+	*     it, but a framebuffer is memory mapped hardware and need not appear
+	*     in that map - a card answering at 0xFD000000 typically does not, so
+	*     its pages are simply absent. Writing there would page fault, which
+	*     is why this is checked and reported rather than assumed. Only worth
+	*     asking where P2V() applies in the first place. */
+	fb_mapped = fb_reachable ? vmm_is_mapped((uint32_t)P2V(fb_addr)) : 0;
+
+	if(mbi->framebuffer_addr_high != 0)
+		status = "above 4 GiB, unreachable";
+	else if(fb_addr == 0)
+		status = "no address reported";
+	else if(!fb_reachable)
+		status = "outside the direct mapping";
+	else if(!fb_mapped)
+		status = "not mapped";
+	else
+		status = "mapped";
+
+	/* One line, assembled in three calls because the 64-bit case cannot use
+	*  the same conversion: %X prints an unpadded 32-bit value, so gluing two
+	*  of them together would silently misrepresent the address. */
+	printf("Framebuffer: %s %ix%i %i bpp, pitch %i, at ",
+		kind, fb_width, fb_height, fb_bpp, fb_pitch);
+
+	if(mbi->framebuffer_addr_high != 0)
+		printf("0x%X:0x%X", mbi->framebuffer_addr_high, fb_addr);
+	else
+		printf("0x%X", fb_addr);
+
+	printf(" (%s)\n", status);
+}
+
 /* Reports the modules the bootloader loaded alongside the kernel, in exactly
 *  one line - the boot output has to fit into 25 rows, and the names are the
 *  only thing one cannot look up again later with the shell.
@@ -463,7 +595,23 @@ int kernel(uint32_t magic, multiboot_info *mbi_phys)
 	*      the handler itself.
 	*  The page fault handler is for the faults that come later - null
 	*  pointer dereferences, writes into the read-only kernel text - and
-	*  those all happen well after isrs_install(). */
+	*  those all happen well after isrs_install().
+	*
+	*  framebuffer_init() sits directly behind vmm_init() and that position is
+	*  the whole point of it. Reading the multiboot fields needs nothing but
+	*  the converted mbi and could happen anywhere above; deciding whether the
+	*  framebuffer may be TOUCHED cannot. The address the bootloader reports
+	*  is physical and belongs to memory mapped hardware, so two things have
+	*  to hold before a single byte is written there: P2V() must be defined
+	*  for it (below DIRECT_MAP_LIMIT, and not a 64-bit address), and the page
+	*  must actually be present - vmm_init() maps RAM as the memory map
+	*  reports it, and a graphics card at 0xFD000000 is not in that map.
+	*  vmm_is_mapped() can only answer once vmm_init() has built the tables,
+	*  hence here and not one line earlier. It only records and reports; the
+	*  mapping, if one turns out to be needed, is a step of its own and would
+	*  belong immediately after, in front of mt_install(), because a fresh
+	*  kernel page table must exist before the first task space is created -
+	*  the same rule the block above states for every other kernel mapping. */
 	print_memory_map(mbi);
 	pmm_init(mbi);
 	vmm_init();
@@ -472,6 +620,7 @@ int kernel(uint32_t magic, multiboot_info *mbi_phys)
 	*  would cost one of the 25 rows the boot output has to fit into. */
 	printf("Paging on: %i page tables, kernel space 0x%X\n",
 		vmm_table_count(), vmm_kernel_space());
+	framebuffer_init(mbi);
 	heap_init();
 	printf("%i MB Memory (%i KB) in %i Frames\n",
 		(pmm_total_bytes() / (1024u * 1024u)),
