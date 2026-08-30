@@ -103,18 +103,38 @@
 /* ------------------------------------------------------------------ */
 
 /* The largest screen this library will accept, and therefore the size of the
-*  back buffer that has to exist for it. 1024x768 is the top entry of both
-*  paths that can produce a framebuffer here -- vbe_res_table in boot/vbe.inc
-*  ranks it highest, and the Multiboot header in src/start.asm asks GRUB for
-*  exactly it -- so this is not a guess about what might turn up, it is the
-*  largest thing that can.
+*  back buffer that has to exist for it. It is the same ceiling
+*  src/include/fbcon.h names as FBCON_MAX_WIDTH/HEIGHT, and that header lists
+*  the four places that have to agree about it -- vbe_res_table in
+*  boot/vbe.inc, the Multiboot video request in src/start.asm, the console's
+*  shadow buffer, and this. The number cannot be included from there: a ring 3
+*  binary must not depend on kernel internals, for the reason user/syscall.h
+*  gives, so this is a COPY and raising one means raising the other by hand.
+*
+*  It is not a guess about what might turn up. Stage 2 walks vbe_res_table
+*  downwards and takes the highest mode the card actually reports, so the mode
+*  is NEGOTIATED AT BOOT and the same binary lands at 1920x1080 on one machine
+*  and 640x480 on another. This is the top of that table; everything below it
+*  is reached by leaving the tail of the buffer unused.
 *
 *  A mode bigger than this is REFUSED by gfx_open() rather than drawn into
-*  partially. Half a screen of window system and half a screen of whatever the
-*  console left behind is worse than a message saying why. */
-#define GFX_MAX_WIDTH    1024
-#define GFX_MAX_HEIGHT    768
+*  partially. That is a deliberate choice and not the same one the console
+*  makes: fbcon.c CLIPS a larger mode, because a console that refuses to print
+*  is a machine with no way to say what went wrong, whereas this program can
+*  exit and let the console say it. Half a screen of window system and half a
+*  screen of whatever the console left behind, with a pointer that walks off
+*  into the half nobody owns, is worse than a message saying why. */
+#define GFX_MAX_WIDTH    1920
+#define GFX_MAX_HEIGHT   1080
 #define GFX_MAX_BYTES       4    /* 32 bpp, the widest pixel there is here   */
+
+/* What the back buffer therefore costs: 8294400 bytes at the ceiling. Stated
+*  as a name because it is the number that matters to a caller -- it is .bss,
+*  and src/exec.c's loader allocates a physical frame per page of it at every
+*  start, so this is 8.3 MB of real memory taken from a 64 MB guest whatever
+*  mode the machine actually came up in. */
+#define GFX_BACK_BYTES  ((unsigned long)GFX_MAX_WIDTH * GFX_MAX_HEIGHT * \
+                         GFX_MAX_BYTES)
 
 /* Coordinates further out than this are ignored by the primitives that do
 *  arithmetic on them, for the reason fbdraw.c gives at its own copy of this
@@ -321,13 +341,15 @@ extern unsigned long gfx_blit(int x, int y, int w, int h);
 
 /* Records that a rectangle of the canvas has changed and will need copying.
 *
-*  WHY THIS IS NOT OPTIONAL. A full screen is 1024 * 768 * 4 = 3 MiB. That is
-*  3 MiB across the bus per frame, and it is 3 MiB the CPU has to touch even
-*  when the only thing that moved was a 12 by 19 pointer. Measured on this
-*  machine (the numbers are on screen in gui.c, which times both), a full
-*  flush is tens of milliseconds and a pointer's worth of damage is under
-*  one -- the difference between a pointer that follows the mouse and a
-*  pointer that lags behind it.
+*  WHY THIS IS NOT OPTIONAL. A full screen is width * height * bytes, which is
+*  3 MiB at 1024x768x32 and 7.9 MiB at 1920x1080x32. That is the whole of it
+*  across the bus per frame, and it is the whole of it the CPU has to touch
+*  even when the only thing that moved was a pointer a couple of dozen pixels
+*  across. Measured on this machine (the numbers are on screen in gui.c, which
+*  times both), a full flush is tens of milliseconds and a pointer's worth of
+*  damage is under one -- the difference between a pointer that follows the
+*  mouse and a pointer that lags behind it. The bigger the mode, the more this
+*  is the difference between a window system and a slideshow.
 *
 *  Rectangles that intersect are merged into their bounding box, because
 *  blitting a pixel twice is pure waste; the merge repeats until nothing
@@ -380,9 +402,13 @@ extern void gfx_fill_rect(gfx_surface *s, int x, int y, int w, int h,
 *  top of gfxlib.c for why it is a copy and not a reference.
 *
 *  scale blows each glyph pixel up into a scale x scale block; 1 is the font's
-*  own size, which is a smudge on a 1024x768 screen and is why this takes a
-*  scale at all. The background is never touched, so a glyph drawn over
-*  something leaves that something showing between the strokes.
+*  own size, and it takes a scale because the font is FIXED at 8x8 while the
+*  screen is not. Eight pixels is a readable character up to about 1024x768
+*  and a smudge at 1920x1080, so a caller that wants text the same apparent
+*  size on both has to pick the scale from the mode -- which is what gui.c
+*  does, and it is the only knob it has. The background is never touched, so a
+*  glyph drawn over something leaves that something showing between the
+*  strokes.
 *
 *  gfx_text() stops at the right edge of the clip window instead of wrapping:
 *  wrapping would put the tail of a string a row below the head and one cell

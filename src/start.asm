@@ -192,18 +192,47 @@ mboot:
 
     ; The mode we would like. mode_type 0 is "linear graphics", 1 would be
     ; "EGA text"; width and height are then pixels and depth is bits per
-    ; pixel. 1024x768x32 is what boot/vbe.inc scores highest as well, so both
-    ; boot paths aim at the same screen and the framebuffer console gets the
-    ; 128x48 character grid it is sized for either way.
+    ; pixel. 1920x1080x32 is the top row of vbe_res_table in boot/vbe.inc as
+    ; well, so both boot paths aim at the same screen and the framebuffer
+    ; console gets the same 240x67 character grid either way.
     ;
     ; A zero in any of the three would mean "no preference"; we state all
     ; three, because a loader that cannot serve them is REQUIRED to fall back
-    ; to something close rather than to fail, and "close to 1024x768x32" is a
+    ; to something close rather than to fail, and "close to 1920x1080x32" is a
     ; far better guess than "close to nothing".
+    ;
+    ; This is a PREFERENCE and nothing more, which is why asking for the
+    ; maximum is safe rather than greedy. Three things can happen to it:
+    ;
+    ;   * GRUB reads it, finds the closest mode the card actually has, and
+    ;     sets it. What arrives is then GRUB's choice and not ours, and it
+    ;     need not be a mode this project has ever heard of -- a card given
+    ;     2 MiB of video memory produced 1280x800 here, which appears in no
+    ;     table of ours. That is fine: the request below is the only lever
+    ;     this path has, and the console sizes itself to whatever it is told.
+    ;   * QEMU's -kernel loader ignores the video fields entirely -- its
+    ;     source says as much ("multiboot knows VBE. we don't") -- and the
+    ;     kernel comes up in text mode, exactly as it did before.
+    ;   * Our own stage 2 never reads this header at all; it negotiates
+    ;     through vbe.inc and hands over the result in the same multiboot
+    ;     info structure.
+    ;
+    ; In all three cases the kernel is told what it actually got, in
+    ; MBI_FB_*, and fbcon.c copes with a smaller mode, a different mode, or
+    ; no framebuffer at all. Nothing downstream assumes the numbers below.
     MULTIBOOT_VIDEO_LINEAR	equ 0
-    MULTIBOOT_VIDEO_WIDTH	equ 1024
-    MULTIBOOT_VIDEO_HEIGHT	equ 768
+    MULTIBOOT_VIDEO_WIDTH	equ 1920
+    MULTIBOOT_VIDEO_HEIGHT	equ 1080
     MULTIBOOT_VIDEO_DEPTH	equ 32
+
+    ; The ceiling, mirrored from src/include/fbcon.h. See the long comment
+    ; there: this header is one of the four places that have to agree about
+    ; FBCON_MAX_WIDTH/FBCON_MAX_HEIGHT, and asking a loader for a mode bigger
+    ; than the console's statically sized shadow buffer would get us a screen
+    ; whose top left corner is the console and whose remainder is whatever
+    ; GRUB left behind -- with no error reported anywhere.
+    FBCON_MAX_WIDTH		equ 1920
+    FBCON_MAX_HEIGHT		equ 1080
 
     ; This is the GRUB Multiboot header. A boot signature
     ; No AOUT kludge: the bootloader uses the ELF program headers instead.
@@ -246,6 +275,25 @@ mboot:
     dd MULTIBOOT_VIDEO_WIDTH
     dd MULTIBOOT_VIDEO_HEIGHT
     dd MULTIBOOT_VIDEO_DEPTH
+
+; ASSERT: the requested mode must not exceed the console's ceiling.
+;
+; Written as a `times` assertion rather than as "%if MULTIBOOT_VIDEO_WIDTH >
+; FBCON_MAX_WIDTH", and that is not a style choice: %if is a PREPROCESSOR
+; directive and the preprocessor cannot see an `equ`. Both operands would
+; evaluate as nothing, the comparison would be 0 > 0, and the assertion would
+; sit here looking reassuring while never firing at any value whatsoever.
+; `times <expr> db 0` is evaluated by the assembler, where the equs are real;
+; a relational operator yields 1 or 0, so multiplying by -1 gives a negative
+; repeat count and NASM rejects it by name on this line. When the condition is
+; false the count is 0 and not one byte is emitted -- which matters here more
+; than usual, since a single stray byte between the header and stublet would
+; be a byte of padding inside the .text the loader is reading.
+;
+; The same idiom guards the size budget at the bottom of boot/stage2.asm, for
+; the same reason.
+times (((MULTIBOOT_VIDEO_WIDTH  > FBCON_MAX_WIDTH)  | \
+        (MULTIBOOT_VIDEO_HEIGHT > FBCON_MAX_HEIGHT)) * -1) db 0
 
 ; This is an endless loop here. Make a note of this: Later on, we
 ; will insert an 'extern kernel', followed by 'call kernel', right

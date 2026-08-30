@@ -27,8 +27,9 @@
 *    part of it changes. Nothing can be stale because nothing is kept.
 *
 *  The second answer costs redrawing, and redrawing everything on every mouse
-*  movement would cost 3 MiB of blit per event. So the picture is rebuilt only
-*  inside the rectangles that changed:
+*  movement would cost a whole screen of blit per event -- 3 MiB at 1024x768
+*  and 7.9 at 1920x1080. So the picture is rebuilt only inside the rectangles
+*  that changed:
 *
 *      1. something moves; the program records the rectangle it left and the
 *         rectangle it arrived in as damage (gfx_damage());
@@ -47,7 +48,7 @@
 *  half of it. That is the whole design, and its cost is that a pixel may be
 *  painted several times per frame -- once per window that overlaps it. With
 *  four windows that is at most five paints of a small rectangle, which is
-*  nothing against one 3 MiB blit.
+*  nothing against one full screen blit.
 *
 *  THE POINTER FALLS OUT OF THIS FOR FREE. It is painted last into the canvas
 *  on every repaint, so it is over everything; when it moves, its old
@@ -68,6 +69,49 @@
 *  window produces a burst of mouse events, and without that coalescing each
 *  one would blit two window sized rectangles; with it, a burst becomes one
 *  frame.
+*
+*  ------------------------------------------------------------------------
+*  How big a window is, and why it is not a number in this file
+*  ------------------------------------------------------------------------
+*  The mode is negotiated at boot: this same binary lands at 1920x1080 on one
+*  machine and 640x480 on another (see the note on GFX_MAX_WIDTH in
+*  user/gfxlib.h). A window measured in pixels is therefore a window measured
+*  against nothing -- 470 pixels is two thirds of a 640 pixel screen and a
+*  quarter of a 1920 pixel one.
+*
+*  There are two obvious answers and both are wrong on their own:
+*
+*    FIXED PIXELS. Windows stay legible and get visually smaller as the
+*    screen grows -- but the font does not shrink with them, so eventually
+*    the text is the only thing at its old size and the windows look
+*    stranded in the middle of a desktop they no longer relate to.
+*
+*    A FRACTION OF THE SCREEN. The proportions hold at every size -- but the
+*    font is FIXED AT 8x8 and cannot follow, so the text gets relatively
+*    smaller until a window is mostly empty, and on the way down a window
+*    that is "a quarter of the screen" stops being able to hold its own
+*    contents at 640x480.
+*
+*  So neither: a window is measured in CHARACTER CELLS, and the cell is the
+*  one thing chosen from the mode. Each window declares how many columns and
+*  rows of text it has to hold -- gui_win[] below carries those two numbers
+*  and nothing else about its size -- and every pixel dimension in this file
+*  is derived from the cell by gui_metrics().
+*
+*  THE FLOOR IS THE FONT. With the cell at its natural 8x8 a window is as
+*  small as it can be while still holding its text: the widest line the help
+*  window prints is 29 characters, so that window is 29 * 8 + padding + frame
+*  = 242 pixels and there is no honest way to make it 200. That is the size
+*  used at 1024x768 and below, and it is why the windows there are now less
+*  than half the area they were.
+*
+*  Above 1280 pixels wide the cell doubles to 16x16 and every window doubles
+*  with it. One step and not a continuous scale, because the font can only be
+*  blown up by whole pixels and a 1.5x glyph is a smear. The effect is that
+*  1024x768 and 1920x1080 show windows of about the same size RELATIVE TO THE
+*  SCREEN -- 128 by 96 cells against 120 by 67 -- while 640x480, where 80 by
+*  60 cells is all there is, gets windows that are proportionally larger
+*  because they have run into the floor and cannot be smaller.
 *
 *  ------------------------------------------------------------------------
 *  Leaving
@@ -138,17 +182,86 @@
 /* ------------------------------------------------------------------ */
 
 #define GUI_WINDOWS       4
-#define GUI_BORDER        2     /* frame thickness, all four sides       */
-#define GUI_TITLE_H      24     /* title bar height, inside the border   */
-#define GUI_TEXT_SCALE    2     /* 8x8 font doubled: 16 pixel capitals   */
-#define GUI_LINE_H       20     /* baseline to baseline in the body      */
-#define GUI_PAD           8
 
-/* A window may be dragged off the edges, but never so far that its title bar
-*  becomes unreachable -- a window with no grabbable strip left is a window
-*  that can never be brought back. This many pixels of title bar always stay
-*  on screen. */
-#define GUI_KEEP_ON      40
+/* The frame, and the only measurement in this file that is a plain number of
+*  pixels. Two, because paint_window() draws the bevel as a light pair of
+*  lines and a dark pair and a one pixel bevel is invisible at any of these
+*  resolutions -- and because a border that grew with the cell would be four
+*  pixels of pure chrome on every edge at 1920x1080, which is exactly the
+*  heaviness this sizing pass set out to remove. */
+#define GUI_BORDER        2
+
+/* Where the cell doubles. Below this the font is drawn at its own 8x8, which
+*  is the floor: it is the smallest a window holding its text can be. At or
+*  above it the glyph is 16x16, which is the same apparent size on a 1920 wide
+*  screen that 8x8 has on a 1024 wide one.
+*
+*  The height is tested too, so a wide but short mode -- 1280x720 is the one
+*  that turns up -- is not given windows that then do not fit vertically. */
+#define GUI_SCALE2_WIDTH   1280
+#define GUI_SCALE2_HEIGHT   720
+
+/* Derived from the mode by gui_metrics(), and read by everything else. They
+*  are variables rather than macros for the reason the whole file exists: the
+*  mode is not known until sys_mapfb() has answered. */
+static int gui_scale;         /* 1 or 2: the font's magnification            */
+static int gui_cell_w;        /* 8 or 16: one character                       */
+static int gui_cell_h;
+static int gui_line_h;        /* baseline to baseline in a body               */
+static int gui_pad;           /* body inset, all four sides                   */
+static int gui_title_h;       /* title bar height, inside the border          */
+static int gui_keep_on;       /* draggable strip that stays on screen         */
+static int gui_grid;          /* desktop grid spacing                         */
+static int gui_margin;        /* screen edge to the window group              */
+
+/* How much two windows next to each other in the cascade overlap. Enough to
+*  be unmistakably an overlap and not a coincidence, since showing the Z order
+*  is the reason the windows overlap at all. */
+static int gui_overlap_x;
+static int gui_overlap_y;
+
+/* Fills the lot in from the surface. Every number below is a multiple of the
+*  cell or of the scale, so the whole layout doubles in one step and nothing
+*  can be left behind at its old size -- which is what a pile of independent
+*  #defines would have made easy. */
+static void gui_metrics(const gfx_surface *s)
+{
+	gui_scale = (s->w >= GUI_SCALE2_WIDTH && s->h >= GUI_SCALE2_HEIGHT)
+	          ? 2 : 1;
+
+	gui_cell_w = GFX_FONT_WIDTH  * gui_scale;
+	gui_cell_h = GFX_FONT_HEIGHT * gui_scale;
+
+	/* One scale-unit of leading above and below a line of text. At scale 1
+	*  that is 8 pixels of glyph in a 10 pixel line, which is the density
+	*  the kernel console uses and is readable; anything tighter runs the
+	*  descenders of one line into the capitals of the next. */
+	gui_line_h  = gui_cell_h + 2 * gui_scale;
+
+	/* Chrome, and it is deliberately thin. The title bar used to be 24
+	*  pixels around a 16 pixel glyph and the body inset 8 -- half a
+	*  character of empty frame on every side of every window, which is
+	*  most of what made them look heavy. Two scale-units above and below
+	*  the glyph is enough to stop the text touching the frame. */
+	gui_title_h = gui_cell_h + 4 * gui_scale;
+	gui_pad     = 3 * gui_scale;
+
+	/* A window may be dragged off the edges, but never so far that its
+	*  title bar becomes unreachable -- a window with no grabbable strip
+	*  left can never be brought back. Five characters of it always stay on
+	*  screen, which is a strip the pointer can hit at either scale. */
+	gui_keep_on = 5 * gui_cell_w;
+
+	/* Four cells, so the desktop grid has the same density in characters
+	*  at every resolution -- and so the number of lines paint_desktop()
+	*  draws stays around thirty, whatever the mode. */
+	gui_grid    = 4 * gui_cell_w;
+
+	gui_margin  = gui_cell_w;
+
+	gui_overlap_x = 5 * gui_cell_w;
+	gui_overlap_y = gui_title_h + gui_line_h;
+}
 
 
 /* ------------------------------------------------------------------ */
@@ -164,10 +277,16 @@
 *  Two colours and not one: a single colour arrow disappears the moment it
 *  crosses something of the same colour, and an outlined one is visible over
 *  the title bars, the window bodies and the desktop alike without anyone
-*  having to choose colours that avoid it. */
+*  having to choose colours that avoid it.
+*
+*  It is drawn at gui_scale, like everything else: 12x17 where the font is 8x8
+*  and 24x34 where it is 16x16. Twelve by seventeen is not a speck -- it is
+*  very nearly the size the classic X11 arrow had on the screens this
+*  resolution came from -- and tying it to the same scale as the text is what
+*  stops the pointer from being the one thing that does not change when the
+*  mode does. */
 #define GUI_CURSOR_W     12
 #define GUI_CURSOR_H     17
-#define GUI_CURSOR_SCALE  2     /* drawn at 24x34; 12x17 is a speck at 1024x768 */
 
 static const char *const gui_cursor[GUI_CURSOR_H] = {
 	"X           ",
@@ -205,23 +324,41 @@ static const char *const gui_cursor[GUI_CURSOR_H] = {
 
 typedef struct
 {
-	int         x;
+	int         x;      /* filled in by gui_layout(), never by hand         */
 	int         y;
 	int         w;
 	int         h;
+	int         cols;   /* characters of text the body has to hold          */
+	int         rows;   /* lines of it                                      */
 	const char *title;
 	int         body;
 	int         live;   /* lines of content that change with time, 0 = none */
 } gui_window;
 
-/* Deliberately overlapping. A window system where nothing overlaps never has
-*  to answer the question it exists to answer, and a screenshot of one proves
-*  nothing about raising or about exposure. */
+/* The four windows, stated as CONTENT and not as pixels. cols and rows are
+*  the size of the widest and tallest thing the matching paint_body_*() can
+*  print, counted from those functions rather than estimated:
+*
+*    Clock    "1234 events, 5678 frames" is the long line, four lines deep
+*             once the progress bar has taken the second slot
+*    Pointer  "step -123,-123 " plus the three button squares, five deep
+*    Metrics  "12345 ms in flush total" and "1234 frames 5678 KiB", six deep
+*    Read me  "      and the console with it" at 29 characters is the widest
+*             line in the whole program, and eleven lines is the deepest
+*
+*  A line longer than cols is not a fault -- paint_window() clips the body, so
+*  it is cut off at the frame -- but it is a window that has stopped holding
+*  its contents, so these numbers are the ones to change when the text is.
+*
+*  x, y, w and h are all computed. Deliberately overlapping, which the cascade
+*  in gui_layout() guarantees at every resolution: a window system where
+*  nothing overlaps never has to answer the question it exists to answer, and
+*  a screenshot of one proves nothing about raising or about exposure. */
 static gui_window gui_win[GUI_WINDOWS] = {
-	{  60,  90, 380, 150, "Clock",     GUI_BODY_CLOCK,   4 },
-	{ 300, 200, 360, 160, "Pointer",   GUI_BODY_MOUSE,   5 },
-	{ 520, 320, 460, 220, "Metrics",   GUI_BODY_METRICS, 6 },
-	{ 110, 420, 470, 260, "Read me",   GUI_BODY_HELP,    0 }
+	{ 0, 0, 0, 0, 24,  4, "Clock",   GUI_BODY_CLOCK,   4 },
+	{ 0, 0, 0, 0, 16,  5, "Pointer", GUI_BODY_MOUSE,   5 },
+	{ 0, 0, 0, 0, 26,  6, "Metrics", GUI_BODY_METRICS, 6 },
+	{ 0, 0, 0, 0, 29, 11, "Read me", GUI_BODY_HELP,    0 }
 };
 
 /* Back to front. gui_z[0] is the bottom window and gui_z[GUI_WINDOWS-1] is the
@@ -292,6 +429,150 @@ static int clampi(int v, int lo, int hi)
 	return v;
 }
 
+
+/* ------------------------------------------------------------------ */
+/* Laying the windows out                                              */
+/* ------------------------------------------------------------------ */
+
+/* The outer size of a window that has to hold cols x rows of text. The two
+*  functions are the single definition of "how big is a window", and
+*  win_body_rect() is their exact inverse -- change one and the text starts
+*  landing on the frame. */
+static int win_width_for(int cols)
+{
+	return 2 * GUI_BORDER + 2 * gui_pad + cols * gui_cell_w;
+}
+
+static int win_height_for(int rows)
+{
+	return 2 * GUI_BORDER + gui_title_h + 2 * gui_pad + rows * gui_line_h;
+}
+
+/* Places the windows in a cascade running down and to the right, each one
+*  starting gui_overlap_x/y before the previous one ends, with the steps
+*  shrunk by "tighten" (out of 256) when the full cascade would not fit.
+*
+*  A cascade rather than a grid, for one reason: EVERY CONSECUTIVE PAIR
+*  OVERLAPS BY CONSTRUCTION, at any resolution and any window size, because
+*  the step is the window's own size minus the overlap and never more. A grid
+*  of quadrants overlaps only when the windows happen to be more than half the
+*  cell wide, which is true at 640x480 and false at 1920x1080 -- and a window
+*  system whose Z order stops being visible on the big screen is exactly the
+*  thing that cannot be checked from the source.
+*
+*  Positions come out relative to (0,0); gui_layout() moves the whole group. */
+static void layout_cascade(int tighten)
+{
+	int i, x, y, step;
+
+	x = 0;
+	y = 0;
+
+	for(i = 0; i < GUI_WINDOWS; i++)
+	{
+		gui_win[i].x = x;
+		gui_win[i].y = y;
+
+		/* A window narrower than the overlap would step backwards and
+		*  put the next one to its LEFT, which is not a cascade and is
+		*  the one way this loop could produce a shape nobody intended.
+		*  Zero instead: two windows exactly on top of each other still
+		*  show a Z order, just less of one. */
+		step = gui_win[i].w - gui_overlap_x;
+		if(step < 0) step = 0;
+		x += (step * tighten) / 256;
+
+		step = gui_win[i].h - gui_overlap_y;
+		if(step < 0) step = 0;
+		y += (step * tighten) / 256;
+	}
+}
+
+/* The bounding box of the whole cascade, measured from (0,0). Not simply the
+*  last window's far corner: the cascade ends with the widest window but there
+*  is no rule saying it must, and a bounding box that assumed so would be
+*  wrong the moment the order changed. */
+static void layout_extent(int *out_w, int *out_h)
+{
+	int i, w, h;
+
+	w = 0;
+	h = 0;
+
+	for(i = 0; i < GUI_WINDOWS; i++)
+	{
+		if(gui_win[i].x + gui_win[i].w > w)
+			w = gui_win[i].x + gui_win[i].w;
+		if(gui_win[i].y + gui_win[i].h > h)
+			h = gui_win[i].y + gui_win[i].h;
+	}
+
+	*out_w = w;
+	*out_h = h;
+}
+
+/* Sizes and places every window for the screen actually in front of us.
+*
+*  Two steps. First the sizes, which come from the content and from nothing
+*  else. Then the cascade, tightened until the group fits between the margins:
+*  tightening only ever increases the overlap, so a screen too small for the
+*  natural cascade loses spread and never loses a window off the edge -- which
+*  is the failure that matters, because a window whose title bar is off screen
+*  cannot be dragged back.
+*
+*  The search is a walk down from 256 in steps of 4 rather than anything
+*  cleverer. It runs once, at startup, over four rectangles; a binary search
+*  would be the same answer reached less obviously.
+*
+*  Finally the group is centred. Centred and not anchored top left, because at
+*  1920x1080 four windows sized for their text cannot fill the screen however
+*  they are arranged -- the honest choice is between a cluster in the middle
+*  and a cluster in the corner, and the middle is the one that looks
+*  deliberate. */
+static void gui_layout(const gfx_surface *s)
+{
+	int i, tighten, w, h, avail_w, avail_h, ox, oy;
+
+	for(i = 0; i < GUI_WINDOWS; i++)
+	{
+		gui_win[i].w = win_width_for(gui_win[i].cols);
+		gui_win[i].h = win_height_for(gui_win[i].rows);
+	}
+
+	avail_w = s->w - 2 * gui_margin;
+	avail_h = s->h - 2 * gui_margin;
+
+	for(tighten = 256; tighten > 0; tighten -= 4)
+	{
+		layout_cascade(tighten);
+		layout_extent(&w, &h);
+
+		if(w <= avail_w && h <= avail_h)
+			break;
+	}
+
+	/* Even fully stacked the group can be larger than the screen, on a
+	*  mode too small to hold the widest window at all. Nothing can be done
+	*  about that here and nothing needs to be: the windows are placed at
+	*  the margin and gfxlib clips whatever hangs over. */
+	if(tighten <= 0)
+	{
+		layout_cascade(0);
+		layout_extent(&w, &h);
+	}
+
+	ox = gui_margin + (avail_w - w) / 2;
+	oy = gui_margin + (avail_h - h) / 2;
+	if(ox < 0) ox = 0;
+	if(oy < 0) oy = 0;
+
+	for(i = 0; i < GUI_WINDOWS; i++)
+	{
+		gui_win[i].x += ox;
+		gui_win[i].y += oy;
+	}
+}
+
 /* The rectangle a window occupies on the screen, frame included. Every damage
 *  calculation goes through this rather than repeating x, y, w, h, so that a
 *  window growing a shadow or a resize grip later cannot leave a damage
@@ -310,29 +591,36 @@ static void win_rect(const gui_window *win, gfx_rect *r)
 static void win_body_rect(const gui_window *win, gfx_rect *r)
 {
 	r->x = win->x + GUI_BORDER;
-	r->y = win->y + GUI_BORDER + GUI_TITLE_H;
+	r->y = win->y + GUI_BORDER + gui_title_h;
 	r->w = win->w - 2 * GUI_BORDER;
-	r->h = win->h - 2 * GUI_BORDER - GUI_TITLE_H;
+	r->h = win->h - 2 * GUI_BORDER - gui_title_h;
 
 	if(r->w < 0) r->w = 0;
 	if(r->h < 0) r->h = 0;
 }
 
-/* The part of a window that changes on its own, as opposed to when it moves.
+/* The part of a window that changes on its own, as opposed to when it moves:
+*  the first "live" lines of its body, and never its frame or its title bar.
 *
-*  This is NOT the body. It is the lines of the body that carry a clock or a
-*  counter, and the difference is worth a function: the Metrics body is
-*  456x180 pixels and its five live lines are 456x116, so damaging the body
-*  ten times a second costs 500 KiB of blit per second more than damaging the
-*  lines does. An idle window system should be idle, and the way to make it
-*  idle is to be specific about what actually changed. */
+*  Sizing windows to their contents took most of this function's work away and
+*  it is worth saying so rather than leaving a reader to wonder. All three live
+*  windows now declare as many live lines as they have rows, because every line
+*  they print is a clock or a counter -- so the live rectangle IS the body for
+*  all three and the trim never fires today. What it still buys is the chrome:
+*  the tick damages 192x46 of a 202x62 Clock at scale 1 rather than all of it,
+*  which is a third of the pixels for free, ten times a second, forever.
+*
+*  It stays because the trim is the part that cannot be reconstructed later.
+*  The moment a window grows a static line under its live ones -- a caption, a
+*  legend, a key -- damaging the whole body starts repainting text that never
+*  changes, and that is a cost nobody would go looking for. */
 static void win_live_rect(const gui_window *win, gfx_rect *r)
 {
 	int used;
 
 	win_body_rect(win, r);
 
-	used = win->live * GUI_LINE_H + 2 * GUI_PAD;
+	used = win->live * gui_line_h + 2 * gui_pad;
 	if(r->h > used)
 		r->h = used;
 }
@@ -343,8 +631,8 @@ static void cursor_rect(int x, int y, gfx_rect *r)
 {
 	r->x = x;
 	r->y = y;
-	r->w = GUI_CURSOR_W * GUI_CURSOR_SCALE;
-	r->h = GUI_CURSOR_H * GUI_CURSOR_SCALE;
+	r->w = GUI_CURSOR_W * gui_scale;
+	r->h = GUI_CURSOR_H * gui_scale;
 }
 
 static void damage_rect(const gfx_rect *r)
@@ -385,59 +673,71 @@ static void format_uptime(char *buf, size_t size, int ms)
 *  three.
 *
 *  The lines are drawn across the whole surface and clipped away by the clip
-*  window. That is 56 span calls per damage rectangle, almost all of which
-*  return after one comparison, against a fill of the same rectangle. */
+*  window. The spacing is four character cells rather than a fixed 32 pixels,
+*  which keeps that count near sixty at every resolution -- at a fixed 32 a
+*  1920x1080 desktop would cost 94 span calls per damage rectangle instead of
+*  47 -- and keeps the grid the same density relative to the text. Almost all
+*  of the calls return after one comparison, against a fill of the same
+*  rectangle. */
 static void paint_desktop(gfx_surface *c)
 {
 	int i;
 
 	gfx_clear(c, col_desk);
 
-	for(i = 0; i < c->w; i += 32)
+	for(i = 0; i < c->w; i += gui_grid)
 		gfx_vline(c, i, 0, c->h, col_grid);
-	for(i = 0; i < c->h; i += 32)
+	for(i = 0; i < c->h; i += gui_grid)
 		gfx_hline(c, 0, i, c->w, col_grid);
 
-	/* 16 pixels per character at scale 2, so 62 characters is the most that
-	*  fits across 1024 pixels with a margin. gfx_text() would clip the rest
-	*  rather than wrap it, which is correct and still looks like a mistake,
-	*  so the string is written to fit. */
-	gfx_text(c, 16, 12,
+	/* 59 characters, which is 472 pixels at scale 1 and 944 at scale 2 --
+	*  inside the margin on the narrowest screen either scale is used on
+	*  (640 and 1280). gfx_text() would clip the rest rather than wrap it,
+	*  which is correct and still looks like a mistake, so the string is
+	*  written to fit rather than trusted to be cut off tidily. */
+	gfx_text(c, 2 * gui_cell_w, gui_cell_h,
 	         "TomatOS window system: drag a title, click to raise, Esc out",
-	         GUI_TEXT_SCALE, col_title_text);
+	         gui_scale, col_title_text);
 }
 
 /* One line of body text, at line number "line" counting from 0. */
 static void body_line(gfx_surface *c, const gfx_rect *body, int line,
                       const char *text, gfx_color colour)
 {
-	gfx_text(c, body->x + GUI_PAD, body->y + GUI_PAD + line * GUI_LINE_H,
-	         text, GUI_TEXT_SCALE, colour);
+	gfx_text(c, body->x + gui_pad, body->y + gui_pad + line * gui_line_h,
+	         text, gui_scale, colour);
 }
 
 static void paint_body_clock(gfx_surface *c, const gfx_rect *body)
 {
 	char line[64];
-	int bar_x, bar_y, bar_w, filled;
+	int bar_x, bar_y, bar_w, bar_h, filled;
 
 	format_uptime(line, sizeof(line), gui_uptime);
 	body_line(c, body, 0, "Up", col_dim);
-	gfx_text(c, body->x + GUI_PAD + 3 * GFX_FONT_WIDTH * GUI_TEXT_SCALE,
-	         body->y + GUI_PAD, line, GUI_TEXT_SCALE, col_text);
+	gfx_text(c, body->x + gui_pad + 3 * gui_cell_w,
+	         body->y + gui_pad, line, gui_scale, col_text);
 
 	/* A bar that fills across each second. The digits above prove the clock
 	*  is running; the bar proves the program is redrawing between the
-	*  digits changing, which a still picture of a running clock cannot. */
-	bar_x = body->x + GUI_PAD;
-	bar_y = body->y + GUI_PAD + GUI_LINE_H + 6;
-	bar_w = body->w - 2 * GUI_PAD;
+	*  digits changing, which a still picture of a running clock cannot.
+	*
+	*  It lives in the second line's slot, inset by one scale-unit top and
+	*  bottom, rather than at a fixed offset of its own. That is what keeps
+	*  it out of the third line at scale 1: at 20 pixels a line an absolute
+	*  14 pixel bar with a 6 pixel offset fitted, and at 10 it would have
+	*  reached four pixels into the line below. */
+	bar_x = body->x + gui_pad;
+	bar_y = body->y + gui_pad + gui_line_h + gui_scale;
+	bar_w = body->w - 2 * gui_pad;
+	bar_h = gui_line_h - 2 * gui_scale;
 
 	if(bar_w > 0)
 	{
 		filled = (bar_w * ((gui_uptime % 1000) / 10)) / 100;
-		gfx_fill_rect(c, bar_x, bar_y, bar_w, 14, col_shadow);
-		gfx_fill_rect(c, bar_x, bar_y, filled, 14, col_bar);
-		gfx_draw_rect(c, bar_x, bar_y, bar_w, 14, col_frame);
+		gfx_fill_rect(c, bar_x, bar_y, bar_w, bar_h, col_shadow);
+		gfx_fill_rect(c, bar_x, bar_y, filled, bar_h, col_bar);
+		gfx_draw_rect(c, bar_x, bar_y, bar_w, bar_h, col_frame);
 	}
 
 	snprintf(line, sizeof(line), "%lu events, %lu frames",
@@ -448,7 +748,7 @@ static void paint_body_clock(gfx_surface *c, const gfx_rect *body)
 static void paint_body_mouse(gfx_surface *c, const gfx_rect *body)
 {
 	char line[64];
-	int i, bx;
+	int i, bx, by, box, step, inset;
 
 	snprintf(line, sizeof(line), "at %4d,%-4d", gui_ptr_x, gui_ptr_y);
 	body_line(c, body, 0, line, col_text);
@@ -459,20 +759,28 @@ static void paint_body_mouse(gfx_surface *c, const gfx_rect *body)
 	/* Three squares, filled while the matching button is down. Squares and
 	*  not text because a pressed button lasts a fraction of a second and a
 	*  word that appears and disappears is harder to catch than a box that
-	*  fills in. */
-	bx = body->x + GUI_PAD;
+	*  fills in.
+	*
+	*  A box is one line high and holds one glyph centred in it, so the row
+	*  of them occupies the third line's slot exactly and needs no space
+	*  reserved for it in the window's row count. */
+	box   = gui_line_h;
+	step  = box + 2 * gui_scale;
+	inset = (box - gui_cell_w) / 2;
+
+	bx = body->x + gui_pad;
+	by = body->y + gui_pad + 2 * gui_line_h;
+
 	for(i = 0; i < 3; i++)
 	{
 		int on = (gui_buttons & (1u << i)) != 0;
 
-		gfx_fill_rect(c, bx + i * 34, body->y + GUI_PAD + 2 * GUI_LINE_H + 4,
-		              26, 22, on ? col_bar : col_shadow);
-		gfx_draw_rect(c, bx + i * 34, body->y + GUI_PAD + 2 * GUI_LINE_H + 4,
-		              26, 22, col_frame);
-		gfx_char(c, bx + i * 34 + 6,
-		         body->y + GUI_PAD + 2 * GUI_LINE_H + 7,
+		gfx_fill_rect(c, bx + i * step, by, box, box,
+		              on ? col_bar : col_shadow);
+		gfx_draw_rect(c, bx + i * step, by, box, box, col_frame);
+		gfx_char(c, bx + i * step + inset, by + (box - gui_cell_h) / 2,
 		         (i == 0) ? 'L' : ((i == 1) ? 'R' : 'M'),
-		         GUI_TEXT_SCALE, on ? col_title_text : col_dim);
+		         gui_scale, on ? col_title_text : col_dim);
 	}
 
 	body_line(c, body, 4, (gui_drag >= 0) ? "dragging" : "", col_text);
@@ -556,15 +864,15 @@ static void paint_window(gfx_surface *c, const gui_window *win, int active)
 	/* The title bar. Its height is what the hit test uses to decide that a
 	*  press starts a drag, so the two must agree -- see gui_press(). */
 	gfx_fill_rect(c, win->x + GUI_BORDER, win->y + GUI_BORDER,
-	              win->w - 2 * GUI_BORDER, GUI_TITLE_H,
+	              win->w - 2 * GUI_BORDER, gui_title_h,
 	              active ? col_title_on : col_title_off);
 
-	tx = win->x + GUI_BORDER + GUI_PAD;
-	ty = win->y + GUI_BORDER + (GUI_TITLE_H - GFX_FONT_HEIGHT * GUI_TEXT_SCALE) / 2;
-	gfx_text(c, tx, ty, win->title, GUI_TEXT_SCALE,
+	tx = win->x + GUI_BORDER + gui_pad;
+	ty = win->y + GUI_BORDER + (gui_title_h - gui_cell_h) / 2;
+	gfx_text(c, tx, ty, win->title, gui_scale,
 	         active ? col_title_text : col_dim);
 
-	gfx_hline(c, win->x + GUI_BORDER, win->y + GUI_BORDER + GUI_TITLE_H,
+	gfx_hline(c, win->x + GUI_BORDER, win->y + GUI_BORDER + gui_title_h,
 	          win->w - 2 * GUI_BORDER, col_frame);
 
 	win_body_rect(win, &body);
@@ -592,7 +900,8 @@ static void paint_window(gfx_surface *c, const gui_window *win, int active)
 /* The pointer, painted last so it is over everything. Row by row and run by
 *  run rather than pixel by pixel, so that the horizontal stretches of the
 *  arrow are one span each -- at scale 2 a run of five is a 10 pixel span
-*  drawn twice instead of ten separate blocks. */
+*  drawn twice instead of ten separate blocks. Painted at gui_scale, so the
+*  pointer is 12x17 where the text is 8x8 and 24x34 where it is 16x16. */
 static void paint_cursor(gfx_surface *c)
 {
 	int row, col, run;
@@ -616,9 +925,9 @@ static void paint_cursor(gfx_surface *c)
 				run++;
 
 			gfx_fill_rect(c,
-			              gui_ptr_x + col * GUI_CURSOR_SCALE,
-			              gui_ptr_y + row * GUI_CURSOR_SCALE,
-			              run * GUI_CURSOR_SCALE, GUI_CURSOR_SCALE,
+			              gui_ptr_x + col * gui_scale,
+			              gui_ptr_y + row * gui_scale,
+			              run * gui_scale, gui_scale,
 			              (ch == 'X') ? col_cursor_edge : col_cursor_fill);
 
 			col += run;
@@ -812,7 +1121,7 @@ static void gui_press(int x, int y)
 	*  body is not draggable: dragging by the body is a thing some window
 	*  systems offer with a modifier key, and offering it without one makes
 	*  a click on a button impossible to tell from the start of a drag. */
-	if(y >= w->y + GUI_BORDER && y < w->y + GUI_BORDER + GUI_TITLE_H &&
+	if(y >= w->y + GUI_BORDER && y < w->y + GUI_BORDER + gui_title_h &&
 	   x >= w->x + GUI_BORDER && x < w->x + w->w - GUI_BORDER)
 	{
 		gui_drag = gui_z[GUI_WINDOWS - 1];
@@ -857,8 +1166,8 @@ static void gui_motion(int x, int y)
 		*  it can always be grabbed again, and the top edge never goes
 		*  above the screen, because a title bar above the top edge is a
 		*  window that can be moved down but never up. */
-		nx = clampi(nx, GUI_KEEP_ON - w->w, c->w - GUI_KEEP_ON);
-		ny = clampi(ny, 0, c->h - GUI_KEEP_ON);
+		nx = clampi(nx, gui_keep_on - w->w, c->w - gui_keep_on);
+		ny = clampi(ny, 0, c->h - gui_keep_on);
 
 		if(nx != w->x || ny != w->y)
 		{
@@ -981,6 +1290,10 @@ static void explain_no_screen(int rc)
 			printf("gui: the screen is larger than %dx%d, which is more than\n",
 			       GFX_MAX_WIDTH, GFX_MAX_HEIGHT);
 			printf("     the back buffer compiled into this program can hold.\n");
+			printf("     That buffer is .bss and cannot grow at run time, so\n");
+			printf("     the way out is a smaller mode or a taller ceiling in\n");
+			printf("     user/gfxlib.h -- which costs 4 more bytes of memory\n");
+			printf("     per pixel, in every program that draws.\n");
 			break;
 
 		case SYS_ENOSYS:
@@ -1028,6 +1341,14 @@ int main(int argc, char **argv)
 
 	c = gfx_canvas();
 	setup_colours();
+
+	/* Everything about how big things are, in this order and before
+	*  anything is drawn or hit tested: the metrics come from the mode, the
+	*  window sizes come from the metrics, and the placement comes from the
+	*  sizes. Nothing in this program has a position or a size until these
+	*  two calls have run. */
+	gui_metrics(c);
+	gui_layout(c);
 
 	/* The pointer starts in the middle. The kernel has a position of its
 	*  own and the first mouse event will overwrite this, but there may
@@ -1108,18 +1429,21 @@ int main(int argc, char **argv)
 				*  the others instead, and the reason is worth the
 				*  tenth of a second of lag it costs:
 				*
-				*  damaging it here would put 165 KiB of window
+				*  damaging it here would put a window's worth of
 				*  content into every frame that the pointer moved
 				*  through, and a pointer moving is the case the
 				*  whole damage list exists to make cheap. Left
 				*  out, a frame in which nothing happened but the
-				*  pointer moving damages two 24x34 rectangles and
-				*  nothing else: 6528 bytes when they are apart,
-				*  and 3264 when a slow move overlaps them into
-				*  one, against the 3145728 a full screen costs.
-				*  That is what the Metrics window reports as
-				*  "cheapest", and it would be a fiction about
-				*  this program if this line were here. */
+				*  pointer moving damages two pointer sized
+				*  rectangles and nothing else -- two 24x34 at
+				*  scale 2 is 6528 bytes, or 3264 when a slow move
+				*  overlaps them into one, against the 8294400 a
+				*  full 1920x1080 screen costs. At scale 1 the
+				*  pointer is 12x17 and those numbers are 1632 and
+				*  816 against 3145728. Three orders of magnitude
+				*  either way. That is what the Metrics window
+				*  reports as "cheapest", and it would be a fiction
+				*  about this program if this line were here. */
 			}
 		}
 

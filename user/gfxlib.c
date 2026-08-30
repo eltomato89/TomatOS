@@ -8,14 +8,14 @@
 *  a program with no malloc and a 4 KiB stack.
 *
 *  ------------------------------------------------------------------------
-*  Where 3 MiB of back buffer comes from
+*  Where 8.3 MB of back buffer comes from
 *  ------------------------------------------------------------------------
 *  There are exactly three places a TomatOS program can put a byte:
 *
 *    - the stack, which is one 4 KiB page (USER_STACK_SLOT_SIZE in
 *      src/tasks.c is 8 KiB, and the lower half of it is an unmapped guard
-*      page). A frame of 1024x768x32 is 768 times that, so this is not a
-*      candidate for even a fraction of it;
+*      page). A frame of 1920x1080x32 is two thousand times that, so this is
+*      not a candidate for even a fraction of it;
 *    - the heap, which does not exist. There is no malloc in user space and
 *      no system call that would grow the address space, deliberately: the
 *      kernel's loader maps exactly the segments the ELF declares and nothing
@@ -26,42 +26,61 @@
 *  only one left. user/user.ld puts .bss in the single PT_LOAD segment, where
 *  it is the whole reason p_memsz comes out larger than p_filesz, and
 *  src/exec.c's loader allocates a frame per page of that segment and zeroes
-*  everything past p_filesz. The 3 MiB therefore costs nothing on the FAT
+*  everything past p_filesz. The 8.3 MB therefore costs nothing on the FAT
 *  volume -- the ELF on disk stays around 20 KiB -- and arrives already
-*  cleared, which is one memset of 3 MiB that never has to run.
+*  cleared, which is one memset of 8.3 MB that never has to run.
 *
-*  It is also within the program's own page table. user.ld links at
-*  0x00400000, which is 4 MiB aligned and therefore starts a page directory
-*  entry of its own; one page table covers 4 MiB, and text, rodata, this
-*  buffer and the rest of .bss together stay under that, so the whole program
-*  still needs exactly one page table.
+*  WHAT IT DOES COST is a physical frame per page, eagerly, at every start:
+*  2025 frames for the buffer alone, whatever mode the machine came up in.
+*  That is 8.3 MB of a guest the Makefile now gives 64 MB, and it is the
+*  reason the Makefile gives it 64 rather than the 32 it ran on before.
+*
+*  IT NO LONGER FITS IN ONE PAGE TABLE, and that is the one claim raising the
+*  ceiling actually invalidated. user.ld links at 0x00400000, which is 4 MiB
+*  aligned and therefore starts a page directory entry of its own; one page
+*  table covers 4 MiB, and 8.3 MB of buffer plus a few pages of code reaches
+*  to roughly 0x00BF0000, which is two page tables and within a few hundred
+*  kilobytes of needing a third. Nothing has to be done about that: src/exec.c
+*  maps a segment page by page through vmm_map_in(), which allocates a page
+*  table whenever the directory entry is empty and reports "no memory for a
+*  page table" if it cannot. The cost is one more 4 KiB frame, not a rewrite.
 *
 *  The size is fixed at the largest mode that can turn up rather than fitted
-*  to the mode that did, because there is no way to fit it afterwards. A mode
-*  larger than GFX_MAX_WIDTH x GFX_MAX_HEIGHT is refused by gfx_open(); a
-*  smaller one leaves the tail of the array unused, which costs 3 MiB of
-*  address space and, since nothing ever touches those pages, at most the
-*  frames the loader eagerly allocated for them.
+*  to the mode that did, because there is no way to fit it afterwards -- the
+*  mode is not known until sys_mapfb() answers, and by then every byte the
+*  program will ever have is already mapped. A mode larger than GFX_MAX_WIDTH
+*  x GFX_MAX_HEIGHT is refused by gfx_open(); a smaller one leaves the tail of
+*  the array unused, which is the ORDINARY case and not a failure: 640x480x32
+*  uses 1.2 MB of the 8.3 and never touches the rest.
+*
+*  Which makes one rule load-bearing. THE UNUSED TAIL IS ONLY UNUSED IF EVERY
+*  OFFSET IS COMPUTED FROM THE NEGOTIATED WIDTH AND PITCH, never from
+*  GFX_MAX_WIDTH. gfx_open() gives the canvas a pitch of width * bytes for the
+*  width the card reported, and row_at() is the only place in this file that
+*  turns a row number into an address -- so there is exactly one line to be
+*  right about. Getting it wrong is the bug that draws a correct picture on
+*  the machine that was tested and a sheared one on the next.
 *
 *  ------------------------------------------------------------------------
 *  What a frame costs, and why the damage list exists
 *  ------------------------------------------------------------------------
-*  A full screen is 1024 * 768 * 4 = 3145728 bytes. Two things have to be
-*  said about moving that many:
+*  A full screen is width * height * bytes: 3145728 bytes at 1024x768x32 and
+*  8294400 at 1920x1080x32. Two things have to be said about moving that many:
 *
 *  1. NOT WITH memcpy(). user/lib.c's memcpy() is a byte at a time loop, and
 *     says so in as many words -- "nothing in a user program moves enough
 *     memory for it to matter" was true of every program on this disk until
-*     this one. Three million byte loads and three million byte stores per
+*     this one. Eight million byte loads and eight million byte stores per
 *     frame is four times the memory traffic a dword copy needs and four
 *     times the loop overhead. copy_row() below is that dword copy, and it is
 *     the single reason this file does not simply call memcpy().
 *
-*  2. NOT ALL OF IT. Even at dword width, a full flush is 3 MiB across the
-*     bus, and the pointer moving one pixel changes about 900 of them.
-*     gfx_damage() collects the rectangles that actually changed and
+*  2. NOT ALL OF IT. Even at dword width, a full flush is megabytes across
+*     the bus, and the pointer moving one pixel changes a couple of thousand
+*     of them. gfx_damage() collects the rectangles that actually changed and
 *     gfx_flush() copies only those. gui.c measures both and puts the numbers
-*     on screen, so the claim is checkable rather than asserted.
+*     on screen, so the claim is checkable rather than asserted -- and the
+*     ratio between them grows with the mode.
 *
 *  ------------------------------------------------------------------------
 *  Where the glyphs come from
@@ -253,6 +272,14 @@ typedef char gfx_font_size_check[
 *  through the surface. */
 static unsigned int gfx_back[
 	(GFX_MAX_WIDTH * GFX_MAX_HEIGHT * GFX_MAX_BYTES) / 4];
+
+/* The division by four above is only lossless while the product is a multiple
+*  of four, and a future GFX_MAX_BYTES of 3 with an odd width would silently
+*  make the array short by a pixel -- which is a write past the end of .bss on
+*  the last row of the last frame and nowhere else. Checked here rather than
+*  hoped for, the same way the font table is. */
+typedef char gfx_back_size_check[
+	(sizeof(gfx_back) >= GFX_BACK_BYTES) ? 1 : -1];
 
 
 /* ------------------------------------------------------------------ */
@@ -1184,10 +1211,29 @@ int gfx_open(void)
 	/* The back buffer is a fixed array and cannot grow, so a mode larger
 	*  than it is refused here rather than drawn into a corner of. The
 	*  screen goes straight back: a refusal must not leave the console
-	*  suspended behind a program that has given up. */
+	*  suspended behind a program that has given up.
+	*
+	*  Each of the three dimensions is tested on its own rather than as one
+	*  product, because the product is what has to be prevented from
+	*  overflowing before it can be compared -- and because "wider than
+	*  1920" is something a caller can put in a message, whereas "more than
+	*  8294400 bytes" is not. The byte budget is then asserted below as
+	*  well, on numbers now known to be small enough to multiply. */
 	if(gfx_info.width  > (unsigned long)GFX_MAX_WIDTH ||
 	   gfx_info.height > (unsigned long)GFX_MAX_HEIGHT ||
 	   bytes > GFX_MAX_BYTES)
+	{
+		gfx_close();
+		return SYS_ENOMEM;
+	}
+
+	/* The invariant the whole arrangement rests on, stated in the one form
+	*  that cannot drift: the rows the canvas will actually use, at the
+	*  pitch it will actually use, fit in the array. Width, height and depth
+	*  are each within their limit by now, so the product is at most
+	*  GFX_BACK_BYTES and cannot overflow. */
+	if(gfx_info.width * (unsigned long)bytes * gfx_info.height >
+	   GFX_BACK_BYTES)
 	{
 		gfx_close();
 		return SYS_ENOMEM;
@@ -1228,7 +1274,15 @@ int gfx_open(void)
 	*  padding in a framebuffer's pitch is the card's business, and copying
 	*  it here would only make the buffer bigger. The two pitches therefore
 	*  differ in general, which is exactly why gfx_blit() copies row by row
-	*  and never treats either surface as one flat block. */
+	*  and never treats either surface as one flat block.
+	*
+	*  THE NEGOTIATED WIDTH AND NOT GFX_MAX_WIDTH. The array is sized for
+	*  the ceiling and the surface is sized for the mode, and those are two
+	*  different numbers on every machine that did not get the top mode.
+	*  Padding the canvas out to the maximum pitch instead would still draw
+	*  a correct picture here -- and would make every row of the blit start
+	*  in the wrong place the moment gfx_blit() reads a row address from it,
+	*  which is the diagonal shear. */
 	if(!gfx_surface_init(&gfx_buf, gfx_back,
 	                     (int)gfx_info.width, (int)gfx_info.height,
 	                     gfx_info.width * (unsigned long)bytes, gfx_info.bpp,

@@ -300,8 +300,64 @@ available: `exec.c` allocates a frame per page and zeroes everything past
 `p_filesz`, so it costs nothing on disk and arrives already cleared — a 3 MB
 `memset` that never runs.
 
+#### The mode is negotiated, not chosen
+
+The same binary lands at 1920x1080 on one machine and 640x480 on another.
+`vbe_res_table` in `boot/vbe.inc` ranks six sizes and stage 2 takes the highest
+the card actually reports; the Multiboot header asks GRUB for the same. Nothing
+matches on a VBE *mode number* — the enumeration compares the width and height
+the card reports, so 1920x1080 not being a standard VESA mode costs nothing,
+and a size the card does not offer is simply never scored.
+
+Tested by starving the card: 16 MB gives 1920x1080x32, 4 MB gives
+1920x1080x**16** (resolution beats depth, which is how the ranking is meant to
+work), 2 MB gives 1024x768, 1 MB gives 800x600, and a Cirrus card — a different
+vgabios entirely — lands on 1280x1024. None failed.
+
+**1600x1200 is deliberately absent** although it is a standard VESA mode and
+belongs there by pixel count: 1200 exceeds `FBCON_MAX_HEIGHT`, so the console
+would size itself to 67 rows on a screen with room for 75 and leave the bottom
+128 lines holding whatever the BIOS left. The assembler refuses the row, which
+is how that was caught rather than remembered. 1600x900 takes its place.
+
+The ranking is by pixel count, and the file says where that is the wrong
+question: a 16:9 panel whose card stops short of 1920x1080 would drop to
+1280x1024, a 5:4 mode a widescreen monitor stretches. 1600x900 exists for that.
+What cannot be fixed by any ordering is a card offering only 5:4 modes — the
+shape of the monitor is not in the VBE information at all.
+
+`FBCON_MAX_WIDTH`/`HEIGHT` in `src/include/fbcon.h` is the single place the
+ceiling is written down, and its comment names the four things that have to
+agree: the bootloader's table, the Multiboot request, the console's shadow
+buffer, and the window system's back buffer. If one falls behind, the failure
+is quiet — the console uses the top-left corner of a larger screen and the rest
+keeps whatever was on it.
+
+#### Windows are measured in cells, not pixels
+
+The window system sizes itself the same way. A window declares how many
+character cells it needs; the cell comes from the mode. The floor was found by
+counting the actual strings rather than guessing — the widest line in the
+program is 29 characters and the deepest window 11 lines, so the smallest
+honest window is 242x132. At 1280x720 and above the cell doubles to 16x16 and
+everything doubles with it, which is the only magnification an 8x8 font
+tolerates.
+
+Placement is a centred cascade whose step is the window size minus an overlap,
+so consecutive windows overlap *by construction* at any size — a quadrant grid
+would stop overlapping at 1920x1080, and the Z order would stop being visible.
+A tightening factor shrinks the steps until the group fits the margins, and
+tightening only ever increases overlap, so a small screen loses spread rather
+than losing a window off an edge.
+
+The result at three sizes: 640x480 fills the width and stays legible, 1024x768
+uses a third of the screen where the first version used most of it, and
+1920x1080 centres a cluster over about 70 by 50 percent.
+
 **A framebuffer needs a loader that supplies one.** `make run` does not, so
-`gui` is `make run-iso` or `make run-bootdisk`.
+`gui` is `make run-iso` or `make run-bootdisk`. QEMU now gets 64 MB by default:
+a graphics mode costs twice, once for the framebuffer and once for the back
+buffer a program draws into, and at 1920x1080x32 those are 8.3 MB each.
 
 ### The mouse
 

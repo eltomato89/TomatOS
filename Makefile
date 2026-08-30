@@ -189,7 +189,18 @@ USER_LDFLAGS := -m elf_i386 -T $(USER_LINKER_SCRIPT) -nostdlib -no-pie -static \
 # Override with:  make run QEMU_KEYMAP=en-us
 QEMU_KEYMAP ?= de
 
-QEMUFLAGS := -m 32 -k $(QEMU_KEYMAP)
+# Guest memory. 64 rather than the 32 this ran on for years, because a
+# graphics mode is expensive twice over: the framebuffer itself, and the back
+# buffer a ring 3 program draws into before copying across. At 1920x1080x32
+# those are 8.3 MB each, and the loader allocates a frame per page of a
+# program's .bss -- so "gui" alone wants more than a quarter of 32 MB before
+# the kernel, the heap and the task stacks are counted.
+#
+# It changes nothing about the kernel, which reads the memory map and adapts.
+# Override with:  make run QEMU_MEM=32
+QEMU_MEM ?= 64
+
+QEMUFLAGS := -m $(QEMU_MEM) -k $(QEMU_KEYMAP)
 
 # ---------------------------------------------------------------------------
 #  Network

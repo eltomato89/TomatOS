@@ -9,7 +9,8 @@
 ; door is shut: getting back would need a v86 monitor in the kernel. That is
 ; precisely why the kernel has been stuck with 320x200 or plain text until
 ; now. These few hundred bytes of real mode code are the entire reason the
-; kernel can have a 1024x768 truecolour framebuffer at all.
+; kernel can have a truecolour framebuffer at all -- up to 1920x1080 where the
+; card offers it, and down to 640x480 where it does not, from the same binary.
 ;
 ; Assumptions about the environment stage 2 provides:
 ;
@@ -82,6 +83,56 @@ VBE_MODE_LFB            equ 0x4000  ; bit 14 of the mode number, see vbe_setup
 VBE_MODE_MASK           equ 0x3FFF  ; bits 0..13 are the mode number proper
 
 VBE_MAX_MODES           equ 128     ; mode list entries we are willing to keep
+
+; ---------------------------------------------------------------------------
+; The ceiling, mirrored from src/include/fbcon.h
+;
+; FBCON_MAX_WIDTH / FBCON_MAX_HEIGHT there are the authority: they size the
+; console's shadow buffer, which is statically allocated, and a mode larger
+; than that is CLIPPED rather than refused. The console would then live in the
+; top left corner of the screen and the rest would keep whatever the BIOS left
+; on it -- a boot that looks broken but reports no error anywhere. That is the
+; quiet failure fbcon.h warns about, and this file is one of the four places
+; that have to agree with it.
+;
+; The value is restated here rather than derived, and it should be said why:
+; NASM's preprocessor cannot read a C header (the comments and declarations
+; around those two #defines are not assembly), and this file may not reach
+; outside the boot directory for an include. Single-sourcing it would mean
+; having the build generate an .inc from fbcon.h, which is the obvious next
+; step if a fifth place ever needs the number. Until then the mirror is
+; defended by the assertion in VBE_RES below, so a table row that outgrows the
+; console breaks the BUILD instead of the display.
+;
+; %define rather than equ on purpose: %if is a preprocessor directive and
+; cannot see an equ, so an assertion written against an equ would silently
+; evaluate it as nothing and never fire. Single-line macros are visible to it,
+; and are just as usable as an immediate operand further down.
+; ---------------------------------------------------------------------------
+%define VBE_MAX_WIDTH   1920        ; == FBCON_MAX_WIDTH  in src/include/fbcon.h
+%define VBE_MAX_HEIGHT  1080        ; == FBCON_MAX_HEIGHT in src/include/fbcon.h
+
+; ---------------------------------------------------------------------------
+; One row of vbe_res_table: width, height, rank.
+;
+; A macro rather than three raw directives so that every row is checked
+; against the ceiling as it is written. %error aborts the assembly with the
+; offending line named, which is the loudest failure available here and much
+; better than the alternative: a mode that boots, paints, and is wrong.
+;
+; The row is exactly 5 bytes, which is what vbe_score_mode's "add si, 5"
+; assumes. Keep them in step if the layout ever changes.
+; ---------------------------------------------------------------------------
+%macro VBE_RES 3
+  %if (%1) > VBE_MAX_WIDTH || (%2) > VBE_MAX_HEIGHT
+    %error "vbe_res_table row exceeds FBCON_MAX_WIDTH/FBCON_MAX_HEIGHT -- the framebuffer console cannot use a mode this large, it would clip"
+  %endif
+  %if (%3) > 63
+    %error "vbe_res_table rank must fit in 6 bits: vbe_score_mode shifts it left by 2 in a byte register"
+  %endif
+    dw %1, %2
+    db %3
+%endmacro
 
 ; ---------------------------------------------------------------------------
 ; vbe_setup
@@ -468,6 +519,24 @@ vbe_score_mode:
     ; Resolution.
     mov  cx, [vbe_mode_info + VBE_MI_XRES]
     mov  dx, [vbe_mode_info + VBE_MI_YRES]
+
+    ; The ceiling, enforced here as well as in the table.
+    ;
+    ; This is redundant on purpose. VBE_RES already refuses to assemble a row
+    ; larger than FBCON_MAX_*, so no oversized mode can win by way of the
+    ; table -- but the table is a whitelist maintained by hand, and the cost of
+    ; not trusting it is four instructions on a path that runs a few dozen
+    ; times during one boot. What it buys is that the invariant the kernel
+    ; actually depends on ("the mode handed over is never larger than the
+    ; console's shadow buffer") is checked against the mode the CARD reported,
+    ; at the moment of the decision, rather than being inferred from the fact
+    ; that somebody built the table correctly. A row added with raw dw/db
+    ; directives, bypassing the macro, is caught here.
+    cmp  cx, VBE_MAX_WIDTH
+    ja   .unusable
+    cmp  dx, VBE_MAX_HEIGHT
+    ja   .unusable
+
     mov  si, vbe_res_table
 .res_loop:
     mov  ax, [si]
@@ -497,16 +566,77 @@ vbe_score_mode:
 ; matter of adding a row.
 ; ---------------------------------------------------------------------------
 
-; width, height, rank. 1024x768 is the mode this whole exercise was aimed at;
-; the two below it exist so a machine or a virtual card that cannot do it
-; still ends up in graphics rather than falling back to text.
+; width, height, rank.
+;
+; What the rank means, now that there are six of them: it is an ORDER, not a
+; measurement. Only "greater than" is ever asked of it (vbe_score_mode keeps
+; the strictly better mode), so the numbers could be any ascending sequence;
+; 1..6 is simply the shortest one that reads clearly. What the ordering says
+; is "if the card offers both of these, take this one".
+;
+; The order here is by pixel count, descending. That is not the only defensible
+; order, and it is worth saying exactly where it is wrong, because the table
+; has NO notion of aspect ratio and "highest resolution" is not the same
+; question as "best picture".
+;
+; The case that matters is a 16:9 panel whose card cannot do 1920x1080. Left
+; to the classic list, the next mode down by pixel count is 1280x1024, a 5:4
+; mode that a widescreen monitor either stretches or letterboxes -- worse to
+; look at than a smaller mode of the right shape. 1600x900 is in the table for
+; precisely that case, and it works because its pixel count (1440000) lands
+; above 1280x1024's (1310720): the pixel-count order puts it where the
+; aspect-ratio argument wants it anyway, so one rank column serves both.
+;
+; That is a repair, not a solution, and the remaining hole should be named: a
+; card that offers 1280x1024 but no 16:9 mode at all still hands a widescreen
+; monitor a stretched 5:4 picture, and this table cannot tell. Encoding the
+; monitor's shape is not something a mode list can do -- the ratio the USER is
+; looking at is not in the VBE information at all (it would have to come from
+; the EDID, via int 0x10 AX=4F15h, which is a different feature and a
+; different conversation). If it ever does, the honest fix is a fourth column
+; here plus a term for it in the score, not a re-ordering of ranks: one rank
+; can encode one preference, and any single order has to be wrong for one
+; class of monitor or the other.
+;
+; The two ends of the table are the interesting ones:
+;
+;   1920x1080 is exactly FBCON_MAX_* and therefore the largest mode that can
+;   ever be selected. It is NOT a standard VESA mode -- the VESA numbering
+;   stops at 1600x1200 (modes 0x11E..0x120) -- and is reached through the
+;   Bochs/VBE display extensions that QEMU's std VGA, virtio, VMware SVGA and
+;   most real cards of the last twenty years implement. Asking for it costs
+;   nothing where it is absent, and that is worth being precise about: the
+;   walk in vbe_setup enumerates whatever VideoModePtr lists and matches on
+;   the XResolution/YResolution fields a 4F01h call returns -- never on a mode
+;   NUMBER. A size the card does not offer therefore never appears in the
+;   list, is never scored, and is never handed to 4F02h; the only cost of its
+;   row is the handful of instructions .res_loop spends walking past it, for
+;   modes that end up rejected anyway. There is no failed mode set, no BIOS
+;   probe and no delay -- which is what lets the table be optimistic.
+;
+;   640x480 stays the floor for the same reason it always was: it is the one
+;   mode a VBE 2.0 card can be relied on to have, and landing there is still
+;   enormously better than falling back to text.
+;
+; 1600x1200 is deliberately NOT here, although it IS a standard VESA mode and
+; would otherwise have earned a row between 1920x1080 and 1600x900. Its height exceeds
+; FBCON_MAX_HEIGHT (1200 > 1080), so the console would size itself to 67 rows
+; on a screen with room for 75 and leave the bottom 128 pixel lines untouched
+; for the rest of the session. The VBE_RES macro refuses to assemble it, which
+; is how this was found rather than remembered. It can be added the day
+; fbcon.h raises FBCON_MAX_HEIGHT to 1200 -- and not one day earlier.
+;
+; Ranks must be DISTINCT. vbe_score_mode keeps the strictly better mode, so
+; two rows sharing a rank do not mean "either will do": they mean the winner
+; is whichever the card happens to list first, which is a decision made by the
+; BIOS rather than by this table.
 vbe_res_table:
-    dw 1024, 768
-    db 3
-    dw 800, 600
-    db 2
-    dw 640, 480
-    db 1
+    VBE_RES 1920, 1080, 6               ; 16:9, == FBCON_MAX_*, Bochs/VBE ext
+    VBE_RES 1600,  900, 5               ; 16:9, Bochs/VBE ext
+    VBE_RES 1280, 1024, 4               ; 5:4,  standard VESA (0x11A/0x11B)
+    VBE_RES 1024,  768, 3               ; 4:3,  standard VESA (0x117/0x118)
+    VBE_RES  800,  600, 2               ; 4:3,  standard VESA (0x114/0x115)
+    VBE_RES  640,  480, 1               ; 4:3,  the floor
     dw 0                                ; terminator
 
 ; bits per pixel, rank. 32 first because a four byte pixel means the kernel

@@ -32,22 +32,31 @@
 /* Upper bounds for the shadow buffer, which is statically allocated. A
 *  larger mode is clipped to this rather than refused.
 *
-*  The numbers are not a guess at "big enough": they are the highest mode the
-*  bootloader can actually establish, divided by the cell size. vbe_res_table
-*  in boot/vbe.inc lists 1024x768, 800x600 and 640x480 and nothing above, and
-*  the cell is 8x16 -- so 1024/8 by 768/16. Multiboot cannot raise that
-*  either, because start.asm deliberately does not set the VIDEO_MODE flag,
-*  which means a framebuffer only ever comes from our own stage 2.
+*  The numbers are not a guess at "big enough": they are the highest mode this
+*  system can end up in, divided by the cell size. That mode is named once, in
+*  FBCON_MAX_WIDTH/HEIGHT below, and everything that has to agree about it
+*  derives from there:
 *
-*  They were 160x64 before, sized for a 1280x1024 nothing can produce. That
-*  cost 8 KiB of .bss for cells no mode reaches, and 20 percent of every
-*  scroll, since fbcon_scroll() moves whole rows of MAX_COLS.
+*    - vbe_res_table in boot/vbe.inc, which our own stage 2 negotiates from
+*    - the video request in the Multiboot header in src/start.asm, which GRUB
+*      honours and QEMU's -kernel loader does not
+*    - the back buffer in user/gfxlib.c, which a ring 3 program draws into
 *
-*  Keeping the coupling in mind matters: adding a row to vbe_res_table means
-*  raising these two, otherwise the console silently uses the top left corner
-*  of the new mode instead of all of it. */
-#define FBCON_MAX_COLS   (1024 / 8)
-#define FBCON_MAX_ROWS   (768 / 16)
+*  Raising this raises all four, and each costs memory in a different place --
+*  the shadow buffer here, a frame per page of the program's .bss there, and
+*  the framebuffer itself on the card. A mode the hardware does not offer is
+*  simply not chosen: stage 2 walks the table downwards and takes the highest
+*  the card actually reports, so the same binary lands at 1920x1080 on one
+*  machine and 640x480 on another.
+*
+*  If any of the four falls behind the others, the failure is quiet rather
+*  than loud -- the console would use the top left corner of a larger mode and
+*  the rest of the screen would keep whatever was on it. */
+#define FBCON_MAX_WIDTH   1920
+#define FBCON_MAX_HEIGHT  1080
+
+#define FBCON_MAX_COLS   (FBCON_MAX_WIDTH / FBCON_CELL_W)
+#define FBCON_MAX_ROWS   (FBCON_MAX_HEIGHT / FBCON_CELL_H)
 
 /* Records what the bootloader handed over, before anything can be mapped.
 *  Safe to call with no framebuffer; fbcon_active() then stays false and
