@@ -22,6 +22,7 @@
 #include <tcp.h>
 #include <mouse.h>
 #include <usb.h>
+#include <blockdev.h>
 #include <uhci.h>
 //#include <wmessages.h>
 
@@ -948,6 +949,7 @@ static void usb_explain_layering(void);
 static void usb_explain_absent(void);
 static void usb_show_frames(void);
 static void usb_show_endpoints(const usb_device *dev);
+static void usb_show_storage_line(const usb_device *dev);
 static void usb_show_devices(void);
 static void usb_show_counters(void);
 static void usb_show_bus(void);
@@ -8145,6 +8147,45 @@ static void usb_show_endpoints(const usb_device *dev)
 *  and the class triple: that is how "lsusb" writes an id, it is how "lspci"
 *  writes a class here, and half the class codes -- 0x0A, 0x0E, 0xE0, 0xFF --
 *  are only recognisable that way. */
+/* One extra line under a mass storage device: which block device number it
+*  became, and how big it is.
+*
+*  It is not part of the table because it is not a USB fact -- everything else
+*  in that row came off the wire, and this comes from the layer above. But it
+*  is the number "df" and a mount would name, so a listing that shows a disk
+*  and leaves it out sends the reader to another command to finish a sentence
+*  this one started.
+*
+*  A unit the driver refused -- a sector size that is not 512, a medium that
+*  never became ready -- has no number, and saying so is the point: without it
+*  a refused stick and a stick nobody looked at are the same blank space. */
+static void usb_show_storage_line(const usb_device *dev)
+{
+	int unit;
+	int blkdev;
+
+	if(dev->iface_class != USB_CLASS_MASS_STORAGE)
+		return;
+
+	for(unit = 0; unit < usbmsc_count(); unit++)
+	{
+		blkdev = usbmsc_blkdev(unit);
+
+		printf("      ");
+		if(blkdev < 0)
+		{
+			printf("no block device: %s\n", usbmsc_describe(unit));
+		}
+		else
+		{
+			printf("block device %i, %i MiB, %s\n",
+			       blkdev,
+			       (int)(blk_sectors(blkdev) / 2048u),
+			       blk_describe(blkdev));
+		}
+	}
+}
+
 static void usb_show_devices(void)
 {
 	const usb_device *dev;
@@ -8255,6 +8296,13 @@ static void usb_show_devices(void)
 		                              dev->iface_protocol));
 
 		usb_show_endpoints(dev);
+
+		/* For a disk, the block device number it took -- which is the one
+		   thing on this screen a person then has to type, and the only piece
+		   of the answer that is not in the USB descriptors. A unit that was
+		   refused says so instead, because "no number" and "not listed" look
+		   identical otherwise. */
+		usb_show_storage_line(dev);
 	}
 
 	/* Why the EPs column may be smaller than the device's own descriptor
