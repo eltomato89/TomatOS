@@ -12,6 +12,15 @@
 ; kernel can have a truecolour framebuffer at all -- up to 1920x1080 where the
 ; card offers it, and down to 640x480 where it does not, from the same binary.
 ;
+; The mode is chosen in two steps, and the second one is worth naming here
+; because it is not obvious that it is needed. First, every mode the card
+; enumerates is scored, and the highest scorer wins. Second, that answer is
+; constrained by what the DISPLAY can show, read out of the monitor's EDID --
+; because a card's mode list is a list of signals it can GENERATE, and a
+; laptop's card can generate signals its own panel cannot lock onto. Setting
+; one of those succeeds at every step and leaves the screen black. See
+; vbe_edid_probe.
+;
 ; Assumptions about the environment stage 2 provides:
 ;
 ;   * "boot/layout.inc" has ALREADY been %include'd by the caller. This file
@@ -83,6 +92,38 @@ VBE_MODE_LFB            equ 0x4000  ; bit 14 of the mode number, see vbe_setup
 VBE_MODE_MASK           equ 0x3FFF  ; bits 0..13 are the mode number proper
 
 VBE_MAX_MODES           equ 128     ; mode list entries we are willing to keep
+
+; ---------------------------------------------------------------------------
+; EDID offsets (block 0, 128 bytes, returned by AX=4F15h BL=01h)
+;
+; Only the handful we actually read. EDID is a much larger structure than
+; this; everything not named here is deliberately not believed.
+;
+; The Detailed Timing Descriptor at offset 54 is the interesting one. DTD 1 is
+; by definition the display's PREFERRED timing, and on a fixed-pixel display
+; -- which every laptop panel is -- preferred means native: the one resolution
+; at which the panel is not scaling. That is precisely the number this file
+; needs, and it is the only place in the whole boot chain where the shape of
+; the actual SCREEN, as opposed to the capabilities of the card, can be found.
+;
+; The active pixel counts are 12-bit values split across three bytes each,
+; which is the sort of packing that is easy to get subtly wrong, so it is
+; written out: horizontal active is byte 56 plus the high nibble of byte 58
+; shifted left by 8, and vertical active is byte 59 plus the high nibble of
+; byte 61 shifted left by 8. The LOW nibbles of bytes 58 and 61 belong to the
+; blanking counts and must be masked off -- keeping them would inflate the
+; width by up to 15 and let a mode through that the panel cannot show, which
+; is the exact failure this code exists to prevent.
+; ---------------------------------------------------------------------------
+EDID_SIZE               equ 128     ; block 0; the checksum covers all of it
+EDID_DTD1_CLOCK         equ 54      ; word, pixel clock / 10 kHz. 0 means this
+                                    ;   descriptor is NOT a timing at all but
+                                    ;   a monitor name or range block, and its
+                                    ;   "resolution" would be ASCII text.
+EDID_DTD1_HACT_LO       equ 56      ; byte, horizontal active bits 0..7
+EDID_DTD1_HACT_HI       equ 58      ; byte, bits 4..7 = h active bits 8..11
+EDID_DTD1_VACT_LO       equ 59      ; byte, vertical active bits 0..7
+EDID_DTD1_VACT_HI       equ 61      ; byte, bits 4..7 = v active bits 8..11
 
 ; ---------------------------------------------------------------------------
 ; The ceiling, mirrored from src/include/fbcon.h
@@ -194,6 +235,17 @@ vbe_setup:
     mov  ax, [vbe_ctrl_info + VBE_CI_VERSION]
     mov  [vbe_version], ax
 
+    ; -----------------------------------------------------------------
+    ; 1b. Ask the display what it actually is.
+    ;
+    ; Everything else in this file is a conversation with the CARD, and the
+    ; card is not the thing the user looks at. See vbe_edid_probe: on success
+    ; it leaves the panel's native size in vbe_panel_w/h and vbe_score_mode
+    ; refuses anything larger; on failure it leaves both zero and no filtering
+    ; happens at all. It cannot fail in a way that stops the boot.
+    ; -----------------------------------------------------------------
+    call vbe_edid_probe
+
     ; PhysBasePtr and the "LFB available" attribute bit were both introduced
     ; with VBE 2.0. On a VBE 1.x BIOS there is no linear framebuffer to be
     ; had, only bank switching, which is not what the kernel expects.
@@ -241,9 +293,34 @@ vbe_setup:
     ; Scoring rather than taking the first match matters: the list is in no
     ; useful order, so "first mode that fits" would happily hand the kernel
     ; 640x480x16 on a machine that can do 1024x768x32.
+    ;
+    ; TWO winners are tracked, not one, and that is the whole safety of the
+    ; EDID filter:
+    ;
+    ;   vbe_best_*  the best mode that ALSO fits the panel. This is the one we
+    ;               want, and on a machine with no EDID it is simply the best
+    ;               mode, because the filter then never rejects anything.
+    ;   vbe_any_*   the best mode ignoring the panel entirely -- i.e. exactly
+    ;               what this routine chose before the filter existed.
+    ;
+    ; The filter is therefore allowed to be wrong without being fatal. If the
+    ; EDID was misparsed, or describes an external monitor that is not the
+    ; screen the user is looking at, or names a size for which the card offers
+    ; no mode in vbe_res_table at all, the filtered set can come out EMPTY --
+    ; and an empty set must never mean "no graphics mode", because the whole
+    ; point of the exercise is a display the user can see. So a filtered set
+    ; with nothing in it falls back to vbe_any_*, which is the pre-EDID
+    ; behaviour, rather than to .fail.
+    ;
+    ; Tracking both in one walk rather than making two passes is not just
+    ; economy: a second pass would mean a second few dozen int 0x10 calls, and
+    ; the answers would have to be assumed identical for the decision to make
+    ; any sense. One pass cannot disagree with itself.
     ; -----------------------------------------------------------------
     mov  word [vbe_best_mode], 0xFFFF
     mov  byte [vbe_best_score], 0
+    mov  word [vbe_any_mode], 0xFFFF
+    mov  byte [vbe_any_score], 0
     mov  si, vbe_mode_list
 
 .next_mode:
@@ -266,13 +343,30 @@ vbe_setup:
     cmp  ax, 0x004F
     jne  .mode_done                     ; BIOS lists modes it cannot describe
 
-    call vbe_score_mode                 ; AL = score, 0 means unusable
+    ; AL = score, 0 means unusable. CF set means the mode is usable but is
+    ; larger than the panel the EDID described, so it may only compete for
+    ; the unfiltered fallback below.
+    ;
+    ; BX rather than AX carries the mode number from here on, because AL is
+    ; still needed for the second comparison and "mov ax, [vbe_cur_mode]"
+    ; would eat it.
+    call vbe_score_mode
+    jc   .score_any
+
     cmp  al, [vbe_best_score]
-    jbe  .mode_done                     ; strictly better wins, so on a tie
+    jbe  .score_any                     ; strictly better wins, so on a tie
                                         ; the earlier mode is kept
     mov  [vbe_best_score], al
-    mov  ax, [vbe_cur_mode]
-    mov  [vbe_best_mode], ax
+    mov  bx, [vbe_cur_mode]
+    mov  [vbe_best_mode], bx
+
+.score_any:
+    ; Every usable mode feeds the fallback, panel-sized or not.
+    cmp  al, [vbe_any_score]
+    jbe  .mode_done
+    mov  [vbe_any_score], al
+    mov  bx, [vbe_cur_mode]
+    mov  [vbe_any_mode], bx
 
 .mode_done:
     ; SI is restored here and not straight after the BIOS call, because
@@ -282,7 +376,24 @@ vbe_setup:
 
 .have_best:
     cmp  byte [vbe_best_score], 0
-    je   .fail                          ; nothing usable: keep text mode
+    jne  .chosen
+
+    ; Nothing at all survived the panel filter. Two ways to get here, and
+    ; they need the same answer: either the card offers no mode this file
+    ; recognises (in which case vbe_any_score is zero too and we keep text
+    ; mode, exactly as before), or the EDID named a panel no row of
+    ; vbe_res_table fits inside -- a 1280x800 or 1440x900 display, say, on a
+    ; card whose only smaller offer is 1024x768 -- and then the honest answer
+    ; is the mode we would have picked with no EDID at all. A picture that is
+    ; too big for the panel is a gamble; NO picture is a certainty, and a
+    ; certainty of nothing is worse than a gamble on something.
+    mov  al, [vbe_any_score]
+    test al, al
+    jz   .fail                          ; nothing usable: keep text mode
+    mov  [vbe_best_score], al
+    mov  ax, [vbe_any_mode]
+    mov  [vbe_best_mode], ax
+.chosen:
 
     ; Re-read the winner's mode info, because the walk left the buffer full of
     ; whatever the last mode in the list happened to be.
@@ -461,10 +572,163 @@ vbe_get_pitch:
     ret
 
 ; ---------------------------------------------------------------------------
+; vbe_edid_probe
+;
+;   in:  DS = 0, real mode, a VBE 2.0+ BIOS already confirmed by vbe_setup
+;   out: vbe_panel_w / vbe_panel_h hold the display's native size in pixels,
+;        or stay at zero if there is no EDID worth believing. Never fails in
+;        any way the caller has to handle -- "we do not know" is a normal and
+;        common answer, and it is the answer that changes nothing.
+;   clobbers: nothing the caller can see (pusha / pop es).
+;
+; WHY THIS EXISTS. The mode list tells us what the CARD can generate; it says
+; nothing about what the SCREEN can show, and on a laptop those two lists are
+; not the same list. A ThinkPad T430's Intel HD 4000 offers 1920x1080 because
+; the VGA and DisplayPort connectors can drive a monitor that size. The panel
+; hinged to the lid is 1366x768 or 1600x900 and cannot. Set 1920x1080 on such
+; a machine and every single thing works: 4F02h returns success, the
+; framebuffer is real, the kernel boots, the console draws -- and the panel
+; stays black, because it has been handed a signal it cannot lock onto. That
+; is the worst failure this boot chain has, because it is indistinguishable
+; from a hang and there is nothing on the screen to say otherwise.
+;
+; AX=4F15h is the VBE/DDC extension: the video BIOS reads the display's EDID
+; over the monitor's I2C lines and hands it back. BL=01h reads one 128-byte
+; block, CX selects the controller unit (0 = the primary display) and DX the
+; block number (0 = the base block, which is the only one we want).
+;
+; WHY THE VALIDATION IS NOT OPTIONAL, and this is measured rather than
+; assumed -- all three of these were observed from a real probe under QEMU:
+;
+;   * QEMU's std VGA / -device VGA answers properly, with a real EDID whose
+;     preferred timing is whatever xres/yres say (1280x800 by default).
+;   * -device VGA,edid=off returns AX=004Fh -- SUCCESS -- and fills the buffer
+;     with 0xFF bytes. A caller that trusted the return code alone would read
+;     a 4095x4095 panel out of that and filter every mode away.
+;   * -vga cirrus returns AX=004Fh and writes NOTHING. The buffer is left as
+;     it was, and if that is all zeros then the checksum test PASSES, because
+;     zero bytes sum to zero. The header check is the only thing that catches
+;     it, which is why both tests are here and neither is enough alone.
+;
+; So the buffer is wiped first (so "the BIOS wrote nothing" is a state we can
+; recognise rather than stale data we might believe), the 8-byte header
+; 00 FF FF FF FF FF FF 00 is checked, the checksum over all 128 bytes is
+; checked, and the descriptor is checked for being a timing at all. Anything
+; that does not pass all four leaves the panel size unknown -- which is the
+; NORMAL case on plenty of hardware, not an error, and costs exactly the
+; behaviour this file had before EDID was read at all.
+; ---------------------------------------------------------------------------
+vbe_edid_probe:
+    pusha
+    push es
+
+    ; Wipe first. See the cirrus case above: a BIOS is entitled to report
+    ; success and leave the buffer alone, and an all-zero buffer fails the
+    ; header check, whereas whatever happened to be here might not.
+    cld
+    push ds
+    pop  es
+    mov  di, vbe_edid
+    mov  cx, EDID_SIZE
+    xor  al, al
+    rep  stosb
+
+    mov  di, vbe_edid                   ; ES:DI, and ES is still DS
+    mov  ax, 0x4F15
+    mov  bx, 0x0001                     ; BL = 01h, read EDID. The whole of BX
+                                        ; is written rather than just BL: BH is
+                                        ; not an input for this subfunction, so
+                                        ; leaving it as whatever pusha happened
+                                        ; to preserve is relying on every BIOS
+                                        ; agreeing about that, for no saving.
+    xor  cx, cx                         ; controller unit 0, the primary one
+    xor  dx, dx                         ; EDID block 0
+    push ds                             ; as everywhere else in this file: a
+    int  0x10                           ; video BIOS may return with the
+    pop  ds                             ; segment registers rearranged
+    cmp  ax, 0x004F
+    jne  .unknown                       ; no DDC, no monitor, or refused
+
+    ; --- the 8 byte header: 00 FF FF FF FF FF FF 00 ---------------------
+    cmp  byte [vbe_edid + 0], 0x00
+    jne  .unknown
+    cmp  byte [vbe_edid + 7], 0x00
+    jne  .unknown
+    mov  si, vbe_edid + 1
+    mov  cx, 6
+.header_loop:
+    lodsb
+    cmp  al, 0xFF
+    jne  .unknown
+    loop .header_loop
+
+    ; --- the checksum: all 128 bytes sum to zero modulo 256 --------------
+    ; A byte-wide accumulator IS the modulo, so there is nothing to take a
+    ; remainder of afterwards.
+    mov  si, vbe_edid
+    mov  cx, EDID_SIZE
+    xor  al, al
+.sum_loop:
+    add  al, [si]
+    inc  si
+    loop .sum_loop
+    test al, al
+    jnz  .unknown
+
+    ; --- DTD 1 has to actually be a detailed timing ----------------------
+    ; The four descriptors at 54, 72, 90 and 108 share one slot format, and a
+    ; zero pixel clock is the flag that says "this one is a display
+    ; descriptor instead" -- a monitor name, a serial number, a range limit
+    ; block. Reading a name as a resolution gives a panel size made of ASCII.
+    cmp  word [vbe_edid + EDID_DTD1_CLOCK], 0
+    je   .unknown
+
+    ; --- horizontal active, into DI --------------------------------------
+    movzx ax, byte [vbe_edid + EDID_DTD1_HACT_HI]
+    and  al, 0xF0                       ; the low nibble is h blanking
+    shl  ax, 4                          ; nibble -> bits 8..11
+    mov  bl, [vbe_edid + EDID_DTD1_HACT_LO]
+    xor  bh, bh
+    add  ax, bx
+    mov  di, ax
+
+    ; --- vertical active, into AX ----------------------------------------
+    movzx ax, byte [vbe_edid + EDID_DTD1_VACT_HI]
+    and  al, 0xF0                       ; the low nibble is v blanking
+    shl  ax, 4
+    mov  bl, [vbe_edid + EDID_DTD1_VACT_LO]
+    xor  bh, bh
+    add  ax, bx
+
+    ; Both are published together or not at all. A zero in either half is a
+    ; descriptor we misread, and half a panel size is worse than none: it
+    ; would filter every mode away in one axis and none in the other.
+    test di, di
+    jz   .unknown
+    test ax, ax
+    jz   .unknown
+    mov  [vbe_panel_h], ax
+    mov  [vbe_panel_w], di
+
+.unknown:
+    ; Nothing to undo on the failure path: both words are only ever written
+    ; once, above, after every check has passed. Zero means "no panel size
+    ; is known", which is what they started as.
+    pop  es
+    popa
+    ret
+
+; ---------------------------------------------------------------------------
 ; vbe_score_mode
 ;
-;   in:  vbe_mode_info filled in by a successful 4F01h
+;   in:  vbe_mode_info filled in by a successful 4F01h,
+;        vbe_panel_w / vbe_panel_h from vbe_edid_probe (0 = unknown)
 ;   out: AL = score, 0 meaning the mode is unusable. Higher is better.
+;        CF set = the mode is otherwise fine but is larger than the panel, so
+;                 it may only compete for the unfiltered fallback. CF is
+;                 always clear when the EDID was unavailable, which is what
+;                 makes this file behave exactly as it used to on a machine
+;                 that has no EDID to give.
 ;   clobbers: AX, BX, CX, DX, SI
 ;
 ; The score is  resolution_rank * 4 + depth_rank, with both ranks taken from
@@ -554,10 +818,40 @@ vbe_score_mode:
     shl  bl, 2
     add  bl, bh
     mov  al, bl
+
+    ; -----------------------------------------------------------------
+    ; The panel filter.
+    ;
+    ; CX and DX still hold this mode's XResolution and YResolution -- the
+    ; table walk above only touched AX and SI -- so no reload is needed.
+    ;
+    ; This NARROWS and never widens: it can turn an otherwise good mode into
+    ; a fallback-only candidate, and it can do nothing else. It cannot invent
+    ; a mode, cannot change a score, and cannot reject a mode on a machine
+    ; where vbe_panel_w is zero, which is every machine whose EDID could not
+    ; be read. That is the property the whole design rests on: the worst this
+    ; filter can do when it is wrong is choose a smaller mode than necessary,
+    ; and the worst it can do when it is right is prevent a black screen.
+    ;
+    ; "Wider or taller than the panel", strictly -- a mode exactly the size of
+    ; the panel is the ideal case, not a rejected one.
+    ; -----------------------------------------------------------------
+    cmp  word [vbe_panel_w], 0
+    je   .accept                        ; no EDID: no filtering, as before
+    cmp  cx, [vbe_panel_w]
+    ja   .oversize
+    cmp  dx, [vbe_panel_h]
+    ja   .oversize
+.accept:
+    clc
+    ret
+.oversize:
+    stc
     ret
 
 .unusable:
     xor  al, al
+    clc                                 ; a zero score is not a panel refusal
     ret
 
 ; ---------------------------------------------------------------------------
@@ -568,10 +862,10 @@ vbe_score_mode:
 
 ; width, height, rank.
 ;
-; What the rank means, now that there are six of them: it is an ORDER, not a
+; What the rank means, now that there are nine of them: it is an ORDER, not a
 ; measurement. Only "greater than" is ever asked of it (vbe_score_mode keeps
 ; the strictly better mode), so the numbers could be any ascending sequence;
-; 1..6 is simply the shortest one that reads clearly. What the ordering says
+; 1..9 is simply the shortest one that reads clearly. What the ordering says
 ; is "if the card offers both of these, take this one".
 ;
 ; The order here is by pixel count, descending. That is not the only defensible
@@ -589,14 +883,26 @@ vbe_score_mode:
 ;
 ; That is a repair, not a solution, and the remaining hole should be named: a
 ; card that offers 1280x1024 but no 16:9 mode at all still hands a widescreen
-; monitor a stretched 5:4 picture, and this table cannot tell. Encoding the
-; monitor's shape is not something a mode list can do -- the ratio the USER is
-; looking at is not in the VBE information at all (it would have to come from
-; the EDID, via int 0x10 AX=4F15h, which is a different feature and a
-; different conversation). If it ever does, the honest fix is a fourth column
-; here plus a term for it in the score, not a re-ordering of ranks: one rank
-; can encode one preference, and any single order has to be wrong for one
-; class of monitor or the other.
+; monitor a stretched 5:4 picture, and this table cannot tell. The EDID does
+; now reach this file -- vbe_edid_probe reads it and vbe_score_mode refuses
+; anything bigger than the panel -- but note carefully what that filter is and
+; is not. It is a CEILING, not a shape: it stops a mode the panel cannot
+; display, and it says nothing about whether a mode that does fit has the
+; right aspect ratio. A 1280x1024 mode on a 1366x768 panel is smaller in both
+; axes and passes the filter, and it is still the wrong shape. Encoding the
+; monitor's shape would want a fourth column here plus a term for it in the
+; score, not a re-ordering of ranks: one rank can encode one preference, and
+; any single order has to be wrong for one class of monitor or the other.
+;
+; The clearest place that order is a compromise is 1440x900 against
+; 1280x1024. By pixel count 1280x1024 wins, by 14720 pixels -- 1.1%, which is
+; nothing -- and by shape 1440x900 is the better answer for every widescreen
+; panel made in the last fifteen years. The pixel-count rule is kept anyway,
+; because it is a rule that can be checked by arithmetic instead of by taste,
+; and because the case where it costs anything real is narrow: it needs a card
+; that offers 1280x1024 and 1440x900 and nothing above either. Where it does
+; bite, the EDID filter usually settles it first -- a 1440x900 panel refuses
+; the 1024-line mode as too tall before the ranks are ever compared.
 ;
 ; The two ends of the table are the interesting ones:
 ;
@@ -619,7 +925,8 @@ vbe_score_mode:
 ;   enormously better than falling back to text.
 ;
 ; 1600x1200 is deliberately NOT here, although it IS a standard VESA mode and
-; would otherwise have earned a row between 1920x1080 and 1600x900. Its height exceeds
+; would otherwise have earned a row between 1920x1080 and 1680x1050 (its
+; 1920000 pixels land between their 2073600 and 1764000). Its height exceeds
 ; FBCON_MAX_HEIGHT (1200 > 1080), so the console would size itself to 67 rows
 ; on a screen with room for 75 and leave the bottom 128 pixel lines untouched
 ; for the rest of the session. The VBE_RES macro refuses to assemble it, which
@@ -630,13 +937,51 @@ vbe_score_mode:
 ; two rows sharing a rank do not mean "either will do": they mean the winner
 ; is whichever the card happens to list first, which is a decision made by the
 ; BIOS rather than by this table.
+;
+; THE PIXEL COUNTS ARE WRITTEN OUT so that the order can be checked by reading
+; rather than by nine multiplications, and so that inserting a row is a matter
+; of finding where its own count belongs. Every column below must descend:
+;
+;       1920x1080   2073600      1440x900    1296000
+;       1680x1050   1764000      1366x768    1049088
+;       1600x900    1440000      1024x768     786432
+;       1280x1024   1310720       800x600     480000
+;                                 640x480     307200
+;
+; The three panel sizes at ranks 8, 5 and 4 were added because they are what
+; the machines this boots on actually have and not what the VESA standard has:
+; 1366x768 is the single commonest laptop panel ever built and is one of the
+; two a ThinkPad T430 ships with, 1440x900 and 1680x1050 are the 16:10 sizes of
+; the generation before it. Their absence did not stop those machines booting,
+; but it made them boot into the largest mode the CARD offered instead of the
+; one the panel is -- which, on the T430, is exactly the 1920x1080 black screen
+; the EDID filter above exists to prevent. A filter that rejects everything is
+; no better than no filter at all, so the rows have to be here for it to have
+; anything to choose.
 vbe_res_table:
-    VBE_RES 1920, 1080, 6               ; 16:9, == FBCON_MAX_*, Bochs/VBE ext
-    VBE_RES 1600,  900, 5               ; 16:9, Bochs/VBE ext
-    VBE_RES 1280, 1024, 4               ; 5:4,  standard VESA (0x11A/0x11B)
-    VBE_RES 1024,  768, 3               ; 4:3,  standard VESA (0x117/0x118)
-    VBE_RES  800,  600, 2               ; 4:3,  standard VESA (0x114/0x115)
-    VBE_RES  640,  480, 1               ; 4:3,  the floor
+    VBE_RES 1920, 1080, 10              ; 16:9,  2073600 px, == FBCON_MAX_*
+    VBE_RES 1680, 1050, 9               ; 16:10, 1764000 px, common 22" panel
+    VBE_RES 1600,  900, 8               ; 16:9,  1440000 px, T430 HD+ panel
+    VBE_RES 1280, 1024, 7               ; 5:4,   1310720 px, VESA 0x11A/0x11B
+    VBE_RES 1440,  900, 6               ; 16:10, 1296000 px, see the note above
+    VBE_RES 1366,  768, 5               ; 16:9,  1049088 px, T430 HD panel
+    VBE_RES 1280,  800, 4               ; 16:10, 1024000 px, see below
+    VBE_RES 1024,  768, 3               ; 4:3,    786432 px, VESA 0x117/0x118
+    VBE_RES  800,  600, 2               ; 4:3,    480000 px, VESA 0x114/0x115
+    VBE_RES  640,  480, 1               ; 4:3,    307200 px, the floor
+;
+; 1280x800 IS HERE BECAUSE OF WHAT THE PANEL FILTER DOES WITH A MISSING ROW.
+; It is a real and very common 16:10 laptop panel, and it is also what QEMU's
+; default EDID advertises -- so when the filter went in, the whole table above
+; 1024x768 was suddenly out of reach on the default development machine and
+; every boot dropped to 1024x768 in a 1280x800 frame. That is the filter
+; working correctly on a table with a hole in it, and the hole is the bug.
+;
+; The general shape of it is worth stating, because it will happen again: a
+; panel size that is not a row here does not merely fail to be chosen, it
+; pushes the choice down to the largest row that FITS INSIDE it, which can be
+; much smaller. A missing row costs more once the filter exists than it did
+; when the highest scorer simply won.
     dw 0                                ; terminator
 
 ; bits per pixel, rank. 32 first because a four byte pixel means the kernel
@@ -669,19 +1014,25 @@ vbe_rgb888:
 ; STAGE2_ORG + (however far into stage 2 this file was included). That is
 ; comfortably below 1 MiB, which is all the BIOS requires of an ES:DI buffer.
 ;
-; Total cost is 1032 bytes. Worth checking against layout.inc: DISK_BUFFER
-; sits at 0x9000, only 0x1000 bytes above STAGE2_ORG, so stage 2's code plus
-; these buffers has to stay under 4 KiB or the two will overlap. Should stage
-; 2 ever grow past that, move these buffers to fixed addresses in the free
-; 0x0500..0x6FFF region rather than letting them drift into DISK_BUFFER.
+; Total cost is 1166 bytes. Worth checking against layout.inc: DISK_BUFFER
+; sits at 0xA000, 0x2000 bytes above STAGE2_ORG, so stage 2's code plus these
+; buffers has to stay under 8 KiB or the two will overlap -- which is the same
+; ceiling stage2.asm's own assertions enforce, and they are what will actually
+; catch it. Should stage 2 ever outgrow that, move these buffers to fixed
+; addresses in the free 0x0500..0x6FFF region rather than letting them drift
+; into DISK_BUFFER.
 ; ---------------------------------------------------------------------------
 vbe_ctrl_info:      times 512 db 0      ; VbeInfoBlock, must be 512 for 'VBE2'
 vbe_mode_info:      times 256 db 0      ; ModeInfoBlock, VBE 3.0 wants 256
 vbe_mode_list:      times (VBE_MAX_MODES * 2) db 0  ; our copy of the mode list
+vbe_edid:           times EDID_SIZE db 0 ; EDID block 0 from AX=4F15h BL=01h
 vbe_version:        dw 0                ; BCD, e.g. 0x0300
 vbe_cur_mode:       dw 0                ; mode currently under examination
-vbe_best_mode:      dw 0xFFFF           ; best mode found, 0xFFFF = none
+vbe_best_mode:      dw 0xFFFF           ; best mode that also fits the panel
+vbe_any_mode:       dw 0xFFFF           ; best mode ignoring the panel
+vbe_panel_w:        dw 0                ; the display's native size in pixels,
+vbe_panel_h:        dw 0                ;   0/0 = no EDID worth believing
 vbe_best_score:     db 0                ; its score, 0 = nothing usable yet
-vbe_pad:            db 0                ; keeps what follows word aligned
+vbe_any_score:      db 0                ; and the fallback's
 
 %endif ; TOMATOS_VBE_INC

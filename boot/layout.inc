@@ -114,6 +114,13 @@ RESERVED_SECTORS    equ 1040
 
 ; Real mode load addresses. Everything below 0x7C00 up to 0x0500 is free,
 ; and 0x7E00 upward is free until the BIOS data at 0x9FC00.
+; BIOS data area, the keyboard shift-state byte. Bit 0 is right shift and bit
+; 1 is left shift, and they read as "held right now" rather than as something
+; buffered -- which is exactly why the text mode escape hatch uses them: a
+; person looking at a black screen can hold shift through POST and find out
+; nothing about whether it worked until the machine comes up in 80x25.
+BIOS_KBD_FLAGS      equ 0x0417
+
 STAGE1_ORG          equ 0x7C00      ; where the BIOS puts us
 STAGE2_ORG          equ 0x8000      ; stage 1 loads stage 2 here
 STAGE2_STACK        equ 0x7C00      ; grows down, below stage 2

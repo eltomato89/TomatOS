@@ -35,7 +35,9 @@
 *       128x48 = 6144 cells: 6144 * 16 rows * 8 pixels = 786432 pixel writes,
 *       roughly 3 to 4 instructions each once the fg/bg values are hoisted
 *       out of the loops, so about 2.5 to 3 million instructions -- and every
-*       one of them is a WRITE. Plus a 15 KB move of the shadow buffer.
+*       one of them is a WRITE. Plus a 22 KB move of the shadow buffer: the
+*       move is whole rows of FBCON_MAX_COLS, not of the 128 columns this
+*       mode uses, so it is 47 * 240 * 2 bytes rather than 47 * 128 * 2.
 *
 *  And (b) does not have to be the worst case, because the shadow buffer says
 *  what is already on the screen: after the scroll, cell (c,r) has to show
@@ -123,9 +125,10 @@
 *
 *  One byte per glyph row, most significant bit leftmost, 256 glyphs (CP437,
 *  which is what printf() in scrn.c already translates its umlauts into).
-*  Lives in src/video/font8x16.c. Declared here for the same reason as above. */
-#define FBCON_CELL_W   8
-#define FBCON_CELL_H  16
+*  Lives in src/video/font8x16.c. Declared here for the same reason as above.
+*
+*  FBCON_CELL_W and FBCON_CELL_H used to be defined here. They are in fbcon.h
+*  now, next to the two public macros that are computed from them. */
 extern const uint8_t font8x16[256][FBCON_CELL_H];
 
 /* --- The shadow buffer ---------------------------------------------------
@@ -135,10 +138,19 @@ extern const uint8_t font8x16[256][FBCON_CELL_H];
 *  nostalgia -- it makes a cell a single word to compare, which is what the
 *  scroll leans on, and it makes the whole buffer one memcpy to shift.
 *
-*  160x64 cells at two bytes is 20 KiB of .bss and covers 1280x1024 with an
-*  8x16 cell. A larger mode is clipped to it rather than refused, so the
-*  console works on a screen this buffer cannot fully describe -- it just
-*  does not use the far right and the bottom of it. */
+*  The size follows FBCON_MAX_WIDTH/HEIGHT and is not chosen here: 1920x1080
+*  with an 8x16 cell is 240x67 cells, so 31.4 KiB of .bss. A larger mode is
+*  clipped to it rather than refused, so the console works on a screen this
+*  buffer cannot fully describe -- it just does not use the far right and the
+*  bottom of it. Verified against a 1920x1200 and a 2560x1440 mode: both come
+*  out as a 240x67 console, and paint_all() still fills the WHOLE screen with
+*  the background first, so the part outside the console is black rather than
+*  whatever the BIOS left there.
+*
+*  The figure is stated as a consequence rather than as a constant because it
+*  has already been wrong once: it said "160x64 cells, 20 KiB, covers
+*  1280x1024" for as long as FBCON_MAX_* said 1920x1080, and the scroll
+*  measurements below inherited the same stale column count. */
 static uint16_t shadow[FBCON_MAX_ROWS][FBCON_MAX_COLS];
 
 /* Geometry in characters. Before fbcon_describe() has been called these
@@ -912,8 +924,9 @@ void fbcon_scroll(int attrib)
 	*  cell from it unconditionally: it fills the screen with the background
 	*  first and then draws each non-blank cell, so it never assumes anything
 	*  about what is on the screen and cannot inherit a stale pixel. The
-	*  scroll while suspended therefore costs one 15 KB memcpy and no pixels
-	*  at all, however many screens' worth of text go past. */
+	*  scroll while suspended therefore costs one memcpy of at most 31 KB --
+	*  (FBCON_MAX_ROWS - 1) * FBCON_MAX_COLS * 2 -- and no pixels at all,
+	*  however many screens' worth of text go past. */
 	if(may_paint())
 	{
 		for(row = 0; row < fb_rows - 1; row++)
@@ -941,7 +954,8 @@ void fbcon_scroll(int attrib)
 
 	/* One memcpy for the shadow buffer: whole rows including the unused
 	*  columns to the right, because that keeps it a single contiguous move
-	*  of about 15 KB instead of one call per row. Forward copy with the
+	*  of at most 31 KB instead of one call per row -- 22 KB at 1024x768,
+	*  where only 48 of the 67 rows are in use. Forward copy with the
 	*  destination BELOW the source, which is what kernel.c's byte loop
 	*  handles correctly for overlapping ranges. */
 	memcpy(&shadow[0][0], &shadow[1][0],

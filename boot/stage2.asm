@@ -13,6 +13,13 @@
 ; Order of the steps, and why it is this order
 ; ---------------------------------------------------------------------------
 ;
+;   0. Shift state    One byte, read before anything else can disturb it and
+;                     long before it is needed. It is the user's only way to
+;                     say "do not set a graphics mode" on a machine where the
+;                     graphics mode is why they cannot see anything, so it has
+;                     to be sampled while the key they held through POST is
+;                     still down. See the block at s2_start.
+;
 ;   1. A20            Everything else that touches memory above 1 MiB depends
 ;                     on it. If A20 is off, a write to 0x00100000 lands at
 ;                     0x00000000 instead -- on the IVT, on this code, on the
@@ -74,6 +81,17 @@ TEXT_FB_PITCH   equ 160         ; 80 cells * 2 bytes
 TEXT_FB_WIDTH   equ 80
 TEXT_FB_HEIGHT  equ 25
 TEXT_FB_BPP     equ 16          ; two bytes per character cell
+
+; The BIOS keyboard shift-state byte, in the BIOS data area at 0040:0017.
+; Bit 0 right shift, bit 1 left shift, bit 2 ctrl, bit 3 alt; the higher bits
+; are the caps/num/scroll latches, which are NOT what we want -- a latch is a
+; toggle somebody may have left on months ago, and this has to mean "held down
+; right now".
+;
+; BIOS_KBD_FLAGS itself is in layout.inc with the other fixed low-memory
+; addresses. Only the mask is here, because only this file decides which keys
+; mean "text mode".
+KBD_SHIFT_MASK  equ 0x03        ; either shift key, see s2_start
 
 ; ---------------------------------------------------------------------------
 ; Entry point and the patchable header
@@ -142,8 +160,78 @@ s2_start:
         ; BIOS call gets a chance to eat it.
         mov     [s2_boot_drive], dl
 
+        ; --- 0. the escape hatch --------------------------------------------
+        ;
+        ; THIS IS A RECOVERY PATH FOR A USER WHO CAN SEE NOTHING AT ALL, and
+        ; every part of its design follows from that one sentence.
+        ;
+        ; The failure it answers: vbe.inc picks the best mode the CARD offers,
+        ; and on a laptop the card can offer modes the PANEL cannot display.
+        ; When that happens nothing reports an error -- 4F02h returns success,
+        ; the kernel boots, the console draws, the machine is running
+        ; perfectly -- and the screen is black. vbe.inc now reads the EDID to
+        ; avoid choosing such a mode, but the EDID is exactly the thing a
+        ; machine in this state is most likely to be lying about or not
+        ; providing, so there has to be a way out that does not depend on it.
+        ;
+        ; It must therefore work with NO FEEDBACK WHATSOEVER: the user cannot
+        ; see a menu, cannot see a countdown, cannot see whether the keypress
+        ; registered, and on a machine that boots in two seconds cannot react
+        ; to anything either. That rules out every interactive scheme and
+        ; leaves one: a key already HELD DOWN before the machine is switched
+        ; on, so it is down whenever we happen to look.
+        ;
+        ; 0040:0017 is where the BIOS keeps the live shift state, and it is
+        ; readable in real mode with one instruction. It reflects the physical
+        ; state of the keys right now, not something in the keystroke queue,
+        ; which is what makes a held key work at all.
+        ;
+        ; WHY EITHER SHIFT KEY, and not ctrl, alt, a combination, or a letter:
+        ;
+        ;   * A MODIFIER produces no keystroke, so holding it does not fill
+        ;     the BIOS keyboard buffer and does not produce the "stuck key"
+        ;     beeping that holding a letter through POST gives on a ThinkPad.
+        ;     Holding it for the whole of POST is genuinely free.
+        ;   * SHIFT specifically, because it is the convention -- it is what
+        ;     GRUB watches for to force its menu, so it is the key somebody
+        ;     with a black screen is most likely to try unprompted.
+        ;   * EITHER shift, because the user cannot see which one worked. One
+        ;     key to describe, two keys that satisfy it.
+        ;   * NOT ctrl or alt: on a ThinkPad both are involved in the BIOS's
+        ;     own boot-time gestures, and neither is worth the ambiguity.
+        ;   * NOT a two-key combination: it has to be holdable with one hand
+        ;     while the other reaches the power button, in the dark, by
+        ;     somebody already convinced the machine is broken.
+        ;
+        ; The asymmetry of being wrong is the whole argument for making it
+        ; this easy to trigger. A false positive costs a boot in 80x25 text,
+        ; which works and is obvious and is fixed by rebooting without the
+        ; key. A false negative costs a black screen with no way out. So this
+        ; is deliberately biased towards firing.
+        ;
+        ; READ HERE, at the very top, and not at step 5 where it is used.
+        ; Between the two is the whole kernel and module load -- seconds of
+        ; disk activity on a USB stick -- and nobody holds a key that long on
+        ; purpose. Sampling early catches the state the user set up before
+        ; pressing the power button, which is the only state they can set up
+        ; at all.
+        mov     al, [BIOS_KBD_FLAGS]
+        and     al, KBD_SHIFT_MASK
+        mov     [s2_safe_mode], al      ; non-zero = forced text mode
+
         mov     si, s2_msg_banner
         call    s2_print
+
+        ; Say so, audibly. s2_msg_safe opens with a BEL, which int 10h's
+        ; teletype call turns into a beep on the PC speaker -- the one channel
+        ; that still works when the display does not, and the only
+        ; confirmation available to the person this feature is for. The text
+        ; after it is for the luckier case where the screen works.
+        cmp     byte [s2_safe_mode], 0
+        je      .not_safe
+        mov     si, s2_msg_safe
+        call    s2_print
+.not_safe:
 
         call    s2_mbi_clear
 
@@ -205,6 +293,14 @@ s2_start:
         mov     si, s2_msg_vbe
         call    s2_print
 
+        ; The escape hatch, sampled at the top of this file. Skipping the call
+        ; entirely rather than letting vbe_setup run and undoing it afterwards
+        ; is the point: a mode that has been SET cannot reliably be unset, and
+        ; the screen we are trying to save is dark from the instant 4F02h
+        ; returns. Not asking is the only way to be sure.
+        cmp     byte [s2_safe_mode], 0
+        jne     .vbe_forced_text
+
         call    vbe_setup               ; see the assumed contract below
         jc      .vbe_failed
 
@@ -222,6 +318,21 @@ s2_start:
         ; kernel then comes up in text mode rather than not at all.
         call    s2_fb_text
         mov     si, s2_msg_no
+        call    s2_print
+        jmp     .vbe_done
+
+.vbe_forced_text:
+        ; The same destination as a failed vbe_setup, reached on purpose
+        ; rather than by accident -- which is exactly why this path is cheap
+        ; to have. s2_fb_text hands the kernel an EGA text screen, the kernel
+        ; sees MB_FB_TYPE_TEXT and keeps its console on 0xB8000, and nothing
+        ; anywhere else has to know that a human asked for it.
+        ;
+        ; It reports a different word from the failure above, because the two
+        ; are diagnosed differently: "text" means the machine has no usable
+        ; VBE, "safe" means it has one and was told not to use it.
+        call    s2_fb_text
+        mov     si, s2_msg_safe_short
         call    s2_print
 .vbe_done:
 
@@ -1373,10 +1484,18 @@ s2_chs_sector:  db      0
 s2_boot_drive:  db      0x80
 s2_use_lba:     db      0
 s2_retries:     db      0
+s2_safe_mode:   db      0               ; shift was held: force 80x25 text
 
 ; Kept short on purpose: one line per major step, so a hang or a reboot can
 ; always be pinned to the step whose line was printed last.
-s2_msg_banner:  db      13, 10, "TomatOS stage2", 13, 10, 0
+;
+; The banner is the one exception, and it earns its extra thirty bytes: it is
+; the only place the escape hatch is ever advertised. Reading it does not help
+; on THIS boot -- the shift state was already sampled a dozen instructions ago
+; -- but somebody who has seen it once knows what to hold down the day the
+; screen comes up black, and by then there is nothing left to read it from.
+s2_msg_banner:  db      13, 10, "TomatOS stage2 (hold shift for text mode)"
+                db      13, 10, 0
 s2_msg_a20:     db      "a20 ", 0
 s2_msg_e820:    db      "e820 ", 0
 s2_msg_load:    db      "load ", 0
@@ -1384,6 +1503,14 @@ s2_msg_mods:    db      "mods ", 0
 s2_msg_vbe:     db      "vbe ", 0
 s2_msg_ok:      db      "ok", 13, 10, 0
 s2_msg_no:      db      "text", 13, 10, 0
+
+; The escape hatch, twice. The long one is printed at the top of the boot and
+; opens with 7 -- BEL -- which int 10h AH=0Eh sounds on the PC speaker: on a
+; machine whose panel shows nothing, that beep is the entire user interface,
+; and it is the only way to learn that the held key was seen. The short one
+; takes the place of "ok" at step 5 so the step list stays one word per line.
+s2_msg_safe:    db      7, "safe mode: 80x25 text forced", 13, 10, 0
+s2_msg_safe_short: db   "safe", 13, 10, 0
 s2_msg_skip:    db      "none", 13, 10, 0
 s2_msg_fail:    db      "FAILED", 13, 10, 0
 s2_msg_disk:    db      "disk error", 13, 10, 0

@@ -55,6 +55,15 @@
 #define FBCON_MAX_WIDTH   1920
 #define FBCON_MAX_HEIGHT  1080
 
+/* The size of one character cell, which is the font's size: one byte per
+*  glyph row, 16 rows. These belong here rather than in fbcon.c because the
+*  two macros below are built from them and are public -- with the defines
+*  private, any second file that included this header and used FBCON_MAX_COLS
+*  failed to compile on an undeclared identifier, which is a header that only
+*  works for the one file that does not need it. */
+#define FBCON_CELL_W   8
+#define FBCON_CELL_H  16
+
 #define FBCON_MAX_COLS   (FBCON_MAX_WIDTH / FBCON_CELL_W)
 #define FBCON_MAX_ROWS   (FBCON_MAX_HEIGHT / FBCON_CELL_H)
 
