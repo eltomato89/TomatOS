@@ -18,6 +18,7 @@
 #include <usb.h>
 #include <exec.h>
 #include <ata.h>
+#include <blockdev.h>
 #include <fat.h>
 #include <pci.h>
 #include <rtl8139.h>
@@ -855,6 +856,17 @@ static void disk_init(void)
 
 	ata_init();
 
+	/* The block layer, immediately after the driver whose devices it claims.
+	*  blk_init() takes numbers 0..3 for ATA whether or not a drive answered on
+	*  each -- claiming them is what stops a USB stick later taking a number a
+	*  hard disk would have had, which would make "mount 1" mean different
+	*  things on two boots of one machine.
+	*
+	*  The filesystem talks only to this now, so nothing below this line may be
+	*  skipped: without it fat_mount() finds device 0 unregistered and reports
+	*  no filesystem on a machine that has one. */
+	blk_init();
+
 	first   = -1;
 	mounted = -1;
 
@@ -903,6 +915,39 @@ static void disk_init(void)
 		fat_type(), drive,
 		(int)(fat_free_bytes() / 1024u),
 		(int)(fat_total_bytes() / 1024u));
+}
+
+/* Tries to mount whatever removable block device turned up after disk_init()
+*  had already run -- a USB stick, today.
+*
+*  Split from disk_init() rather than folded into it because the two happen at
+*  different times for a real reason: ATA is there from the moment its driver
+*  probes, while a stick needs four layers that only exist once the PCI bus has
+*  been walked. Trying both from one place would mean either mounting nothing
+*  until the network stack is up, or looking for a device that cannot be there
+*  yet.
+*
+*  Silent when there is nothing, like disk_init(): a machine with no stick is
+*  the ordinary case and a row saying so is a row taken from something that has
+*  news. */
+static void removable_init(void)
+{
+	int dev;
+
+	for(dev = BLK_REMOVABLE_FIRST; dev < BLK_MAX_DEVICES; dev++)
+	{
+		if(!blk_present(dev))
+			continue;
+
+		if(fat_mount(dev) != 0)
+			continue;
+
+		printf("Filesystem: %s on %s (%s), %i KiB of %i KiB free\n",
+			fat_type(), blk_describe(dev), blk_bus(dev),
+			(int)(fat_free_bytes() / 1024u),
+			(int)(fat_total_bytes() / 1024u));
+		return;
+	}
 }
 
 /* ---------------------------------------------------------------------------
@@ -960,6 +1005,10 @@ static void network_init(void)
 	*  the boot away, because schedule() saves no context while current_task is
 	*  still -1. */
 	usbhid_init();
+
+	/* Mass storage, after HID and after blk_init() -- it registers block
+	*  devices, so the layer that owns the numbers has to exist first. */
+	usbmsc_init();
 
 	rtl8139_init();
 	net_init();
@@ -1296,6 +1345,22 @@ int kernel(uint32_t magic, multiboot_info *mbi_phys)
 	/* Network last: it is the only driver whose work starts by itself, from
 	*  an interrupt, and there is nothing above it that waits on the result. */
 	network_init();
+
+	/* And then the disks again, because USB came up in there.
+	*
+	*  disk_init() ran before it and could only see the ATA drives; a stick is
+	*  reached through the PCI bus, a host controller, the USB core and a SCSI
+	*  transport, none of which existed at that point. Rather than move the
+	*  whole of network_init() ahead of the filesystem -- which would put the
+	*  network stack before the disk it may want to read from -- the mount is
+	*  simply tried again for whatever appeared meanwhile.
+	*
+	*  Only if nothing is mounted yet. A machine with a hard disk keeps it: a
+	*  stick that silently took over the filesystem because it was plugged in
+	*  at boot would be a surprise, and the ATA drives are the ones the boot
+	*  chain itself came from. */
+	if(!fat_mounted())
+		removable_init();
 
 	task_console = taskmgr_add_task( main, "CONSOLE", TASK_PRIORITY_REALTIME );
 	taskmgr_task_start(task_console);

@@ -290,4 +290,40 @@ extern uint32_t usbhid_keys(void);
 extern uint32_t usbhid_moves(void);
 extern uint32_t usbhid_errors(void);
 
+/* --- The mass storage class driver ---------------------------------------
+*
+*  Claims interfaces of class 8 subclass 6 protocol 0x50 -- SCSI over the
+*  bulk-only transport -- and registers each usable unit with the block layer,
+*  so a stick is mounted by fat_mount() exactly as a hard disk is. See
+*  blockdev.h for why the numbers it gets are above the ATA range.
+*
+*  No task of its own: every transfer runs on the caller's, inside blk_read()
+*  or blk_write(), with a lock per interface so two tasks cannot interleave
+*  commands on one pipe. */
+extern void usbmsc_init(void);
+
+extern int  usbmsc_present(void);
+extern int  usbmsc_count(void);
+
+/* One line about unit "index" -- what it is, how big, and why it was refused
+*  if it was. Never null. */
+extern const char *usbmsc_describe(int index);
+
+/* The block device number the unit took, or -1 for one that was refused --
+*  a sector size that is not 512, or a medium that never became ready. */
+extern int usbmsc_blkdev(int index);
+
+/* commands is every SCSI command issued. The three failure counts are
+*  deliberately separate, because they mean different things to whoever is
+*  looking: failures is the DEVICE rejecting a command, which is a real answer
+*  and often an expected one (no medium in the slot); errors is the transport
+*  losing it; resets is how often the two ends had to be put back in step. */
+extern uint32_t usbmsc_commands(void);
+extern uint32_t usbmsc_failures(void);
+extern uint32_t usbmsc_errors(void);
+extern uint32_t usbmsc_stalls(void);
+extern uint32_t usbmsc_resets(void);
+
+extern const char *usbmsc_last_error(void);
+
 #endif

@@ -461,10 +461,55 @@ testable without hardware and was: 82 usages compared against the PS/2 tables
 in both shift states, all equal, with the divergences (keypad `/`, the key
 next to left shift) documented rather than smoothed over.
 
+#### Mass storage: a stick is just another disk
+
+TomatOS mounts a USB stick and runs programs off it. `ls` loaded from
+`/BIN/LS.ELF` on the stick lists the stick, and `cat /note.txt` reads a file
+written on the host.
+
+The piece that made that possible is not the driver but a **block layer**.
+`fat.c` used to call `ata_read()` by name, which was honest while ATA was the
+only way to reach a sector; a stick is reached through four layers that have
+nothing in common with an IDE controller. `blockdev.h` is the join, and
+`fat_mount()` keeps its signature — 0..3 still mean exactly the ATA drives they
+always did.
+
+**Device numbers are stable rather than packed**, and that is a decision: a
+scheme that moved everything down to the first free slot would renumber a hard
+disk because somebody plugged a stick in, and `mount 1` would mean different
+things on two boots of one machine.
+
+Three things in the transport decided the driver. **A command failure is not a
+transport failure** — status 1 means the device rejected the command, which is
+often the expected answer (no medium in the slot), and the way to find out why
+is a REQUEST SENSE, itself another full three-phase command. **The residue
+field** says how much of the promised transfer did not happen, and there are
+two accounts of the same number — what the controller moved and what the device
+processed — so the smaller wins and the untouched tail of the buffer is zeroed,
+because otherwise a short read serves the previous sector's data. **SCSI is big
+endian** where USB is little endian, and `READ CAPACITY` returns the *last* LBA
+rather than the count: being off by one there is a filesystem that reads one
+sector past the end.
+
+A sector size that is not 512 is **refused rather than translated**, and the
+reasoning is worth keeping: writing a 512-byte sector into a 4096-byte block is
+a read-modify-write, which needs a second copy of the medium and opens a torn
+write per operation, and a half-translation that reads but cannot write is a
+filesystem that mounts and then fails at the first directory update. The unit
+stays visible with the reason attached, so the stick does not merely fail to
+appear.
+
+The proof is a byte comparison, not an absence of errors: sectors 0, 1, the
+cluster boundary at 4095/4096, and the very last sector 32767 all read
+identical to the same offsets of the image file on the host, including
+multi-sector reads that cross both a cluster and a transfer boundary. After
+writing, the host image differs from a pristine copy in *exactly* the sectors
+written and nothing else.
+
 Deliberately absent: hubs (so one device per root port — QEMU inserts a hub of
-its own once a second device is attached unless the ports are named), mass
-storage, isochronous transfers, and anything about USB 3, whose bus is
-electrically separate and reachable only through xHCI.
+its own once a second device is attached unless the ports are named),
+isochronous transfers, and anything about USB 3, whose bus is electrically
+separate and reachable only through xHCI.
 
 ### The mouse
 

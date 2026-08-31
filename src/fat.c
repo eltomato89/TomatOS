@@ -2,11 +2,19 @@
 *  By:   Jens Köhler (eltomato@googlemail.com)
 *  Desc: FAT12/FAT16 filesystem, reading and writing.
 *
-*  Sits directly on ata_read() and ata_write(). Everything this file knows
-*  about the volume comes out of sector 0, the BIOS Parameter Block, and is
-*  turned once at mount time into the four numbers the rest of the code
-*  actually needs: where the FAT starts, where the root directory starts,
-*  where the data area starts, and how many data clusters there are.
+*  Sits on blk_read() and blk_write(), and on nothing more specific than
+*  that. It used to call ata_read() and ata_write() by name, which was honest
+*  while ATA was the only way to reach a sector; a USB stick is a block device
+*  too, and it answers through four layers that have nothing in common with an
+*  IDE controller. So the drive number this file carries is a BLOCK DEVICE
+*  number now: 0..3 still mean exactly the ATA drives they always did, and 4
+*  and up can be a stick, and nothing below cares which.
+*
+*  Everything this file knows about the volume comes out of sector 0, the BIOS
+*  Parameter Block, and is turned once at mount time into the four numbers the
+*  rest of the code actually needs: where the FAT starts, where the root
+*  directory starts, where the data area starts, and how many data clusters
+*  there are.
 *
 *  Those four numbers are derived exactly once, in fat_mount(). The write
 *  half below reuses them and never recomputes an offset of its own: two
@@ -35,6 +43,14 @@
 *  and a single buffer would reload a sector on every step. This keeps the
 *  promise fat.h makes, that a directory read never touches the heap, and it
 *  means the filesystem works before heap_init() has ever run.
+*
+*  That split used to be worth a few hundred microseconds of PIO per step.
+*  On a removable device it is worth twenty times that: a stick on USB 1.1
+*  moves roughly a megabyte a second, and every sector this driver asks for
+*  costs a whole bulk transaction rather than a burst of inw. Nothing about
+*  the caches changes because of that - they were already the difference
+*  between one read per step and two - but the reason they are here is no
+*  longer "it is a bit faster".
 *
 *  --- Writing ---------------------------------------------------------------
 *
@@ -73,7 +89,7 @@
 
 #include <system.h>
 #include <string.h>
-#include <ata.h>
+#include <blockdev.h>
 #include <fat.h>
 
 /* --- On disk constants ---------------------------------------------------- */
@@ -112,7 +128,7 @@
 #define DIR_FileSize     28
 
 #define DIR_ENTRY_SIZE   32
-#define DIR_PER_SECTOR   (ATA_SECTOR_SIZE / DIR_ENTRY_SIZE)
+#define DIR_PER_SECTOR   (BLK_SECTOR_SIZE / DIR_ENTRY_SIZE)
 
 /* Attribute bits */
 #define ATTR_READ_ONLY   0x01
@@ -140,7 +156,8 @@
 /* --- Mounted volume ------------------------------------------------------- */
 
 static int      fat_is_mounted = 0;
-static int      fat_drive = 0;
+static int      fat_drive = 0;          /* block device number, not an ATA   */
+                                        /* drive - see blockdev.h            */
 static int      fat_bits = 0;           /* 12 or 16                          */
 
 static uint32_t fat_spc = 0;            /* sectors per cluster               */
@@ -165,11 +182,16 @@ static const char *fat_err = "";
 *  cluster 2, which turns writing one file into a quadratic walk. */
 static uint32_t fat_alloc_hint = 2;
 
-/* Bytes handed to ata_write() since the volume was mounted. This counts
+/* Bytes handed to blk_write() since the volume was mounted. This counts
 *  METADATA too - the FAT copies and the directory entry are writes to the
 *  medium like any other, and a counter that hid them would understate what
 *  this driver has done to somebody's disk. Saving ten bytes therefore shows
-*  up as several kilobytes, and that is the honest number. */
+*  up as several kilobytes, and that is the honest number.
+*
+*  Not the same number as blk_bytes_written(), and deliberately kept next to
+*  it rather than replaced by it: that one counts every device since boot and
+*  includes whatever else wrote, this one counts what this volume was made to
+*  swallow since it was mounted. */
 static uint32_t fat_written = 0;
 
 /* Set when a FAT update failed part way through the copies, so that the
@@ -184,11 +206,11 @@ static int fat_write_locked = 0;
 /* Sector caches. fat_buf holds a sector of the FAT, dat_buf a sector of the
 *  data area or of the root directory. Valid flags rather than an impossible
 *  lba, because sector 0 is a perfectly ordinary lba. */
-static uint8_t  fat_buf[ATA_SECTOR_SIZE];
+static uint8_t  fat_buf[BLK_SECTOR_SIZE];
 static uint32_t fat_buf_lba = 0;
 static int      fat_buf_valid = 0;
 
-static uint8_t  dat_buf[ATA_SECTOR_SIZE];
+static uint8_t  dat_buf[BLK_SECTOR_SIZE];
 static uint32_t dat_buf_lba = 0;
 static int      dat_buf_valid = 0;
 
@@ -233,6 +255,80 @@ static void wr32(uint8_t *p, uint32_t off, uint32_t v)
     p[off + 3] = (uint8_t)((v >> 24) & 0xFF);
 }
 
+/* --- Failures that came from the medium ------------------------------------
+*
+*  Every message in this file used to be a plain constant, and for the ones
+*  about the filesystem it still is: "corrupt cluster chain" says everything
+*  there is to say. The ones about the DEVICE cannot be constants any more.
+*
+*  Two things changed under them. blk_read() refuses requests that ata_read()
+*  passed straight down to the hardware - a device number nothing is
+*  registered on, a range that runs off the end of the medium - so a failed
+*  read no longer means the disk said no; it can equally mean the question
+*  was not one that could be asked. blk_last_error() is where that difference
+*  is written down, and dropping it on the floor would leave "read error in
+*  the FAT" standing in front of a device that was never read at all.
+*
+*  And the device is worth naming, by BUS as well as by model. On a fixed
+*  disk the only interesting failure is a bad sector; on a removable one the
+*  usual failure is that somebody pulled it out, and blk_bus() is what lets a
+*  user see that the thing that vanished was the stick and not the disk.
+*
+*  One static buffer, because fat_last_error() hands back a pointer that
+*  outlives the call and this file allocates nothing. It holds one message at
+*  a time: the next failure overwrites it, which is exactly the lifetime the
+*  constants had. */
+static char fat_msg[192];
+
+static void fat_msg_cat(uint32_t *n, const char *s)
+{
+    if (s == 0)
+        return;
+    while (*s != '\0' && *n + 1 < sizeof(fat_msg))
+        fat_msg[(*n)++] = *s++;
+    fat_msg[*n] = '\0';
+}
+
+/* what, then the device in brackets, then - when with_reason is set and the
+*  block layer has something to say - why it refused. with_reason is off for
+*  the callers that are reporting a STATE rather than a failed call, where
+*  blk_last_error() would be about some older, unrelated request. */
+static void fat_dev_err(const char *what, int with_reason)
+{
+    uint32_t n = 0;
+    const char *what_it_is;
+    const char *why;
+
+    fat_msg[0] = '\0';
+    fat_msg_cat(&n, what);
+
+    /* blockdev.h promises neither of these is null, but blk_describe() is
+    *  empty for a number nothing is registered on - which is exactly the
+    *  case a message about a device that vanished has to survive. Then the
+    *  bus stands alone and reads "(none)", rather than "( on none)". */
+    what_it_is = blk_describe(fat_drive);
+    fat_msg_cat(&n, " (");
+    if (what_it_is[0] != '\0')
+    {
+        fat_msg_cat(&n, what_it_is);
+        fat_msg_cat(&n, " on ");
+    }
+    fat_msg_cat(&n, blk_bus(fat_drive));
+    fat_msg_cat(&n, ")");
+
+    if (with_reason)
+    {
+        why = blk_last_error();
+        if (why != 0 && why[0] != '\0')
+        {
+            fat_msg_cat(&n, ": ");
+            fat_msg_cat(&n, why);
+        }
+    }
+
+    fat_err = fat_msg;
+}
+
 /* --- Cached sector reads -------------------------------------------------- */
 
 static int fat_get_fat_sector(uint32_t lba)
@@ -241,9 +337,9 @@ static int fat_get_fat_sector(uint32_t lba)
         return 0;
 
     fat_buf_valid = 0;
-    if (ata_read(fat_drive, lba, 1, fat_buf) < 0)
+    if (blk_read(fat_drive, lba, 1, fat_buf) < 0)
     {
-        fat_err = "read error in the FAT";
+        fat_dev_err("read error in the FAT", 1);
         return -1;
     }
     fat_buf_lba = lba;
@@ -257,9 +353,9 @@ static int fat_get_data_sector(uint32_t lba)
         return 0;
 
     dat_buf_valid = 0;
-    if (ata_read(fat_drive, lba, 1, dat_buf) < 0)
+    if (blk_read(fat_drive, lba, 1, dat_buf) < 0)
     {
-        fat_err = "read error in the data area";
+        fat_dev_err("read error in the data area", 1);
         return -1;
     }
     dat_buf_lba = lba;
@@ -270,10 +366,28 @@ static int fat_get_data_sector(uint32_t lba)
 /* --- Cached sector writes --------------------------------------------------
 *
 *  The counterparts of the two functions above, and the ONLY places in this
-*  file that call ata_write(). Both work on the contents of the cache buffer
+*  file that call blk_write(). Both work on the contents of the cache buffer
 *  the matching read would have filled, so a sector is never written from
 *  somewhere the cache does not know about - which is what keeps the caches
-*  describing the disk rather than a version of it that used to be true. */
+*  describing the disk rather than a version of it that used to be true.
+*
+*  WHAT "THE WRITE LANDED" MEANS, and it means less than it did. The ordering
+*  rules this file is built on - backups before the primary, data before the
+*  chain, the chain before the directory entry - are worth something only if
+*  an earlier write is on the medium before a later one is issued. Against
+*  ATA that was true for a reason that is not in this file at all: ata_write()
+*  ends every call with a CACHE FLUSH command, so a return of 0 meant the
+*  sectors were out of the drive's buffer.
+*
+*  blk_write() promises no such thing and has nowhere to promise it: there is
+*  no flush in blk_ops, and a USB stick acknowledges a SCSI WRITE(10) when it
+*  has the data, not when the flash has it. So on a removable device the
+*  orderings below are the order the writes are ISSUED in, and a device that
+*  reorders or buffers them can still leave a state none of the arguments
+*  here cover. That is worth writing down rather than pretending away; it is
+*  not worth changing anything for, because issuing them in the careful order
+*  is strictly better than issuing them in a careless one, and a flush this
+*  layer cannot ask for is not one it can fake. */
 
 /* Writes the FAT sector currently held in fat_buf to every FAT copy on the
 *  volume. sec is the sector's index WITHIN a FAT, not an lba, and fat_buf
@@ -315,7 +429,7 @@ static int fat_put_fat_sector(uint32_t sec)
 
     for (k = fat_num_fats; k > 0; k--)
     {
-        if (ata_write(fat_drive,
+        if (blk_write(fat_drive,
                       fat_fat_lba + (k - 1) * fat_sec_per_fat + sec,
                       1, fat_buf) < 0)
         {
@@ -327,14 +441,15 @@ static int fat_put_fat_sector(uint32_t sec)
             if (k < fat_num_fats)
             {
                 fat_write_locked = 1;
-                fat_err = "FAT copies left inconsistent - volume is now read only";
+                fat_dev_err("FAT copies left inconsistent"
+                            " - volume is now read only", 1);
                 return -1;
             }
 
-            fat_err = "write error in the FAT";
+            fat_dev_err("write error in the FAT", 1);
             return -1;
         }
-        fat_written += ATA_SECTOR_SIZE;
+        fat_written += BLK_SECTOR_SIZE;
     }
     return 0;
 }
@@ -347,22 +462,28 @@ static int fat_put_data_sector(void)
         fat_err = "nothing cached to write back";
         return -1;
     }
-    if (ata_write(fat_drive, dat_buf_lba, 1, dat_buf) < 0)
+    if (blk_write(fat_drive, dat_buf_lba, 1, dat_buf) < 0)
     {
         dat_buf_valid = 0;
-        fat_err = "write error in the data area";
+        fat_dev_err("write error in the data area", 1);
         return -1;
     }
-    fat_written += ATA_SECTOR_SIZE;
+    fat_written += BLK_SECTOR_SIZE;
     return 0;
 }
 
 /* Claims the data cache for lba WITHOUT reading it. Only legal when the
-*  caller then fills all ATA_SECTOR_SIZE bytes before calling
+*  caller then fills all BLK_SECTOR_SIZE bytes before calling
 *  fat_put_data_sector(); anything less would write out whatever the buffer
 *  happened to hold from an unrelated sector. It exists because a full
 *  sector overwrite otherwise pays for a read whose every byte is discarded,
-*  and sequential writing is nothing but full sector overwrites. */
+*  and sequential writing is nothing but full sector overwrites.
+*
+*  That read used to cost a PIO burst. On a stick it costs a bulk
+*  transaction each way, so on the slowest device this driver can be given
+*  the saving is the difference between one transfer per sector written and
+*  two. The rule it depends on is unchanged and is not negotiable: fill all
+*  BLK_SECTOR_SIZE bytes, or do not claim. */
 static void fat_claim_data(uint32_t lba)
 {
     dat_buf_lba = lba;
@@ -375,7 +496,7 @@ static void fat_claim_data(uint32_t lba)
 *  land in different sectors reads exactly like any other. */
 static int fat_byte(uint32_t off, uint8_t *out)
 {
-    uint32_t sec = off / ATA_SECTOR_SIZE;
+    uint32_t sec = off / BLK_SECTOR_SIZE;
 
     if (sec >= fat_sec_per_fat)
     {
@@ -385,7 +506,7 @@ static int fat_byte(uint32_t off, uint8_t *out)
     if (fat_get_fat_sector(fat_fat_lba + sec) < 0)
         return -1;
 
-    *out = fat_buf[off % ATA_SECTOR_SIZE];
+    *out = fat_buf[off % BLK_SECTOR_SIZE];
     return 0;
 }
 
@@ -499,10 +620,10 @@ static int fat_cluster_valid(uint32_t c)
 static int fat_patch_fat(uint32_t off, uint8_t v0, uint8_t m0,
                          uint8_t v1, uint8_t m1)
 {
-    uint32_t sec0 = off / ATA_SECTOR_SIZE;
-    uint32_t sec1 = (off + 1) / ATA_SECTOR_SIZE;
-    uint32_t i0 = off % ATA_SECTOR_SIZE;
-    uint32_t i1 = (off + 1) % ATA_SECTOR_SIZE;
+    uint32_t sec0 = off / BLK_SECTOR_SIZE;
+    uint32_t sec1 = (off + 1) / BLK_SECTOR_SIZE;
+    uint32_t i0 = off % BLK_SECTOR_SIZE;
+    uint32_t i1 = (off + 1) % BLK_SECTOR_SIZE;
 
     if (sec1 >= fat_sec_per_fat)
     {
@@ -1081,7 +1202,7 @@ static void fat_reset(void)
 
 int fat_mount(int drive)
 {
-    uint8_t bs[ATA_SECTOR_SIZE];
+    uint8_t bs[BLK_SECTOR_SIZE];
     uint32_t bytes_per_sec;
     uint32_t reserved;
     uint32_t total_sectors;
@@ -1095,14 +1216,20 @@ int fat_mount(int drive)
     fat_drive = drive;
     fat_err = "";
 
-    if (drive < 0 || drive >= ATA_MAX_DRIVES)
+    /* A block device number, and BLK_MAX_DEVICES is the whole table rather
+    *  than the four ATA slots: 0..3 are still the IDE drives, 4 and up are
+    *  whatever registered later. Only the range is tested here. Whether
+    *  anything is actually there is blk_read()'s answer to give, and taking
+    *  it from there rather than asking blk_present() first keeps the number
+    *  of places that decide "no device" at one. */
+    if (drive < 0 || drive >= BLK_MAX_DEVICES)
     {
-        fat_err = "no such drive";
+        fat_err = "no such block device";
         return -1;
     }
-    if (ata_read(drive, 0, 1, bs) < 0)
+    if (blk_read(drive, 0, 1, bs) < 0)
     {
-        fat_err = "cannot read the boot sector";
+        fat_dev_err("cannot read the boot sector", 1);
         return -1;
     }
 
@@ -1113,11 +1240,13 @@ int fat_mount(int drive)
     }
 
     /* Everything below assumes 512 byte sectors, from the sector caches to
-    *  DIR_PER_SECTOR to the ATA layer itself. A volume formatted with a
-    *  different sector size is refused rather than mounted with every
-    *  offset quietly wrong. */
+    *  DIR_PER_SECTOR to the block layer itself - blockdev.h fixes
+    *  BLK_SECTOR_SIZE at 512 for every driver and says so out loud, because
+    *  a device with 4096 byte sectors would have to translate rather than
+    *  report it. A volume formatted with a different sector size is refused
+    *  rather than mounted with every offset quietly wrong. */
     bytes_per_sec = rd16(bs, BPB_BytsPerSec);
-    if (bytes_per_sec != ATA_SECTOR_SIZE)
+    if (bytes_per_sec != BLK_SECTOR_SIZE)
     {
         fat_err = "bytes per sector is not 512 - unsupported";
         return -1;
@@ -1177,7 +1306,7 @@ int fat_mount(int drive)
     *  practice, but the rounding costs nothing and a malformed BPB should
     *  not shift the data area by half a sector. */
     root_bytes = fat_root_entries * DIR_ENTRY_SIZE;
-    fat_root_sectors = (root_bytes + ATA_SECTOR_SIZE - 1) / ATA_SECTOR_SIZE;
+    fat_root_sectors = (root_bytes + BLK_SECTOR_SIZE - 1) / BLK_SECTOR_SIZE;
 
     fat_fat_lba = reserved;
     fat_root_lba = reserved + fat_num_fats * fat_sec_per_fat;
@@ -1238,7 +1367,7 @@ int fat_mount(int drive)
         else
             need_bytes = (fat_clusters + 2) * 2;
 
-        if (fat_sec_per_fat * (uint32_t)ATA_SECTOR_SIZE < need_bytes)
+        if (fat_sec_per_fat * (uint32_t)BLK_SECTOR_SIZE < need_bytes)
         {
             fat_err = "FAT is too small for the cluster count";
             fat_bits = 0;
@@ -1289,7 +1418,7 @@ uint32_t fat_cluster_bytes(void)
 {
     if (!fat_is_mounted)
         return 0;
-    return fat_spc * (uint32_t)ATA_SECTOR_SIZE;
+    return fat_spc * (uint32_t)BLK_SECTOR_SIZE;
 }
 
 /* clusters * cluster size, saturating. A FAT16 volume with 64 sectors per
@@ -1316,7 +1445,16 @@ uint32_t fat_total_bytes(void)
 /* Counts free clusters by scanning the FAT. Entries 0 and 1 are reserved
 *  and are not part of the data area, so the scan runs over the cluster
 *  numbers 2 .. fat_clusters + 1. Sequential, so the FAT sector cache turns
-*  the whole scan into one pass over the FAT. */
+*  the whole scan into one pass over the FAT.
+*
+*  One pass is still one sector transfer per 512 bytes of FAT, and on a stick
+*  that is the most expensive thing in this file by a wide margin: a FAT16
+*  volume with a megabyte of FAT is two thousand bulk round trips, seconds
+*  rather than the milliseconds the same call costs on IDE. There is no
+*  cheaper way to count free clusters on FAT12/16 - there is no free count in
+*  the boot sector to trust, that is a FAT32 field - so this is not a bug,
+*  but a caller that wants a number on every screen refresh should know what
+*  it is asking for. */
 uint32_t fat_free_bytes(void)
 {
     uint32_t c;
@@ -1442,7 +1580,7 @@ int fat_read(const char *path, uint32_t offset, uint32_t len, void *buf)
         return -1;
     }
 
-    cluster_bytes = fat_spc * (uint32_t)ATA_SECTOR_SIZE;
+    cluster_bytes = fat_spc * (uint32_t)BLK_SECTOR_SIZE;
     cluster = de.first_cluster;
 
     /* Skip whole clusters to reach the offset. fat_walk() carries the cycle
@@ -1463,14 +1601,14 @@ int fat_read(const char *path, uint32_t offset, uint32_t len, void *buf)
     while (done < len)
     {
         if (fat_get_data_sector(fat_cluster_lba(cluster)
-                                + pos / ATA_SECTOR_SIZE) < 0)
+                                + pos / BLK_SECTOR_SIZE) < 0)
             return -1;
 
-        chunk = ATA_SECTOR_SIZE - (pos % ATA_SECTOR_SIZE);
+        chunk = BLK_SECTOR_SIZE - (pos % BLK_SECTOR_SIZE);
         if (chunk > len - done)
             chunk = len - done;
 
-        memcpy((uint8_t *)buf + done, dat_buf + (pos % ATA_SECTOR_SIZE),
+        memcpy((uint8_t *)buf + done, dat_buf + (pos % BLK_SECTOR_SIZE),
                chunk);
         done += chunk;
         pos += chunk;
@@ -1507,25 +1645,34 @@ const char *fat_last_error(void)
 /* Can this volume be written to at all?
 *
 *  Three things have to hold, and they are checked here rather than at the
-*  first ata_write() because fat.h promises a caller can ask BEFORE the user
-*  has typed a filename - failing afterwards is a worse answer.
+*  first blk_write() because fat.h promises a caller can ask BEFORE the user
+*  has typed a filename - failing afterwards is a worse answer. On a
+*  removable device that promise is worth more than it ever was on a disk:
+*  the honest answer changes while the machine is running.
 *
 *    - something is mounted,
-*    - the drive is still there and answered an IDENTIFY, and
+*    - the device still reports a size, and
 *    - no earlier FAT update was left half applied across the copies, and
-*    - the volume the BPB describes fits inside the drive that IDENTIFY
-*      reported. A BPB claiming more sectors than the medium has is either a
-*      truncated image or a lie, and either way the last cluster of the data
-*      area is off the end of the disk. ata_write() would refuse that one
-*      sector; refusing the whole volume is the honest answer, because a
-*      filesystem whose tail cannot be written is not one to hand a user. */
+*    - the volume the BPB describes fits inside the size the device reports.
+*      A BPB claiming more sectors than the medium has is either a truncated
+*      image or a lie, and either way the last cluster of the data area is
+*      off the end of the medium. blk_write() would refuse that one sector;
+*      refusing the whole volume is the honest answer, because a filesystem
+*      whose tail cannot be written is not one to hand a user.
+*
+*  The second test used to read "the drive answered an IDENTIFY", which was
+*  ATA's way of saying a drive was there. A stick answers no IDENTIFY - its
+*  size comes back from a SCSI READ CAPACITY, four layers away - so the
+*  question has to be asked the way blockdev.h defines it, and blockdev.h
+*  deliberately makes presence and size ONE answer: a device with no size is
+*  not a device anyone can use, and two answers that could disagree would be
+*  two chances to get it wrong. So there is no separate presence call below,
+*  and a stick that was pulled out reports zero sectors and fails here. */
 int fat_writable(void)
 {
     uint32_t sectors;
 
     if (!fat_is_mounted)
-        return 0;
-    if (!ata_present(fat_drive))
         return 0;
 
     /* Latched by a FAT update that failed between the copies. Cleared only
@@ -1534,7 +1681,7 @@ int fat_writable(void)
     if (fat_write_locked)
         return 0;
 
-    sectors = ata_sectors(fat_drive);
+    sectors = blk_sectors(fat_drive);
     if (sectors == 0 || sectors < fat_total_sectors)
         return 0;
 
@@ -1561,7 +1708,13 @@ static int fat_write_ready(void)
     }
     if (!fat_writable())
     {
-        fat_err = "the mounted volume cannot be written to";
+        /* Named rather than left as a bare sentence, because the most
+        *  ordinary way to reach it is now that the medium is gone: on a
+        *  removable device this is what "somebody pulled the stick out"
+        *  looks like from up here. No blk_last_error() with it - nothing
+        *  was just asked of the device, so whatever is in there belongs to
+        *  some older request and would be a guess dressed up as a reason. */
+        fat_dev_err("the mounted volume cannot be written to", 0);
         return -1;
     }
     fat_err = "";
@@ -1614,7 +1767,9 @@ static int fat_now(uint32_t *date, uint32_t *time)
 *
 *  Every cluster this driver hands to a file is zeroed before the file can
 *  see it. That is not free - it doubles the sector writes of a sequential
-*  write - and it is done anyway for two reasons. It means a gap left by
+*  write, and on a stick a sector write is a bulk transaction rather than a
+*  burst of outw, so the doubling is felt - and it is done anyway for two
+*  reasons, neither of which is about speed. It means a gap left by
 *  seeking past the end of a file reads back as zeros without any of the
 *  size arithmetic elsewhere having to be exactly right, and it means the
 *  slack at the end of the last cluster cannot hand a new file the contents
@@ -1632,7 +1787,7 @@ static int fat_zero_cluster(uint32_t c)
     }
 
     lba = fat_cluster_lba(c);
-    memset(dat_buf, 0, ATA_SECTOR_SIZE);
+    memset(dat_buf, 0, BLK_SECTOR_SIZE);
 
     for (i = 0; i < fat_spc; i++)
     {
@@ -2261,7 +2416,7 @@ static int fat_file_cluster(fat_file *f, uint32_t idx, int allocate,
 static uint32_t fat_put(fat_file *f, uint32_t pos, uint32_t len,
                         const uint8_t *src)
 {
-    uint32_t cluster_bytes = fat_spc * (uint32_t)ATA_SECTOR_SIZE;
+    uint32_t cluster_bytes = fat_spc * (uint32_t)BLK_SECTOR_SIZE;
     uint32_t done = 0;
     uint32_t idx, off, lba, in, chunk, cluster;
     int r;
@@ -2281,13 +2436,13 @@ static uint32_t fat_put(fat_file *f, uint32_t pos, uint32_t len,
         if (r != 0)
             break;                  /* full or broken; fat_err is set */
 
-        lba = fat_cluster_lba(cluster) + off / ATA_SECTOR_SIZE;
-        in = off % ATA_SECTOR_SIZE;
-        chunk = ATA_SECTOR_SIZE - in;
+        lba = fat_cluster_lba(cluster) + off / BLK_SECTOR_SIZE;
+        in = off % BLK_SECTOR_SIZE;
+        chunk = BLK_SECTOR_SIZE - in;
         if (chunk > len - done)
             chunk = len - done;
 
-        if (chunk == ATA_SECTOR_SIZE)
+        if (chunk == BLK_SECTOR_SIZE)
         {
             /* A whole sector is replaced, so reading it first would throw
             *  away every byte it returned. in is necessarily 0 here, and
@@ -2513,7 +2668,7 @@ int fat_truncate(const char *path, uint32_t size)
         return 0;
     }
 
-    cluster_bytes = fat_spc * (uint32_t)ATA_SECTOR_SIZE;
+    cluster_bytes = fat_spc * (uint32_t)BLK_SECTOR_SIZE;
 
     /* Clusters to keep, rounded up. Written as a division plus a remainder
     *  test rather than (size + cluster_bytes - 1) / cluster_bytes, which

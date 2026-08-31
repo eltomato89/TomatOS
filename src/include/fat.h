@@ -38,8 +38,13 @@ typedef struct
     int      is_dir;
 } fat_dirent;
 
-/* Reads the boot sector of the given drive and works out the layout.
-*  Returns 0 on success, negative if the drive holds nothing recognisable. */
+/* Reads the boot sector of the given device and works out the layout.
+*  Returns 0 on success, negative if it holds nothing recognisable.
+*
+*  "drive" is a BLOCK DEVICE number now, not an ATA drive -- see blockdev.h.
+*  The numbers 0..3 still mean exactly the ATA drives they always did, so
+*  nothing that mounted drive 0 has to change; what is new is that 4 and up can
+*  be a USB stick, and this file no longer knows the difference. */
 extern int fat_mount(int drive);
 
 extern int fat_mounted(void);
