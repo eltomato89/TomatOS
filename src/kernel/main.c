@@ -7521,7 +7521,7 @@ static void net_dns_show_cache(void)
 *  little without the connection they belong to sitting above them.
 *
 *  One call here is not a read, and it has to be. Nothing outside a network
-*  system call drives tcp_poll() on this machine -- src/syscall.c says so in
+*  system call drives tcp_poll() on this machine -- src/kernel/syscall.c says so in
 *  as many words -- so a connection whose TIME_WAIT ran out ten seconds ago
 *  is still sitting in the table with nothing to notice. Printing that row
 *  would be answering "is this stuck?" with one that only looks stuck because

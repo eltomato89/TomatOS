@@ -69,7 +69,7 @@
 *
 *  Configuration space is reached with 32 bit accesses only. system.h offers
 *  inportb/outportb and declares an inportw that nothing in the kernel ever
-*  defines; there is no 32 bit pair at all. Like src/ata.c does for its word
+*  defines; there is no 32 bit pair at all. Like src/drivers/block/ata.c does for its word
 *  wide transfers, the two helpers below are local - a header this file does
 *  not own is no place to add to. */
 

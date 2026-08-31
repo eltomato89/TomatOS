@@ -75,7 +75,7 @@
 *  ------------------------------------------------------------------------
 *  The mode is negotiated at boot: this same binary lands at 1920x1080 on one
 *  machine and 640x480 on another (see the note on GFX_MAX_WIDTH in
-*  user/gfxlib.h). A window measured in pixels is therefore a window measured
+*  user/include/gfxlib.h). A window measured in pixels is therefore a window measured
 *  against nothing -- 470 pixels is two thirds of a 640 pixel screen and a
 *  quarter of a 1920 pixel one.
 *
@@ -270,7 +270,7 @@ static void gui_metrics(const gfx_surface *s)
 
 /* The classic arrow, as a picture rather than as a bitmap: 'X' is the outline,
 *  '.' is the fill and a space is transparent. Written this way for the same
-*  reason src/font8x8.c draws its glyphs in the comments -- the picture IS the
+*  reason src/video/font8x8.c draws its glyphs in the comments -- the picture IS the
 *  definition, and a mistake in it is visible in the source instead of hiding
 *  in a hex constant.
 *
@@ -835,9 +835,9 @@ static void paint_body_help(gfx_surface *c, const gfx_rect *body)
 
 	/* Not a property of this program, and said anyway because it is the
 	*  first thing that looks like a bug in it. The shell waits RUN_WAIT_MS
-	*  (30 seconds, src/main.c) for a program it started and then goes back
+	*  (30 seconds, src/kernel/main.c) for a program it started and then goes back
 	*  to its prompt -- where it reads the keyboard. There is ONE key slot
-	*  in src/kb.c and SYS_GETCH and SYS_INPUT both take from it, so from
+	*  in src/drivers/input/kb.c and SYS_GETCH and SYS_INPUT both take from it, so from
 	*  that moment the shell wins every keystroke and Escape never arrives
 	*  here. The pointer is unaffected: the mouse has a queue of its own. */
 	body_line(c, body, 7, "After 30 s the shell takes",  col_dim);
@@ -1303,7 +1303,7 @@ static void explain_no_screen(int rc)
 			printf("     the back buffer compiled into this program can hold.\n");
 			printf("     That buffer is .bss and cannot grow at run time, so\n");
 			printf("     the way out is a smaller mode or a taller ceiling in\n");
-			printf("     user/gfxlib.h -- which costs 4 more bytes of memory\n");
+			printf("     user/include/gfxlib.h -- which costs 4 more bytes of memory\n");
 			printf("     per pixel, in every program that draws.\n");
 			break;
 

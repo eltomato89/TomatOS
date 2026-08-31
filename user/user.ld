@@ -12,7 +12,7 @@
 *
 *    2. Clear of the user stacks. taskmgr parks them directly under the
 *       kernel: USER_STACK_REGION_TOP is 0xBFFFF000 and with 64 tasks at
-*       8 KiB per slot the region reaches down to 0xBFF80000 (src/tasks.c).
+*       8 KiB per slot the region reaches down to 0xBFF80000 (src/kernel/tasks.c).
 *       4 MiB is nowhere near it -- there are almost 3 GiB of untouched
 *       address space between the two, room enough for a heap and for
 *       whatever mmap-like thing comes later.
@@ -32,7 +32,7 @@
 *  ------------------------------------------------------------------------
 *  Why exactly one PT_LOAD
 *  ------------------------------------------------------------------------
-*  The loader in src/exec.c walks the program headers and acts on PT_LOAD
+*  The loader in src/kernel/exec.c walks the program headers and acts on PT_LOAD
 *  only; it allocates a frame per page, copies p_filesz bytes in, zeroes the
 *  rest up to p_memsz and maps the result with PAGE_USER. Every additional
 *  segment is another allocate-copy-map round for no gain: 32-bit x86 without

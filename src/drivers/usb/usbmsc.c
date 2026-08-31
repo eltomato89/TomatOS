@@ -2,8 +2,8 @@
 *  Desc: SCSI commands inside the bulk-only transport, presented upwards as
 *        ordinary 512 byte block devices.
 *
-*  WHERE THIS SITS. src/usb.c enumerates whatever is plugged in and stops at
-*  the class triple; src/blockdev.h says what a thing that can hand over a
+*  WHERE THIS SITS. src/drivers/usb/usb.c enumerates whatever is plugged in and stops at
+*  the class triple; src/include/blockdev.h says what a thing that can hand over a
 *  sector has to look like. This file is the whole distance between those two
 *  sentences, and it is longer than it sounds because there are three protocols
 *  stacked on top of each other before a sector appears:

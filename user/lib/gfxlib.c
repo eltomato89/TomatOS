@@ -2,7 +2,7 @@
 *  Desc: The primitives gfxlib.h promises, plus the back buffer they draw
 *        into and the blit that puts it on the screen.
 *
-*  gfxlib.h says what this is for and how it differs from src/fbdraw.c. This
+*  gfxlib.h says what this is for and how it differs from src/video/fbdraw.c. This
 *  file says where the memory came from and what it costs, because those are
 *  the two questions a back buffer raises and neither has an obvious answer in
 *  a program with no malloc and a 4 KiB stack.
@@ -13,7 +13,7 @@
 *  There are exactly three places a TomatOS program can put a byte:
 *
 *    - the stack, which is one 4 KiB page (USER_STACK_SLOT_SIZE in
-*      src/tasks.c is 8 KiB, and the lower half of it is an unmapped guard
+*      src/kernel/tasks.c is 8 KiB, and the lower half of it is an unmapped guard
 *      page). A frame of 1920x1080x32 is two thousand times that, so this is
 *      not a candidate for even a fraction of it;
 *    - the heap, which does not exist. There is no malloc in user space and
@@ -25,7 +25,7 @@
 *  So it is .bss, and .bss turns out to be the right answer rather than the
 *  only one left. user/user.ld puts .bss in the single PT_LOAD segment, where
 *  it is the whole reason p_memsz comes out larger than p_filesz, and
-*  src/exec.c's loader allocates a frame per page of that segment and zeroes
+*  src/kernel/exec.c's loader allocates a frame per page of that segment and zeroes
 *  everything past p_filesz. The 8.3 MB therefore costs nothing on the FAT
 *  volume -- the ELF on disk stays around 20 KiB -- and arrives already
 *  cleared, which is one memset of 8.3 MB that never has to run.
@@ -40,7 +40,7 @@
 *  aligned and therefore starts a page directory entry of its own; one page
 *  table covers 4 MiB, and 8.3 MB of buffer plus a few pages of code reaches
 *  to roughly 0x00BF0000, which is two page tables and within a few hundred
-*  kilobytes of needing a third. Nothing has to be done about that: src/exec.c
+*  kilobytes of needing a third. Nothing has to be done about that: src/kernel/exec.c
 *  maps a segment page by page through vmm_map_in(), which allocates a page
 *  table whenever the directory entry is empty and reports "no memory for a
 *  page table" if it cannot. The cost is one more 4 KiB frame, not a rewrite.
@@ -67,7 +67,7 @@
 *  A full screen is width * height * bytes: 3145728 bytes at 1024x768x32 and
 *  8294400 at 1920x1080x32. Two things have to be said about moving that many:
 *
-*  1. NOT WITH memcpy(). user/lib.c's memcpy() is a byte at a time loop, and
+*  1. NOT WITH memcpy(). user/lib/lib.c's memcpy() is a byte at a time loop, and
 *     says so in as many words -- "nothing in a user program moves enough
 *     memory for it to matter" was true of every program on this disk until
 *     this one. Eight million byte loads and eight million byte stores per
@@ -85,14 +85,14 @@
 *  ------------------------------------------------------------------------
 *  Where the glyphs come from
 *  ------------------------------------------------------------------------
-*  user/lib.h has no font and there is no font file on the volume to load, so
-*  the table below is a COPY of the first 128 glyphs of src/font8x8.c. A copy
-*  and not a reference, for the same reason user/syscall.h is a copy of the
+*  user/include/lib.h has no font and there is no font file on the volume to load, so
+*  the table below is a COPY of the first 128 glyphs of src/video/font8x8.c. A copy
+*  and not a reference, for the same reason user/include/syscall.h is a copy of the
 *  kernel's call numbers: this program links against user/lib.o and nothing
 *  else, and reaching into src/ would make a ring 3 binary depend on a kernel
 *  object it is not built with.
 *
-*  src/font8x8.c REMAINS THE AUTHORITY. Each glyph there carries a picture of
+*  src/video/font8x8.c REMAINS THE AUTHORITY. Each glyph there carries a picture of
 *  itself in the comment above it and the picture is what to fix if a
 *  character comes out wrong; this table is eight bytes per row with the code
 *  spelled out beside it, and a change there has to be brought here by hand.
@@ -113,7 +113,7 @@
 
 /* 128 glyphs, GFX_FONT_HEIGHT bytes each. Codes 0x00..0x1F are blank and
 *  0x7F is a hollow box, so an attempt to draw an undrawable code is visible
-*  rather than silent. Copied from src/font8x8.c -- see the header note. */
+*  rather than silent. Copied from src/video/font8x8.c -- see the header note. */
 static const unsigned char gfx_font[128][GFX_FONT_HEIGHT] = {
 	{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },  /* 00   */
 	{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },  /* 01   */
@@ -248,7 +248,7 @@ static const unsigned char gfx_font[128][GFX_FONT_HEIGHT] = {
 /* The table really is 128 glyphs of GFX_FONT_HEIGHT bytes. gfx_char() indexes
 *  it with a character value and would run off the end of a short one, so this
 *  is checked at compile time -- a negative array size is a hard error and
-*  cannot be ignored the way a warning can. Same guard as src/font8x8.c's. */
+*  cannot be ignored the way a warning can. Same guard as src/video/font8x8.c's. */
 typedef char gfx_font_size_check[
 	(sizeof(gfx_font) == 128 * GFX_FONT_HEIGHT) ? 1 : -1];
 
@@ -367,7 +367,7 @@ gfx_color gfx_rgb(const gfx_surface *s,
 
 	/* Truncate each channel from the top to the width the mode carries,
 	*  then move it to where the mode keeps it. Identical arithmetic to
-	*  src/fbcon.c's rgb_to_pixel(), on purpose: a colour named by the same
+	*  src/video/fbcon.c's rgb_to_pixel(), on purpose: a colour named by the same
 	*  triple has to come out the same on both sides of the gate. */
 	return (((gfx_color)r >> (8 - s->red_size))   << s->red_pos)
 	     | (((gfx_color)g >> (8 - s->green_size)) << s->green_pos)
@@ -612,7 +612,7 @@ static void span_raw(const gfx_surface *s, unsigned char *dst, int len,
 *  million and the sum would overflow before the test could reject it.
 *
 *  The left cut is computed in UNSIGNED arithmetic, which is where this
-*  differs from src/fbdraw.c's hspan(). fbdraw.c writes "len += x" with x
+*  differs from src/video/fbdraw.c's hspan(). fbdraw.c writes "len += x" with x
 *  negative, which is right for every value it can actually be handed but
 *  undefined for x near INT_MIN. clip.x - x has a true value between 1 and
 *  2^31 + 16384 whenever this branch is taken, which does not fit an int but
@@ -835,7 +835,7 @@ static int div_round(int num, int den)
 	return -((-num + den / 2) / den);
 }
 
-/* Cohen-Sutherland, as in src/fbdraw.c and for the same reasons: it trims the
+/* Cohen-Sutherland, as in src/video/fbdraw.c and for the same reasons: it trims the
 *  segment before rastering, so a line from (-9000,-9000) to (9000,9000) costs
 *  the pixels it actually draws and not eighteen thousand clipped-away steps.
 *
@@ -1330,7 +1330,7 @@ gfx_surface *gfx_screen(void)
 *
 *  Dwords first, then whatever is left over. Four bytes at a time is four
 *  times fewer loop iterations and four times fewer bus transactions than the
-*  byte loop in user/lib.c's memcpy(), and on a full screen that is the
+*  byte loop in user/lib/lib.c's memcpy(), and on a full screen that is the
 *  difference between a frame and a slideshow.
 *
 *  The dword accesses are NOT guaranteed to be aligned. The two surfaces have

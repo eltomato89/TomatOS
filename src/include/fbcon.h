@@ -38,9 +38,9 @@
 *  derives from there:
 *
 *    - vbe_res_table in boot/vbe.inc, which our own stage 2 negotiates from
-*    - the video request in the Multiboot header in src/start.asm, which GRUB
+*    - the video request in the Multiboot header in src/kernel/start.asm, which GRUB
 *      honours and QEMU's -kernel loader does not
-*    - the back buffer in user/gfxlib.c, which a ring 3 program draws into
+*    - the back buffer in user/lib/gfxlib.c, which a ring 3 program draws into
 *
 *  Raising this raises all four, and each costs memory in a different place --
 *  the shadow buffer here, a frame per page of the program's .bss there, and

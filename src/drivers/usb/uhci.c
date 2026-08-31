@@ -24,7 +24,7 @@
 *      list, the queue heads and the transfer descriptors ITSELF, by DMA. They
 *      therefore live at physical addresses out of pmm_alloc_frames() -- which
 *      hands out physical addresses directly and does not need V2P() -- and
-*      every kernel access to the same memory goes through P2V(). src/rtl8139.c
+*      every kernel access to the same memory goes through P2V(). src/drivers/net/rtl8139.c
 *      says the same thing about its rings and is the model this file follows.
 *      Without PCI_CMD_MASTER the controller reads nothing and reports nothing.
 *
@@ -427,7 +427,7 @@ static const char uhci_no_hc[] = "UHCI: no controller";
 /* --- Port access ----------------------------------------------------------
 *
 *  system.h declares an inportw() that nothing defines and has no 32 bit
-*  accessor at all; src/ata.c and src/rtl8139.c both ran into the same gap and
+*  accessor at all; src/drivers/block/ata.c and src/drivers/net/rtl8139.c both ran into the same gap and
 *  both kept their helpers local. A header this file does not own is no place
 *  to fix that, so these are static and named apart from the global ones. */
 
@@ -568,7 +568,7 @@ uint32_t uhci_frames(void)
 
 /* --- The description string -----------------------------------------------
 *
-*  Composed by hand into a fixed buffer, as src/rtl8139.c and src/ata.c do:
+*  Composed by hand into a fixed buffer, as src/drivers/net/rtl8139.c and src/drivers/block/ata.c do:
 *  there is no snprintf() here, and this file has no printf() either -- it
 *  reports through return values and through this one line. */
 
@@ -1290,7 +1290,7 @@ static int uhci_op_control(usb_device *dev, const usb_setup *setup,
     *  physically contiguous, reachable by physical address and untouched until
     *  the controller has finished with it, none of which anything above this
     *  line promises. So it is copied through a buffer this driver owns, for
-    *  the same reasons src/rtl8139.c copies a frame into a transmit slot. */
+    *  the same reasons src/drivers/net/rtl8139.c copies a frame into a transmit slot. */
     memcpy(uhci_setup_virt(slot), setup, sizeof(usb_setup));
     if(!in && length > 0)
     {

@@ -122,7 +122,7 @@
 *     only caller in the kernel that overlaps at all; the other ring buffers
 *     (net.c, tcp.c) copy between separate buffers, and heap.c's realloc()
 *     copies into a fresh block. There is no memmove() on the kernel side --
-*     user/lib.c has one, but that is a different binary.
+*     user/lib/lib.c has one, but that is a different binary.
 *
 *     "rep movsb"/"rep movsl" with DF clear ascend, so the direction is kept.
 *     What is NOT kept is byte-for-byte equivalence with the old loop when
@@ -987,7 +987,7 @@ static void network_init(void)
 	*  ask the same PCI enumeration what is on the bus, but QEMU puts its UHCI
 	*  controller on IRQ 11 -- the line the RTL8139 also lands on. The UHCI
 	*  driver polls rather than installing a handler there, precisely so that
-	*  it cannot unhook the card; see the reasoning in src/uhci.c. Bringing it
+	*  it cannot unhook the card; see the reasoning in src/drivers/usb/uhci.c. Bringing it
 	*  up first means a machine where that ever changed would fail loudly here
 	*  rather than quietly losing the network later.
 	*

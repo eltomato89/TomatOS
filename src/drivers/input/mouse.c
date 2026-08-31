@@ -13,7 +13,7 @@
 *  say what it turned out to be for a human to read -- a USB driver would
 *  answer "USB HID mouse" there and the contract would be unchanged.
 *
-*  The mouse shares the 8042 with the keyboard (src/kb.c), and the two drivers
+*  The mouse shares the 8042 with the keyboard (src/drivers/input/kb.c), and the two drivers
 *  overlap in exactly two places: port 0x60, and the controller's configuration
 *  byte. Both are handled here rather than shared, because there is nothing to
 *  share -- kb.c reads a byte when IRQ 1 says so, and this file never touches

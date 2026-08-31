@@ -183,7 +183,7 @@ static void explain(const char *path, int rc)
 			break;
 
 		case SYS_ENOSYS:
-			/* user/syscall.h warns about exactly this at the top: the program
+			/* user/include/syscall.h warns about exactly this at the top: the program
 			*  is a file on a disk and the kernel booting it may be older than
 			*  the call numbers compiled into it. Worth naming, because
 			*  everything else about the machine looks perfectly healthy. */

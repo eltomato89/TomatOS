@@ -349,7 +349,7 @@ int do_amd(void) {
 /* getRamSize() is gone. The function determined the amount of memory by
  * destructive test writes across the address space - it was the cause of a
  * boot hang and overwrote foreign regions while doing so. The memory is now
- * reported by the bootloader's memory map, see pmm_init() in src/pmm.c. */
+ * reported by the bootloader's memory map, see pmm_init() in src/mm/pmm.c. */
 
 void init_serial() {
    outportb(PORT + 1, 0x00);    // Disable all interrupts
@@ -446,7 +446,7 @@ void audio_beep(unsigned frequency, int duration)
  * and nothing inside it did either. They were also the last code here that
  * declared variables in the middle of a block, which this kernel does not do.
  *
- * Nothing was lost with them. The kernel boots from ATA (src/ata.c) and
+ * Nothing was lost with them. The kernel boots from ATA (src/drivers/block/ata.c) and
  * mounts FAT off it; there is no floppy driver for a detection result to
  * feed, and "make run-floppy" boots an image through the BIOS without ever
  * asking this file about it. */

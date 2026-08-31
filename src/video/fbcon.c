@@ -123,7 +123,7 @@
 *
 *  One byte per glyph row, most significant bit leftmost, 256 glyphs (CP437,
 *  which is what printf() in scrn.c already translates its umlauts into).
-*  Lives in src/font8x16.c. Declared here for the same reason as above. */
+*  Lives in src/video/font8x16.c. Declared here for the same reason as above. */
 #define FBCON_CELL_W   8
 #define FBCON_CELL_H  16
 extern const uint8_t font8x16[256][FBCON_CELL_H];

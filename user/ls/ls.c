@@ -1,7 +1,7 @@
 /* TomatOS - ls: list a directory
 *  Desc: The shell's "ls", moved out of the kernel and into a ring 3 program.
 *
-*  This used to be listdir()/fs_list() in src/main.c, where it ran in the
+*  This used to be listdir()/fs_list() in src/kernel/main.c, where it ran in the
 *  shell's own task with the whole kernel in reach: it called fat_readdir()
 *  directly, asked fat_mounted() why there was nothing, and padded its columns
 *  by hand because the kernel's printf() has no field widths. None of that is
@@ -26,7 +26,7 @@
 *      name, then the smallest name larger than that one, and so on -- but it
 *      costs a full walk of the directory per line printed. sys_readdir() is
 *      index based and the driver underneath re-reads the directory from its
-*      first sector for every single index (see fat_dir_nth() in src/fat.c),
+*      first sector for every single index (see fat_dir_nth() in src/fs/fat.c),
 *      so an ordinary listing already costs O(n^2) sector reads. Multiplying
 *      that by another n to get alphabetical order is not a trade worth
 *      making on a machine reading a real disk one sector at a time.

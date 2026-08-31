@@ -184,8 +184,8 @@ make run-iso   # GRUB passes them via module lines
 ```
 
 A program is a static ELF32 built separately from the kernel — see `user/`.
-It links against `user/syscall.h` (the raw `int 0x80` wrappers) and
-`user/lib.c`, a small C library holding `_start`, `printf`, the string
+It links against `user/include/syscall.h` (the raw `int 0x80` wrappers) and
+`user/lib/lib.c`, a small C library holding `_start`, `printf`, the string
 routines and the file helpers. `_start` calls `main(argc, argv)` and hands its
 return value to `SYS_EXIT`, so a utility is just a `main()`.
 
@@ -211,9 +211,10 @@ anything that would land at or above `KERNEL_VIRTUAL_BASE`.
 
 ### Disk and filesystem
 
-`src/ata.c` talks to ATA/IDE drives with programmed I/O and LBA28 — no DMA,
+`src/drivers/block/ata.c` talks to ATA/IDE drives with programmed I/O and LBA28 — no DMA,
 no PCI enumeration, no interrupt handler; the driver polls and masks the
-drive's interrupt. On top of it `src/fat.c` reads FAT12 and FAT16 volumes.
+drive's interrupt. On top of it `src/fs/blockdev.c` presents a sector, whatever the hardware,
+and `src/fs/fat.c` reads and writes FAT12, FAT16 and FAT32 volumes.
 
 `make disk` builds a 32 MB FAT16 image with mtools and puts the user
 programs plus a few text files on it; the run targets attach it as a hard
@@ -651,7 +652,7 @@ on how the machine booted** — because the two graphics paths on this machine
 have almost nothing in common.
 
 Mode 13h (320x200, 256 palette entries) is reached at *runtime* by programming
-the VGA registers, which is all `src/vga.c` needs and why it works from the
+the VGA registers, which is all `src/video/vga.c` needs and why it works from the
 text console. The VBE framebuffer (1024x768x32) is established by our own
 stage 2 *before the kernel starts*, and cannot be entered later: VBE is a real
 mode BIOS interface and is out of reach once the kernel is in protected mode.
@@ -659,7 +660,7 @@ mode BIOS interface and is out of reach once the kernel is in protected mode.
 That asymmetry decides the design. A machine booted with `make run-bootdisk` is
 already in the better mode, and switching it to 13h would be a one-way trip —
 there would be no way back to 1024x768. So on that path the picture is drawn
-into the framebuffer that is already there (`src/fbdraw.c`) and the console is
+into the framebuffer that is already there (`src/video/fbdraw.c`) and the console is
 restored afterwards from `fbcon`'s shadow buffer, which is the only record of
 what was on the screen.
 
@@ -777,7 +778,7 @@ path, an offset and a length, and no file descriptor anywhere.
 **This is the first code in the kernel that can destroy data.** Everything
 before it was additive: a wrong packet is dropped, a wrong pixel overwritten,
 a wrong page faults. A wrong sector write takes a file with it. One sentence
-decided nearly every design question in `src/fat.c`:
+decided nearly every design question in `src/fs/fat.c`:
 
 > A leak is one `fsck -r` away; a cross-link cannot be repaired without losing
 > a file.
@@ -1301,13 +1302,33 @@ Since the kernel is linked as ELF, GDB has all symbols available.
 ## Layout
 
 ```
-src/            kernel sources
-src/include/    own headers
-user/           ring 3 programs and their C library, built separately
+src/            kernel sources, grouped by subsystem
+  kernel/         entry, tasks, syscalls, interrupts, the low level bits
+  mm/             physical frames, paging, the heap
+  fs/             the block device layer and FAT
+  net/            the IPv4 stack: ip, udp, tcp, dhcp, dns
+  video/          text console, framebuffer console, drawing, fonts
+  drivers/        one directory per bus: block, input, bus, usb, net
+  include/        own headers, deliberately flat -- see below
+user/           ring 3 programs, one directory each
+  include/        the headers a program may see, and the whole of its world
+  lib/            the C library every program links, plus opt-in ones
 linker.ld       linker script, loads at 1 MiB
+boot/           the GRUB-free boot chain: stage 1, stage 2, layout
+sysroot/        static contents of the disk image, named as they appear on it
 bin/            the original GRUB Legacy floppy image (template, never modified)
 legacy/         the 2011 Windows toolchain (DJGPP, VFD) and its batch files
 ```
+
+`src/include/` stays flat while the implementations are grouped, which is
+deliberate. A header is an interface, so that one directory is the list of
+what the kernel offers; the grouping of the `.c` files says who wrote a thing,
+not who may call it. It also keeps every `#include` in the tree to a bare name
+resolved through a single `-I`, so moving a source between subsystems — which
+this layout invites — touches no source at all. The restructuring itself was
+verified that way: all seven user programs came out byte-identical, and the
+kernel differed only by 40 bytes of alignment padding from the changed link
+order, with the same symbols and the same `.text`, `.rodata` and `.data`.
 
 Sources are UTF-8 with LF. The build uses `-std=gnu89`; under newer standards
 the implicit declarations of the original code become hard errors.

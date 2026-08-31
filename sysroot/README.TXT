@@ -1,9 +1,10 @@
 TomatOS on a disk
 =================
 
-This volume is read by src/blockdev.c, which reaches either
-src/ata.c (ATA PIO, LBA28) or a USB stick, and by src/fat.c
-(FAT12, FAT16 and FAT32, read and write).
+This volume is read by src/fs/blockdev.c, which reaches either
+src/drivers/block/ata.c (ATA PIO, LBA28) or a USB stick, and
+by src/fs/fat.c, which handles FAT12, FAT16 and FAT32 and both
+reads and writes.
 
 Layout:
   /BIN    user programs, one ELF each

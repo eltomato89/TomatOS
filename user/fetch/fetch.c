@@ -102,7 +102,7 @@
 *  A page can be a JPEG
 *  ------------------------------------------------------------------------
 *  cat faced this exact question about files and answered it (see the long
-*  note in user/cat.c); this program answers it the same way rather than
+*  note in user/cat/cat.c); this program answers it the same way rather than
 *  inventing a second convention for the same screen. There is no terminal
 *  driver here: sys_putch() acts on the control characters it is handed, so
 *  0x08 walks the cursor backwards over text that is already there and 0x0D
@@ -164,7 +164,7 @@
 *       fetch of a 404 which is a perfectly successful transaction.
 *
 *    2. AN EXISTING FILE IS NOT OVERWRITTEN. sys_fcreate() refuses one on
-*       purpose (see user/syscall.h) and this program does not argue with it.
+*       purpose (see user/include/syscall.h) and this program does not argue with it.
 *       What arrives over a network is not known in advance -- it can be a
 *       redirect stub, a captive portal or nothing at all -- and overwriting
 *       something that is already on the disk with it, unasked, is a trade of
@@ -273,7 +273,7 @@
 
 /* Every buffer here is at file scope, i.e. in .bss, and that is not a style
 *  preference. The user stack is ONE 4 KiB page (user/user.ld and the stack
-*  region in src/tasks.c); a 2 KiB local array would already be half of it
+*  region in src/kernel/tasks.c); a 2 KiB local array would already be half of it
 *  and the pair below would run off the bottom into the guard page, which
 *  the kernel answers by killing the task before main() prints anything.
 *  .bss costs nothing in the file on disk either -- the loader zeroes the
@@ -1058,7 +1058,7 @@ static void explain(const char *what, int rc)
 			break;
 
 		case SYS_ENOSYS:
-			/* The case user/syscall.h warns about at the top: this program
+			/* The case user/include/syscall.h warns about at the top: this program
 			*  is a file on a disk and the kernel booting it may be older
 			*  than the call numbers compiled into it. Worth naming, because
 			*  everything else about the machine looks perfectly healthy. */

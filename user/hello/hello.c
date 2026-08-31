@@ -10,7 +10,7 @@
 *
 *  It used to hand-roll its own decimal conversion, because the only header a
 *  program got was the raw "int 0x80" wrappers. There is a small C library now
-*  (user/lib.h), so this reads like a C program: an entry point called main(),
+*  (user/include/lib.h), so this reads like a C program: an entry point called main(),
 *  arguments, printf. What it demonstrates has not changed:
 *
 *    - There is still no C runtime beyond what lib.c provides, and no libc

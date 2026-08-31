@@ -190,7 +190,7 @@ static const char rtl_no_card[] = "RTL8139: not present";
 /* --- Port access ----------------------------------------------------------
 *
 *  system.h declares an inportw() that nothing in the kernel defines, and
-*  there is no 32 bit accessor at all. src/ata.c ran into the same gap and
+*  there is no 32 bit accessor at all. src/drivers/block/ata.c ran into the same gap and
 *  kept its helpers local; a header this file does not own is no place to
 *  fix that, so the four below are static and named apart from the global
 *  ones to avoid any collision the day they do appear. */

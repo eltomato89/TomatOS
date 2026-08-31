@@ -1,9 +1,9 @@
 /* TomatOS - User space runtime library
 *  Desc: The small pile of C a TomatOS program is allowed to stand on.
 *
-*  user/syscall.h is the kernel's ABI and nothing more: it can print a string
+*  user/include/syscall.h is the kernel's ABI and nothing more: it can print a string
 *  and read a key, and every program that wants to print a number has to
-*  write the division loop itself (see user/hello.c, which does exactly
+*  write the division loop itself (see user/hello/hello.c, which does exactly
 *  that). This header is the layer above it -- a printf(), the handful of
 *  string and memory routines the utilities actually use, and the startup
 *  code that turns "an ELF the kernel jumps into" into "a C program with a
@@ -16,7 +16,7 @@
 *       so it is not here. sys_write(), sys_getch() and friends are perfectly
 *       good names already; call them directly.
 *
-*    2. It depends on user/syscall.h and on nothing else. No src/include/,
+*    2. It depends on user/include/syscall.h and on nothing else. No src/include/,
 *       no host headers, not even <stdarg.h> -- see the va_list section
 *       below. A program on disk may be older than the kernel that runs it,
 *       and the syscall numbers are the only contract that spans that gap.
@@ -24,7 +24,7 @@
 *  Semantics are the STANDARD C ones wherever a function carries a standard
 *  C name, and this is worth saying out loud rather than assuming: the
 *  kernel's own strcmp() returned 1 for "equal" for years and the bugs that
-*  came out of it were real (src/str.c still carries the note). So:
+*  came out of it were real (src/kernel/str.c still carries the note). So:
 *  strcmp() returns 0 when the strings are equal, memcmp() likewise, and a
 *  negative or positive result orders the operands the way the standard says.
 */
@@ -102,8 +102,8 @@ int main(int argc, char **argv);
 *                   %     a literal percent sign
 *
 *  Field widths are the reason this exists at all. The kernel's printf()
-*  (src/scrn.c) has none, and the code around it pays for that: the shell
-*  hand-rolls its column padding and src/kernel.c carries a print_capped()
+*  (src/video/scrn.c) has none, and the code around it pays for that: the shell
+*  hand-rolls its column padding and src/kernel/kernel.c carries a print_capped()
 *  helper purely because there is no way to say "%.20s". The utilities that
 *  are moving out of the kernel -- ls, df -- are column printers almost
 *  entirely, so %-12s and %8u are the whole job.
@@ -246,7 +246,7 @@ long read_file(const char *path, void *buf, size_t size);
 *  gives one key. Turning a stream of keys into a line means echoing each
 *  one, and erasing on backspace means printing "\b \b" rather than "\b",
 *  because the console's backspace moves the cursor without clearing the
-*  cell under it (src/scrn.c putch()). Every interactive program needs this
+*  cell under it (src/video/scrn.c putch()). Every interactive program needs this
 *  and every one of them would get it slightly wrong. */
 int readline(char *buf, size_t size);
 

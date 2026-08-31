@@ -1,7 +1,7 @@
 /* TomatOS - cat: print a file
 *  Desc: The shell's "cat", moved out of the kernel and into a ring 3 program.
 *
-*  This was printfile()/fs_cat() in src/main.c. The rules about what a byte
+*  This was printfile()/fs_cat() in src/kernel/main.c. The rules about what a byte
 *  from a file is allowed to do to the screen have not changed -- they are
 *  restated below, because they are the whole of this program's judgement --
 *  but everything underneath them has: fat_size() and fat_read() are now
@@ -73,7 +73,7 @@
 *  single read, so asking for more only means being answered with this much
 *  anyway -- and asking for less would cost real time. Every sys_read()
 *  resolves the path from the root again and walks the cluster chain from the
-*  file's first cluster to the offset (src/fat.c), so the number of calls,
+*  file's first cluster to the offset (src/fs/fat.c), so the number of calls,
 *  not the number of bytes, is what a large file pays for. Four kilobytes is
 *  the largest chunk the interface will answer in one go. */
 #define CAT_CHUNK        4096

@@ -2,7 +2,7 @@
 *  Desc: Keyboards and mice on the USB bus, delivered into the same two
 *        queues the PS/2 drivers fill.
 *
-*  WHAT THIS FILE IS FOR. src/usb.c enumerates whatever is plugged in and stops
+*  WHAT THIS FILE IS FOR. src/drivers/usb/usb.c enumerates whatever is plugged in and stops
 *  there: it addresses a device, reads its descriptors and configures it, and
 *  then hands the result to whoever recognises the class triple. This is the
 *  driver for class 3 (HID), subclass 1 (boot interface), protocol 1 (keyboard)

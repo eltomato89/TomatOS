@@ -3170,7 +3170,7 @@ static int sys_unmapfb(struct regs *r)
 *  sys_input_event uses int32_t and uint32_t. The widening is the conversion,
 *  and doing it through a local is what keeps a partially built structure out
 *  of user memory. The button masks cross unchanged -- MOUSE_BUTTON_LEFT is 1,
-*  RIGHT is 2, MIDDLE is 4, and user/syscall.h publishes the same three
+*  RIGHT is 2, MIDDLE is 4, and user/include/syscall.h publishes the same three
 *  numbers, so there is nothing to translate. */
 static int sysinput_take_mouse(sys_input_event *ev)
 {
@@ -3309,7 +3309,7 @@ static int sysinput_take(sys_input_event *ev)
 *  keyboard to itself until the shell gives up waiting for it.
 *
 *  timeout_ms of 0 waits forever, which is task_wait()'s own convention and
-*  what user/syscall.h documents; a negative one is not a duration and is
+*  what user/include/syscall.h documents; a negative one is not a duration and is
 *  refused. Even a forever wait is chunked, so a task blocked here is blocked
 *  in the scheduler's sense -- "ps" shows Blocked, not a busy loop -- and comes
 *  back once every SYS_INPUT_POLL to look at the keyboard. */

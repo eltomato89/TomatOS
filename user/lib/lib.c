@@ -1,7 +1,7 @@
 /* TomatOS - User space runtime library
 *  Desc: Startup code, printf, strings, and the two wrappers worth having.
 *
-*  See user/lib.h for what each of these promises. This file is about how.
+*  See user/include/lib.h for what each of these promises. This file is about how.
 *
 *  Built freestanding and linked -nostdlib, so there is no libgcc to fall
 *  back on either. That rules out one thing in particular and it is worth
@@ -74,7 +74,7 @@ void _start(int argc, char **argv)
 *    - The kernel takes its console lock for the length of one sys_write().
 *      Character by character, a timer tick between two of them lets another
 *      task print into the middle of the line -- exactly the interleaving
-*      the kernel's own printf() takes a lock to prevent (src/scrn.c). A
+*      the kernel's own printf() takes a lock to prevent (src/video/scrn.c). A
 *      chunk at a time does not make a printf() atomic, but it makes the
 *      window a hundred times narrower and costs nothing.
 *
@@ -806,7 +806,7 @@ int readline(char *buf, size_t size)
 			{
 				len--;
 				/* "\b \b" and not "\b". The console's backspace only moves
-				*  the cursor left, it does not clear the cell (src/scrn.c
+				*  the cursor left, it does not clear the cell (src/video/scrn.c
 				*  putch()), so the character has to be overwritten with a
 				*  space and the cursor moved back again. This is the whole
 				*  reason this function exists. */

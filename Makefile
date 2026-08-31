@@ -11,6 +11,13 @@
 #  Directories
 # ---------------------------------------------------------------------------
 SRC_DIR     := src
+# Headers stay in ONE flat directory while the .c files below are grouped
+# into subsystems, and that asymmetry is the point rather than an oversight.
+# A header is an interface: this directory is the list of what the kernel
+# offers, readable at a glance, and the grouping of the implementations says
+# nothing about who may call them. Keeping it flat also keeps -I to a single
+# entry and every #include in the tree to a bare name -- so moving a .c file
+# between subsystems, as this layout invites, touches no source at all.
 INC_DIR     := $(SRC_DIR)/include
 BUILD_DIR   := build
 ISO_DIR     := $(BUILD_DIR)/iso
@@ -19,8 +26,20 @@ ISO_DIR     := $(BUILD_DIR)/iso
 # executables that share nothing with the kernel but the "int 0x80" ABI, so
 # they get their own sources, their own headers and their own object
 # directory -- see the "User space" block further down.
-USER_DIR    := user
+USER_DIR     := user
 USER_OBJ_DIR := $(BUILD_DIR)/user
+
+# Each program is a directory of its own, and every .c in it is part of that
+# program -- so a command that outgrows one file needs no change here. The
+# two directories that are not programs:
+#
+#   include/   the headers a program may see, and the whole of its world.
+#   lib/       the C library every program links, plus the ones it can opt
+#              into. Sources here are never picked up by a program's own
+#              wildcard, which is what keeps "one directory, one program"
+#              true rather than approximately true.
+USER_INC_DIR := $(USER_DIR)/include
+USER_LIB_DIR := $(USER_DIR)/lib
 
 # What the disk contains, as files rather than as recipe lines.
 #
@@ -31,7 +50,7 @@ USER_OBJ_DIR := $(BUILD_DIR)/user
 #
 # THE NAMES ARE UPPER CASE 8.3 ON PURPOSE, and that is the one thing about
 # this directory that looks wrong and is not. mtools writes a VFAT long name
-# entry for any name that is not a valid 8.3, and src/fat.c skips long name
+# entry for any name that is not a valid 8.3, and src/fs/fat.c skips long name
 # entries -- so a file called "readme.txt" here would be copied onto the
 # image, take up clusters, and be invisible to every program that lists a
 # directory. The name in the source tree is the name on the disk, which also
@@ -49,7 +68,7 @@ ISO         := $(BUILD_DIR)/tomatos.iso
 FLOPPY_TMPL := bin/dev_kernel_grub.img
 FLOPPY      := $(BUILD_DIR)/tomatos_floppy.img
 
-# FAT hard disk image -- the disk src/ata.c and src/fat.c talk to.
+# FAT hard disk image -- the disk src/drivers/block/ata.c and src/fs/fat.c talk to.
 DISK        := $(BUILD_DIR)/tomatos_disk.img
 
 LINKER_SCRIPT      := linker.ld
@@ -125,9 +144,8 @@ LDFLAGS  := -m elf_i386 -T $(LINKER_SCRIPT) -nostdlib -no-pie
 # ---------------------------------------------------------------------------
 #  User space
 #
-#  One entry per program; user/<name>.c becomes $(BUILD_DIR)/<name>.elf.
-#  Programs are single translation units on purpose -- there is no libc to
-#  link against, so anything shared between them belongs in a header.
+#  One entry per program; user/<name>/ becomes $(BUILD_DIR)/<name>.elf, with
+#  every .c in that directory compiled into it.
 # ---------------------------------------------------------------------------
 # Programs that live on the disk rather than in the kernel. "make disk" copies
 # each one into /BIN as NAME.ELF, and the shell runs an unknown command by
@@ -137,25 +155,30 @@ LDFLAGS  := -m elf_i386 -T $(LINKER_SCRIPT) -nostdlib -no-pie
 # kernel's directory reader skips.
 USER_PROGS := hello ls cat fetch rm cp gui
 
-# The C library every program links against: user/lib.c, holding _start (which
-# calls main), printf, the string routines and the file helpers. It is a plain
-# object rather than an archive -- with a handful of programs, "ar" would only
-# add a step and a chance for a stale index, and the linker garbage collects
-# nothing here either way.
-USER_LIB_SRC := $(USER_DIR)/lib.c
-USER_LIB_OBJ := $(USER_OBJ_DIR)/lib.o
+# The sources and the objects of one program, by name. Wildcarded, so adding
+# a second file to a program is dropping it in that program's directory.
+#   $(1) = program name
+user_srcs = $(sort $(wildcard $(USER_DIR)/$(1)/*.c))
+user_objs = $(patsubst $(USER_DIR)/%.c,$(USER_OBJ_DIR)/%.o,$(call user_srcs,$(1)))
 
-# Extra objects for one program only, named per program. gfxlib is NOT in
+# The C library every program links against: user/lib/lib.c, holding _start
+# (which calls main), printf, the string routines and the file helpers. It is
+# a plain object rather than an archive -- with a handful of programs, "ar"
+# would only add a step and a chance for a stale index, and the linker
+# garbage collects nothing here either way.
+USER_LIB_OBJ := $(USER_OBJ_DIR)/lib/lib.o
+
+# Libraries a program opts into, named per program. gfxlib is NOT in
 # USER_LIB_OBJ and must not be: its back buffer is 3 MiB of .bss, and linking
 # it into every program would give "ls" a three megabyte memory image for a
 # buffer it never touches. The loader allocates a frame per page of memsz, so
 # that is not a number on disk -- it is real RAM at every start.
-USER_GFX_OBJ  := $(USER_OBJ_DIR)/gfxlib.o
-USER_EXTRA_gui := $(USER_GFX_OBJ)
+USER_GFX_OBJ   := $(USER_OBJ_DIR)/lib/gfxlib.o
+USER_LIBS_gui  := $(USER_GFX_OBJ)
 
 USER_ELFS  := $(patsubst %,$(BUILD_DIR)/%.elf,$(USER_PROGS))
-USER_OBJS  := $(patsubst %,$(USER_OBJ_DIR)/%.o,$(USER_PROGS))
-USER_DEPS  := $(USER_OBJS:.o=.d) $(USER_OBJ_DIR)/lib.d
+USER_OBJS  := $(foreach p,$(USER_PROGS),$(call user_objs,$(p)))
+USER_DEPS  := $(USER_OBJS:.o=.d) $(USER_LIB_OBJ:.o=.d) $(USER_GFX_OBJ:.o=.d)
 
 # The objects deliberately land in a directory of their own. Nothing forces
 # the separation otherwise: both sides are -m32 freestanding ELF objects, and
@@ -174,18 +197,20 @@ USER_DEPS  := $(USER_OBJS:.o=.d) $(USER_OBJ_DIR)/lib.d
 #                         performs no relocations at all. Position
 #                         independent code would need a GOT and someone to
 #                         fill it in; there is nobody.
-#   -nostdinc -I $(USER_DIR)
+#   -nostdinc -I $(USER_INC_DIR)
 #                         No system headers, and NOT $(INC_DIR): a user
 #                         program must not be able to reach kernel internals
-#                         even by accident. user/syscall.h is the whole of
-#                         its world.
+#                         even by accident. What is in user/include/ is the
+#                         whole of its world -- and now that this is a
+#                         directory rather than the whole of user/, a program
+#                         cannot reach another program's headers either.
 USER_CFLAGS := \
 	-m32 \
 	-std=gnu89 \
 	-mgeneral-regs-only \
 	-fno-pic -fno-pie \
 	-ffreestanding -fno-builtin -nostdinc \
-	-I $(USER_DIR) \
+	-I $(USER_INC_DIR) \
 	-fno-strict-aliasing \
 	-fno-stack-protector \
 	-fno-asynchronous-unwind-tables \
@@ -201,7 +226,7 @@ USER_CFLAGS := \
 USER_LDFLAGS := -m elf_i386 -T $(USER_LINKER_SCRIPT) -nostdlib -no-pie -static \
                 --no-warn-rwx-segments
 
-# Keyboard layout. The kernel carries a German keymap (src/kb.c), so QEMU has
+# Keyboard layout. The kernel carries a German keymap (src/drivers/input/kb.c), so QEMU has
 # to deliver German scancodes. Under Wayland QEMU does not pass raw scancodes
 # through but translates via the keysym -- without -k the guest ends up with
 # the US layout, and the minus key arrives as the German sharp s.
@@ -280,7 +305,7 @@ QEMUFLAGS := -m $(QEMU_MEM) -k $(QEMU_KEYMAP) $(USBFLAGS)
 #      10.0.2.3    DNS forwarder
 #      255.255.255.0
 #
-#  The card is an RTL8139 because that is the one src/rtl8139.c drives.
+#  The card is an RTL8139 because that is the one src/drivers/net/rtl8139.c drives.
 #
 #  Turn it off with:   make run NET=0
 #  Record traffic with: make run NETDUMP=1   -> build/net.pcap, readable by
@@ -351,7 +376,7 @@ DISK_SIZE_MB    := $(shell expr \( $(DISK_TOTAL_SECS) + 1024 \) / 2048)
 # How the image is handed to QEMU.
 #
 # This is exactly what "-hda" expands to (index=0, media=disk -> IDE bus 0
-# master, the drive src/ata.c calls drive 0), with "format=raw" spelled out.
+# master, the drive src/drivers/block/ata.c calls drive 0), with "format=raw" spelled out.
 # Without it QEMU probes the file and prints a warning about having guessed --
 # harmless, but it would be the only noise in an otherwise quiet build.
 #
@@ -608,17 +633,28 @@ endef
 # ---------------------------------------------------------------------------
 #  Sources / objects
 #
-#  Wildcard based -- no hand-maintained file list.
-#  src/test.S is a leftover empty file and is deliberately not built.
+#  Found rather than listed, at any depth: src/ is grouped into subsystems
+#  (kernel, mm, fs, net, video, drivers/<bus>), and a new one needs no entry
+#  here. The object tree mirrors the source tree -- src/net/ip.c becomes
+#  build/net/ip.o -- so two files of the same name in different subsystems
+#  cannot collide, which a flat object directory would let them do silently.
+#
+#  Sorted, so the link order is a property of the tree and not of the order
+#  the filesystem happens to hand the names back.
+#
+#  include/ is excluded because it holds no translation units; it is left
+#  flat on purpose. A header is an interface, and the single directory IS the
+#  list of what the kernel offers -- see the comment above INC_DIR.
 # ---------------------------------------------------------------------------
-C_SRCS   := $(wildcard $(SRC_DIR)/*.c)
-ASM_SRCS := $(wildcard $(SRC_DIR)/*.asm)
+C_SRCS   := $(sort $(shell find $(SRC_DIR) -name '*.c'   -not -path '$(INC_DIR)/*'))
+ASM_SRCS := $(sort $(shell find $(SRC_DIR) -name '*.asm' -not -path '$(INC_DIR)/*'))
 
 C_OBJS   := $(patsubst $(SRC_DIR)/%.c,$(BUILD_DIR)/%.o,$(C_SRCS))
 ASM_OBJS := $(patsubst $(SRC_DIR)/%.asm,$(BUILD_DIR)/%.o,$(ASM_SRCS))
 
 # start.o first: the Multiboot header must end up at the front of the image.
-OBJS := $(BUILD_DIR)/start.o $(filter-out $(BUILD_DIR)/start.o,$(ASM_OBJS) $(C_OBJS))
+START_OBJ := $(BUILD_DIR)/kernel/start.o
+OBJS := $(START_OBJ) $(filter-out $(START_OBJ),$(ASM_OBJS) $(C_OBJS))
 
 DEPS := $(C_OBJS:.o=.d) $(USER_DEPS)
 
@@ -651,27 +687,38 @@ $(KERNEL): $(OBJS) $(LINKER_SCRIPT) | $(BUILD_DIR)
 	@echo "  Kernel ready: $@"
 
 # --- compile ---------------------------------------------------------------
-$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
+#
+# The user rule comes first deliberately. build/user/ls/ls.o matches the
+# kernel pattern as well, with a stem of "user/ls/ls"; make only rejects it
+# because src/user/ls/ls.c cannot be made, which is true today and is a thin
+# thing to rely on. Order makes it not matter.
+#
+# Each rule creates its own output directory. The object tree mirrors the
+# source tree, so the directories are not known until the wildcards have run,
+# and an order-only prerequisite on a fixed list would have to be kept in
+# step with the source layout by hand -- exactly what this restructuring was
+# meant to stop.
+$(USER_OBJ_DIR)/%.o: $(USER_DIR)/%.c
+	@mkdir -p $(dir $@)
+	@echo "  CC/U    $<"
+	$(CC) $(USER_CFLAGS) $(DEPFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c
+	@mkdir -p $(dir $@)
 	@echo "  CC      $<"
 	$(CC) $(CFLAGS) $(DEPFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/%.o: $(SRC_DIR)/%.asm | $(BUILD_DIR)
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.asm
 	$(call need,$(AS),nasm)
+	@mkdir -p $(dir $@)
 	@echo "  AS      $<"
 	$(AS) $(ASFLAGS) $< -o $@
 
 $(BUILD_DIR):
 	@mkdir -p $(BUILD_DIR)
 
-$(USER_OBJ_DIR):
-	@mkdir -p $(USER_OBJ_DIR)
-
 # --- user space programs ---------------------------------------------------
 user: $(USER_ELFS) $(USER_MODULES)
-
-$(USER_OBJS) $(USER_LIB_OBJ) $(USER_GFX_OBJ): $(USER_OBJ_DIR)/%.o: $(USER_DIR)/%.c | $(USER_OBJ_DIR)
-	@echo "  CC/U    $<"
-	$(CC) $(USER_CFLAGS) $(DEPFLAGS) -c $< -o $@
 
 # The program plus the library, and nothing else on the link line: no kernel
 # objects, no libgcc, no crt files. What comes out is a static ET_EXEC with a
@@ -681,13 +728,14 @@ $(USER_OBJS) $(USER_LIB_OBJ) $(USER_GFX_OBJ): $(USER_OBJ_DIR)/%.o: $(USER_DIR)/%
 # lib.o carries _start, so it has to be on the line even for a program that
 # never calls anything else in it; ENTRY(_start) in user.ld would otherwise
 # have no symbol to resolve.
-# USER_EXTRA_<name> names objects only that program links. The secondary
-# expansion is what lets the rule read a variable chosen by the target's own
-# stem rather than by a fixed list.
+# Two things here are chosen by the target's own name, which is what the
+# secondary expansion is for: every object of the program's own directory,
+# and USER_LIBS_<name>, the libraries only that program links.
 .SECONDEXPANSION:
-$(USER_ELFS): $(BUILD_DIR)/%.elf: $(USER_OBJ_DIR)/%.o $(USER_LIB_OBJ) $$(USER_EXTRA_$$*) $(USER_LINKER_SCRIPT) | $(BUILD_DIR)
+$(USER_ELFS): $(BUILD_DIR)/%.elf: $$(call user_objs,$$*) $(USER_LIB_OBJ) \
+                                  $$(USER_LIBS_$$*) $(USER_LINKER_SCRIPT) | $(BUILD_DIR)
 	@echo "  LD/U    $@"
-	$(LD) $(USER_LDFLAGS) -o $@ $< $(USER_LIB_OBJ) $(USER_EXTRA_$*)
+	$(LD) $(USER_LDFLAGS) -o $@ $(call user_objs,$*) $(USER_LIB_OBJ) $(USER_LIBS_$*)
 
 # The bare-name alias QEMU loads (see the Multiboot module block at the top).
 # Relative symlink, so moving $(BUILD_DIR) does not break it.
@@ -993,7 +1041,7 @@ $(STAGE2_BIN): $(STAGE2_SRC) $(BOOT_INCS) | $(BUILD_DIR)
 #      off-by-a-section layout could not pass.
 #
 # And the Multiboot header: it must lie within the first 8 KiB of the image,
-# 4 byte aligned. It is NOT at offset 0 -- src/start.asm puts the entry point
+# 4 byte aligned. It is NOT at offset 0 -- src/kernel/start.asm puts the entry point
 # first and the header just after it, currently at 0x5C -- and that is the
 # right way round here, because stage 2 enters the image at its first byte.
 # The rule prints where it found the magic so a reshuffle of start.asm cannot
@@ -1027,7 +1075,7 @@ $(KERNEL_BIN): $(KERNEL) | $(BUILD_DIR)
 	 if [ -z "$$mb" ]; then \
 	   printf '\nERROR: no Multiboot header (0x1BADB002) in the first 8 KiB of %s.\n' '$@'; \
 	   printf '       The GRUB / -kernel paths would stop booting. Check that\n'; \
-	   printf '       src/start.asm still carries it and that linker.ld keeps\n'; \
+	   printf '       src/kernel/start.asm still carries it and that linker.ld keeps\n'; \
 	   printf '       start.o at the front of .text.\n\n'; \
 	   rm -f $@; exit 1; \
 	 fi; \
@@ -1226,9 +1274,9 @@ help:
 	@echo "  ifconfig 10.0.2.15 255.255.255.0 10.0.2.2"
 	@echo "  ping 10.0.2.2         the gateway answers ARP and ICMP echo"
 	@echo ""
-	@echo "User programs (user/<name>.c -> $(BUILD_DIR)/<name>.elf):"
+	@echo "User programs (user/<name>/ -> $(BUILD_DIR)/<name>.elf):"
 	@echo "  $(USER_PROGS)"
-	@echo "  Add one by dropping the source in $(USER_DIR)/ and appending its"
+	@echo "  Add one by making a directory under $(USER_DIR)/ and appending its"
 	@echo "  name to USER_PROGS in this Makefile - iso and run pick it up."
 	@echo ""
 	@echo "Contents of the disk image (make disk):"

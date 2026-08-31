@@ -402,7 +402,7 @@ s2_kbd_wait_out:
 ;
 ; An entry is therefore 24 bytes long while its size field says 20, and a
 ; consumer walks the list with `addr + size + 4` -- which is exactly what
-; src/pmm.c does. Writing 24 into size, or leaving the size field out and
+; src/mm/pmm.c does. Writing 24 into size, or leaving the size field out and
 ; packing 20-byte entries, both make pmm.c walk off into garbage.
 ;
 ; The trick that keeps this simple: point es:di at entry+4 for the BIOS call,

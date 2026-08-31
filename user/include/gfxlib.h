@@ -1,14 +1,14 @@
 /* TomatOS - drawing from ring 3
-*  Desc: The shapes of src/fbdraw.c, drawn into a buffer of the program's own
+*  Desc: The shapes of src/video/fbdraw.c, drawn into a buffer of the program's own
 *        and copied onto the screen in pieces.
 *
 *  ------------------------------------------------------------------------
 *  Why this exists next to fbdraw.c
 *  ------------------------------------------------------------------------
-*  src/fbdraw.c already draws lines, rectangles and text into the very same
+*  src/video/fbdraw.c already draws lines, rectangles and text into the very same
 *  framebuffer. None of it is reachable from here: this is a separate binary
 *  on a FAT volume, linked -nostdlib against user/lib.o and nothing else, and
-*  the constraint that user/syscall.h states -- a program must not depend on
+*  the constraint that user/include/syscall.h states -- a program must not depend on
 *  kernel internals -- is not a style rule, it is the reason a program on disk
 *  can be older than the kernel that runs it. So the shapes are written again.
 *
@@ -106,9 +106,9 @@
 *  back buffer that has to exist for it. It is the same ceiling
 *  src/include/fbcon.h names as FBCON_MAX_WIDTH/HEIGHT, and that header lists
 *  the four places that have to agree about it -- vbe_res_table in
-*  boot/vbe.inc, the Multiboot video request in src/start.asm, the console's
+*  boot/vbe.inc, the Multiboot video request in src/kernel/start.asm, the console's
 *  shadow buffer, and this. The number cannot be included from there: a ring 3
-*  binary must not depend on kernel internals, for the reason user/syscall.h
+*  binary must not depend on kernel internals, for the reason user/include/syscall.h
 *  gives, so this is a COPY and raising one means raising the other by hand.
 *
 *  It is not a guess about what might turn up. Stage 2 walks vbe_res_table
@@ -130,7 +130,7 @@
 
 /* What the back buffer therefore costs: 8294400 bytes at the ceiling. Stated
 *  as a name because it is the number that matters to a caller -- it is .bss,
-*  and src/exec.c's loader allocates a physical frame per page of it at every
+*  and src/kernel/exec.c's loader allocates a physical frame per page of it at every
 *  start, so this is 8.3 MB of real memory taken from a 64 MB guest whatever
 *  mode the machine actually came up in. */
 #define GFX_BACK_BYTES  ((unsigned long)GFX_MAX_WIDTH * GFX_MAX_HEIGHT * \
@@ -252,7 +252,7 @@ extern int gfx_surface_init(gfx_surface *s, void *mem,
 *  quarter brightness.
 *
 *  Channels narrower than eight bits are truncated from the top, which is the
-*  same thing src/fbcon.c's rgb_to_pixel() does, so a colour looks the same on
+*  same thing src/video/fbcon.c's rgb_to_pixel() does, so a colour looks the same on
 *  both sides of the system call gate. */
 extern gfx_color gfx_rgb(const gfx_surface *s,
                          unsigned char r, unsigned char g, unsigned char b);

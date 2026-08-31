@@ -111,7 +111,7 @@
 *  against an older kernel, so the layout is fixed deliberately rather than
 *  left to the compiler. Every field is a fixed width, char arrays are sized
 *  so that no padding is inserted, and nothing is ever appended in the middle.
-*  The same declarations exist in user/syscall.h and have to move in step --
+*  The same declarations exist in user/include/syscall.h and have to move in step --
 *  see the note at the top of that file for why they are copies and not a
 *  shared include. */
 

@@ -6,14 +6,14 @@
 *  Why the file is never held
 *  ------------------------------------------------------------------------
 *  There is no malloc here and the user stack is ONE 4 KiB page (user/user.ld
-*  and the stack region in src/tasks.c), so "read the file, then write it" is
+*  and the stack region in src/kernel/tasks.c), so "read the file, then write it" is
 *  not a shape this program can have -- it would cap the size of a copyable
 *  file at something well under a page and fail on anything larger with a
 *  fault rather than a message.
 *
 *  What makes streaming free is the shape of the two calls. Neither
 *  sys_read() nor sys_fwrite() has a file position: each one names the file
-*  and says where in it to start (see user/syscall.h). So there is nothing to
+*  and says where in it to start (see user/include/syscall.h). So there is nothing to
 *  seek, nothing to keep open, and a single offset serves both sides -- the
 *  read takes CP_CHUNK bytes from it, the write puts them back at the same
 *  place in the other file, and the copy advances. A one megabyte file costs
@@ -86,7 +86,7 @@
 *  read, so asking for more only means being answered with this much anyway,
 *  and asking for less would cost real time: every sys_read() and every
 *  sys_fwrite() resolves the path from the root again and walks the cluster
-*  chain to the offset (src/fat.c), so the number of CALLS, not the number of
+*  chain to the offset (src/fs/fat.c), so the number of CALLS, not the number of
 *  bytes, is what a large file pays for. */
 #define CP_CHUNK   4096
 
@@ -233,7 +233,7 @@ static void explain(const char *path, int rc)
 			break;
 
 		case SYS_ENOSYS:
-			/* user/syscall.h warns about exactly this at the top: this
+			/* user/include/syscall.h warns about exactly this at the top: this
 			*  program is a file on a disk and the kernel booting it may be
 			*  older than the call numbers compiled into it. */
 			printf("cp: this kernel has no write system calls.\n");
@@ -258,7 +258,7 @@ static char lower(char c)
 
 /* Compares two paths the way the filesystem underneath compares them: 8.3
 *  names on FAT are case insensitive, every path is resolved from the root
-*  (see fat_resolve() in src/fat.c -- there is no working directory), and runs
+*  (see fat_resolve() in src/fs/fat.c -- there is no working directory), and runs
 *  of '/' as well as a trailing one mean nothing. So "/A.TXT", "a.txt" and
 *  "//A.txt/" are one file, and this says so.
 *
