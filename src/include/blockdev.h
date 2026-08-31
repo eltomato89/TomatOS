@@ -62,6 +62,31 @@ typedef struct
     /* A short phrase for the shell -- the model string, the vendor. Never
     *  null, and never longer than a table column. */
     const char *(*describe)(int dev);
+
+    /* Makes everything already written actually reach the medium. Returns 0
+    *  on success, negative if the device refused or could not say.
+    *
+    *  MAY BE NULL, and that is not laziness -- it is the honest answer for a
+    *  driver whose write() already gets there. The ATA driver ends every write
+    *  with a cache flush command, so by the time it returns 0 the sectors are
+    *  out of the drive's buffer; there is nothing left for a separate call to
+    *  do. A USB stick is the opposite: it acknowledges a SCSI WRITE when it
+    *  has the data, not when the flash does.
+    *
+    *  WHY THIS IS NEEDED AT ALL. The filesystem's write ordering is its only
+    *  protection against a power failure -- the whole "a leak is one fsck
+    *  away, a cross-link cannot be repaired" argument depends on an earlier
+    *  write being ON THE MEDIUM before a later one is issued. Against ATA that
+    *  held for free, and nothing in fat.c said so because nothing had to. It
+    *  stopped holding the moment a device could acknowledge a write it has not
+    *  finished, and without this call the careful ordering would be the order
+    *  the writes were ASKED FOR and nothing more.
+    *
+    *  Not called per sector. It is called where the ordering actually matters,
+    *  which is a handful of points per file operation -- see fat.c. On a slow
+    *  device each one costs a round trip, and that cost is the price of the
+    *  guarantee rather than an oversight. */
+    int (*flush)(int dev);
 } blk_ops;
 
 /* Registers a driver for one device number. Returns 0, or negative if the
@@ -85,6 +110,13 @@ extern void blk_init(void);
 *  not check. */
 extern int blk_read(int dev, uint32_t lba, uint32_t count, void *buf);
 extern int blk_write(int dev, uint32_t lba, uint32_t count, const void *buf);
+
+/* Makes everything written to this device so far reach the medium. Returns 0
+*  when it did, or when the driver has nothing to do because its writes already
+*  land -- those two are deliberately the same answer, because a caller can act
+*  on neither differently. Negative means the device was asked and refused, and
+*  then the ordering the caller was relying on did not happen. */
+extern int blk_flush(int dev);
 
 extern int      blk_present(int dev);
 extern uint32_t blk_sectors(int dev);

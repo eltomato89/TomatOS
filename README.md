@@ -461,6 +461,68 @@ testable without hardware and was: 82 usages compared against the PS/2 tables
 in both shift states, all equal, with the divergences (keypad `/`, the key
 next to left shift) documented rather than smoothed over.
 
+#### Two things the block layer broke, and the fixes
+
+Both were found by the agent doing the conversion rather than by a failure,
+which is the useful order.
+
+**The write ordering had lost its guarantee.** The whole "a leak is one `fsck`
+away, a cross-link cannot be repaired" argument depends on an earlier write
+being *on the medium* before a later one is issued. Against ATA that held for
+free — `ata.c` ends every write with a cache flush command — and nothing in
+`fat.c` said so, because nothing had to. It stopped holding the moment a device
+could acknowledge a write it has not finished, which is exactly what a stick
+does.
+
+`blk_ops` gained a `flush`, and it **may be null** — that is the honest answer
+for a driver whose writes already land, and ATA's is null with a comment naming
+the line in `ata.c` that makes it true. USB sends SCSI SYNCHRONIZE CACHE. A
+device that *refuses* the command gets the same answer as a null flush, because
+this CDB is zeros apart from the opcode: there is no field a device that
+implements it could find illegal, so ILLEGAL REQUEST here can only mean "not
+that command", whichever code a firmware picks. A refusal with no valid sense
+data is an error — a device that will not say why it said no has not
+established it had nothing to do. Refusals are remembered per *unit*, not per
+interface, because the command is addressed to a LUN and two cards in one
+reader are different media.
+
+The flushes went where the ordering argument names a transition, not per
+sector: zeros and the allocation mark before the link, data and chain before
+the directory entry, the directory entry before releasing a chain, backup FAT
+copies before the primary. **A failed flush stops short of the dangerous
+step**, every time — never link, never commit, never release — so what is left
+is always a leak and never a cross-link. On ATA the flush has nothing to do and
+answers immediately, so a hard disk pays for none of it.
+
+**And `fat.c` had no re-entrancy guard.** Against ATA that was survivable for a
+reason nobody had written down: ATA never yields, it is a bounded spin, so two
+tasks in the file needed an unlucky preemption. USB waits with `sleep()`, which
+*blocks the task*, so the scheduler runs something else in the middle of every
+sector operation. There are 24 call sites in `syscall.c` and 16 in `main.c`.
+
+The lock is taken with interrupts off rather than with `xchg`, and that
+deliberately differs from the DNS lock in `syscall.c`: that one writes the flag
+and the owner in two stores, so a task preempted between them holds a lock
+whose owner still reads as the previous release's value — and a sweep would
+find that stale pid dead and break a lock just legitimately taken. On one CPU
+`cli` makes the pair indivisible. A dead owner's lock is broken, and unlike the
+DNS sweep this one also **drops both sector caches**: a task that died between
+editing `fat_buf` and writing it out leaves a buffer that no longer describes
+the disk, and the next task would write that abandoned edit back as current.
+
+Two public functions called two others, which a plain flag would have
+deadlocked on at the first `fat_create()`. The fix is a shell-and-body split
+rather than a recursion count, on the grounds that a depth counter buys the
+right to be careless about which functions are entry points — and that
+carelessness is what created the calls.
+
+**An honest limit:** a control kernel built without either fix ran the same
+concurrent workloads and also came out clean, so the tests prove the lock costs
+nothing and breaks nothing, not that the race bites today. `usbmsc.c` carries
+its own per-bus transport lock, which removes the crudest form. What remains
+are the multi-step windows the lock exists for, and none of those was made to
+fail on demand.
+
 #### Mass storage: a stick is just another disk
 
 TomatOS mounts a USB stick and runs programs off it. `ls` loaded from

@@ -43,10 +43,17 @@
 *    - Caching, read-ahead and write-back. Every blk_read() is a real command
 *      on the wire. The filesystem above has its own ideas about that and this
 *      is not the layer to have a second set.
-*    - SYNCHRONIZE CACHE, START STOP UNIT and PREVENT ALLOW MEDIUM REMOVAL.
-*      The first matters for a device with a write cache and no power-loss
-*      protection, and it is the honest thing to send before an unmount that
-*      this kernel does not have; it is written down here rather than done.
+*    - START STOP UNIT and PREVENT ALLOW MEDIUM REMOVAL. Both belong to an
+*      unmount this kernel does not have; they are written down here rather
+*      than done.
+*
+*      SYNCHRONIZE CACHE used to be on this list and no longer is, because the
+*      reason it was on it turned out to be a hole rather than a shortcut. A
+*      stick acknowledges a SCSI WRITE(10) when IT has the data, not when the
+*      flash does, and the filesystem's write ordering -- its only protection
+*      against a power failure -- assumes the earlier write is ON THE MEDIUM
+*      before the later one is issued. Against ATA that held for free. Here it
+*      did not, and nothing said so. See usbmsc_sync_cache().
 *    - MODE SENSE, and therefore the write protect bit. A write to a
 *      write-protected device is attempted and fails with a sense key this file
 *      does report, which is a worse user experience and the same amount of
@@ -196,16 +203,23 @@ typedef struct
 
 /* --- The SCSI commands used ----------------------------------------------
 *
-*  Five, and every one of them is here because something above cannot be
+*  Six, and every one of them is here because something above cannot be
 *  answered without it. Opcodes are the ones from SBC/SPC that every device
 *  claiming subclass 6 implements; anything more adventurous is what the
-*  "deliberately not here" list at the top is for. */
+*  "deliberately not here" list at the top is for.
+*
+*  SYNCHRONIZE CACHE(10) is the one exception to "every device implements it",
+*  and that is not an oversight in the sentence above: a device with no write
+*  cache has nothing to synchronise and is entitled by SBC to reject the
+*  command outright. usbmsc_sync_cache() is written around that fact rather
+*  than in spite of it. */
 #define SCSI_TEST_UNIT_READY   0x00
 #define SCSI_REQUEST_SENSE     0x03
 #define SCSI_INQUIRY           0x12
 #define SCSI_READ_CAPACITY10   0x25
 #define SCSI_READ10            0x28
 #define SCSI_WRITE10           0x2A
+#define SCSI_SYNC_CACHE10      0x35
 
 #define SCSI_CDB6              6
 #define SCSI_CDB10             10
@@ -229,6 +243,16 @@ typedef struct
 *  improve by asking again. */
 #define ASC_NOT_READY_BECOMING 0x04
 #define ASC_NO_MEDIUM          0x3A
+
+/* The two additional sense codes a device uses to say "I do not implement that
+*  command", both under sense key ILLEGAL REQUEST. 20 is INVALID COMMAND
+*  OPERATION CODE -- the opcode itself is unknown -- and 24 is INVALID FIELD IN
+*  CDB, which is what a device that knows the opcode but not the way this file
+*  fills the block in answers. They are named because usbmsc_sync_cache() has to
+*  tell "this command does not exist here" apart from "I will not do it", and
+*  those are the same CSW status and the same sense key. */
+#define ASC_INVALID_COMMAND    0x20
+#define ASC_INVALID_CDB_FIELD  0x24
 
 /* Peripheral device type, the low five bits of INQUIRY byte 0. 0x00 is a
 *  direct access block device (every stick) and 0x0E is the reduced block
@@ -362,6 +386,19 @@ typedef struct
     *  this is why you cannot mount it" is worth a line, and a unit that simply
     *  vanished is a bug report nobody can act on. */
     int           blk_dev;
+
+    /* Set once the unit has answered SYNCHRONIZE CACHE with ILLEGAL REQUEST,
+    *  which is how a device with no write cache says the command does not apply
+    *  to it. See usbmsc_sync_cache(): after that the command is not sent again,
+    *  because the answer cannot change and each attempt is three USB transfers
+    *  at a commit point the filesystem is waiting on.
+    *
+    *  PER UNIT AND NOT PER INTERFACE, deliberately. SYNCHRONIZE CACHE is
+    *  addressed to a logical unit, and the LUNs behind one card reader are
+    *  different media: a card in slot 0 that caches and a card in slot 1 that
+    *  does not is an ordinary thing, and remembering the refusal on the
+    *  interface would silently stop flushing the one that needed it. */
+    int           no_flush;
 
     char          model[USBMSC_MODEL];
     char          text[USBMSC_TEXT];
@@ -1539,6 +1576,149 @@ static int usbmsc_rw10(usbmsc_unit *unit, uint32_t lba, uint32_t count,
     return -1;
 }
 
+/* --- SYNCHRONIZE CACHE(10) ------------------------------------------------
+*
+*  Making the writes that have already been acknowledged actually reach the
+*  flash. blockdev.h explains why anything above cares; the short form is that a
+*  stick answers a WRITE(10) when it has the bytes, not when the medium does, so
+*  without this the filesystem's careful write ordering is the order the writes
+*  were ASKED FOR and nothing more.
+*
+*  THE COMMAND BLOCK, ten bytes and every field big endian:
+*
+*      byte 0     opcode 0x35
+*      byte 1     flags. Bit 1 is IMMED and IS LEFT ZERO ON PURPOSE. With it
+*                 set the device returns status as soon as it has accepted the
+*                 command and writes back afterwards, which is precisely the
+*                 problem this command was added to solve -- a fast success
+*                 that means nothing. Zero means the status comes when the
+*                 cache is actually written out, and the round trip that costs
+*                 is the entire point.
+*      bytes 2..5 the first LBA, 0
+*      byte 6     group number, 0
+*      bytes 7..8 the number of blocks, 0
+*      byte 9     control, 0
+*
+*  A BLOCK COUNT OF ZERO MEANS "EVERYTHING", not "nothing". SBC defines it as
+*  all blocks from the starting LBA to the end of the medium, so LBA 0 with
+*  count 0 is the whole device, which is exactly the question being asked. It is
+*  the one place in this file where a zero length is not an empty request, and
+*  it is worth saying out loud next to a transport that rejects a zero length
+*  data phase -- there is no data phase here at all.
+*
+*  THE INTERESTING CASE IS A DEVICE THAT DOES NOT SUPPORT IT.
+*
+*  Such a device fails the command: CSW status 1, sense key ILLEGAL REQUEST,
+*  ASC 20 (invalid command operation code) or 24 (invalid field in CDB). That is
+*  a real answer from a healthy device and it is NOT a flush that was attempted
+*  and did not work. SBC allows a device with no write cache to reject the
+*  command, and a device with no write cache has nothing to flush -- its writes
+*  were on the medium when it acknowledged them, which is the ATA situation and
+*  the situation blockdev.h calls a legitimate 0.
+*
+*  So this returns 0 for it, and getting that wrong goes badly in both
+*  directions. Reported as a failure, every commit point on such a stick tells
+*  the filesystem the ordering did not happen -- on a device where it did, and
+*  where nothing is wrong at all. Reported as success indiscriminately, a device
+*  that genuinely refused to commit -- a medium error found while writing the
+*  cache back, a write protected card, a unit that went not-ready -- is hidden
+*  behind the same 0, and the caller goes on to write the thing whose safety
+*  depended on the flush having happened. The line between them is the sense
+*  key, which is why a refusal with NO sense data is a failure here: a device
+*  that will not say why it said no has not established that it had nothing to
+*  do.
+*
+*  THE KEY IS TESTED AND NOT THE ASC PAIR, and that is deliberate rather than
+*  loose. This command block is zeros apart from the opcode: LBA 0, count 0, no
+*  flags, no group number, no control byte. There is no field in it that a
+*  device implementing the command could find illegal. So on THIS command,
+*  ILLEGAL REQUEST cannot mean anything except "not that command here",
+*  whichever of the two codes -- or which third one -- a particular firmware
+*  chooses to put in the ASC. Testing for 20 and 24 specifically would turn a
+*  device that answers something else into a device that reports a failed
+*  commit on every write forever, which is the expensive half of the mistake.
+*
+*  THE REFUSAL IS REMEMBERED. unit->no_flush is set and the command is never
+*  sent to that unit again. It is not a cache of a value that might change: the
+*  answer is a property of the command set the device implements, and the two
+*  things that could change it -- a different medium in a card reader, a
+*  different stick in the port -- do not reach a live unit, because there is no
+*  hot plug path here and usbmsc_lost() takes the block device number away
+*  rather than reusing the unit. Without it every commit point on such a device
+*  costs three USB transfers and a REQUEST SENSE to be told the same "no" again,
+*  which on a full-speed bus is milliseconds the filesystem waits for in order
+*  to learn nothing.
+*
+*  Returns 0 when the medium is up to date -- flushed, or nothing to flush --
+*  and negative when the device was asked and refused. */
+static int usbmsc_sync_cache(usbmsc_unit *unit)
+{
+    usbmsc_iface *bus;
+    uint8_t       cdb[SCSI_CDB10];
+    int           result;
+    int           tries;
+
+    /* Asked once, answered forever. */
+    if(unit->no_flush)
+        return 0;
+
+    bus = unit->bus;
+
+    for(tries = 0; tries < USBMSC_TRIES; tries++)
+    {
+        memset(cdb, 0, sizeof(cdb));
+        cdb[0] = SCSI_SYNC_CACHE10;
+
+        /* No data phase at all: length 0, so the direction flag is irrelevant
+        *  and the CBW carries no data length. Three transfers become two plus
+        *  a status, which is why a flush is cheap on a device that supports it
+        *  and only expensive on a slow bus. */
+        result = usbmsc_command(bus, unit->lun, cdb, SCSI_CDB10, 0, 0, 0, 0);
+
+        if(result == 0)
+            return 0;
+
+        if(result < 0)
+        {
+            /* Transport failure. Recovery already ran inside the transport;
+            *  the same one retry the read and write path allows itself, and
+            *  the same reason for stopping at a device that did not survive
+            *  it. A flush that could not be delivered is a flush that did not
+            *  happen, so this ends as a failure rather than as a 0. */
+            if(!bus->live)
+                return -1;
+
+            continue;
+        }
+
+        /* The device rejected the command and there is a sense code. */
+        if(bus->sense_valid && bus->sense_key == SENSE_ILLEGAL_REQUEST)
+        {
+            /* No write cache to synchronise. See above at length: this is the
+            *  same answer as a driver with a null flush, and the sense data is
+            *  what makes it distinguishable from a refusal that matters. */
+            unit->no_flush = 1;
+            return 0;
+        }
+
+        /* UNIT ATTENTION after a reset, or a unit that is still becoming
+        *  ready. Both mean "ask again" rather than "no", exactly as on a
+        *  read. */
+        if(usbmsc_retryable(bus))
+            continue;
+
+        /* Every other refusal is a real one and the caller has to know: the
+        *  ordering it was relying on did not happen. */
+        usbmsc_error_text = usbmsc_sense_text(bus);
+        return -1;
+    }
+
+    if(usbmsc_error_text[0] == '\0')
+        usbmsc_error_text = "USB storage: the cache flush did not complete";
+
+    return -1;
+}
+
 /* --- The block device interface ------------------------------------------ */
 
 /* From a block device number back to the unit. Linear over at most four
@@ -1700,13 +1880,52 @@ static const char *usbmsc_blk_describe(int dev)
     return unit->model;
 }
 
+/* The flush, and the one refusal it does not share with read and write.
+*
+*  usbmsc_check() is not used here, because three of the five things it checks
+*  are about a transfer this call does not make -- there is no buffer, no count
+*  and no range. What is left is the two that matter to a flush: there has to be
+*  a unit behind this number, and the device behind the unit has to still be
+*  there. A device that has gone is a hard failure rather than a quiet 0: a
+*  medium that is not in the machine has not received anything, and blockdev.h
+*  makes a 0 here mean the data is on it.
+*
+*  blk_flush() has already asked usbmsc_blk_sectors() and refused a unit that
+*  answered 0, so the checks below are the second line rather than the first --
+*  the same relationship usbmsc_check() has with blk_read()'s range test, and
+*  kept for the same reason. */
+static int usbmsc_blk_flush(int dev)
+{
+    usbmsc_unit *unit;
+
+    unit = usbmsc_by_blkdev(dev);
+
+    if(unit == 0)
+    {
+        usbmsc_error_text = "USB storage: no such device";
+        return -1;
+    }
+
+    if(unit->bus == 0 || !unit->bus->live || unit->sectors == 0)
+    {
+        usbmsc_error_text = "USB storage: the device is no longer there";
+        return -1;
+    }
+
+    return usbmsc_sync_cache(unit);
+}
+
+/* Unlike the ATA entry in blockdev.c, this one has a flush and needs it: a
+*  WRITE(10) is acknowledged when the device has the data, not when the flash
+*  does. */
 static const blk_ops usbmsc_blk_ops =
 {
     usbmsc_bus_name,
     usbmsc_blk_read,
     usbmsc_blk_write,
     usbmsc_blk_sectors,
-    usbmsc_blk_describe
+    usbmsc_blk_describe,
+    usbmsc_blk_flush
 };
 
 /* --- Claiming ------------------------------------------------------------- */

@@ -44,6 +44,13 @@
 *  promise fat.h makes, that a directory read never touches the heap, and it
 *  means the filesystem works before heap_init() has ever run.
 *
+*  BEING STATIC, they are also the reason there is a lock in this file now.
+*  Two tasks in here at once share them, and one can be handed the other's
+*  sector. Against ATA that needed an unlucky preemption; against a device
+*  whose driver sleeps waiting for a transfer it is what happens every time.
+*  See the lock section below the buffers for the shape of it and for what
+*  becomes of a lock whose owner is killed while holding it.
+*
 *  That split used to be worth a few hundred microseconds of PIO per step.
 *  On a removable device it is worth twenty times that: a stick on USB 1.1
 *  moves roughly a megabyte a second, and every sector this driver asks for
@@ -83,6 +90,16 @@
 *       way a power cut leaves the file at its old extent or shorter, with
 *       at worst some unreferenced clusters. There is no journal here and
 *       there will not be one; the ordering is all the protection there is.
+*
+*  All four are statements about what is ON THE MEDIUM when the next write is
+*  issued, and until recently none of them said so, because against ATA it was
+*  free: ata_transfer() ends every write with a cache flush. A stick
+*  acknowledges a SCSI WRITE when it has the data rather than when the flash
+*  does, so on removable media the rules were the order the writes were ASKED
+*  for and nothing more. fat_sync() is what puts the guarantee back, at the
+*  four transitions the rules above actually name - see the comment
+*  above it, which also says what a flush that FAILS means and why every
+*  caller answers it by stopping short of the dangerous step.
 *
 *  Notes: No warranty expressed or implied. Use at own risk.
 */
@@ -214,6 +231,330 @@ static uint8_t  dat_buf[BLK_SECTOR_SIZE];
 static uint32_t dat_buf_lba = 0;
 static int      dat_buf_valid = 0;
 
+/* --- One task at a time ----------------------------------------------------
+*
+*  WHY THIS IS HERE NOW, when it was not before. Everything in this file works
+*  out of the two static sector caches above and the geometry statics above
+*  them, and until recently that was survivable for a reason nobody had
+*  written down: ATA NEVER YIELDS. A transfer against an IDE controller is a
+*  bounded spin inside ata.c, so two tasks could only meet in the middle of
+*  one if the timer preempted the first at exactly the wrong instruction.
+*  Possible, rare, and never seen.
+*
+*  A USB stick took that accident away. usbmsc.c waits for a transfer with
+*  sleep(), which BLOCKS the task, so the scheduler is guaranteed to elect
+*  somebody else in the middle of every single sector operation. The
+*  interleaving that used to need bad luck is now what happens every time.
+*
+*  And it is reachable from two directions at once: twenty-four call sites in
+*  syscall.c, which is ring 3, and sixteen in main.c, which is the shell. The
+*  shell listing a directory while a program reads a file is two tasks in this
+*  file, and a shared dat_buf means one of them can be handed the other's
+*  sector - dat_buf_valid says a sector is cached and dat_buf_lba says which,
+*  and neither says who put it there. That is not a slow filesystem, it is a
+*  wrong one, and on the write half it is a wrong one that writes.
+*
+*  So: one task inside the sector caches at a time.
+*
+*  WHAT IT IS. A flag and the pid that owns it, taken and given back with
+*  interrupts off. syscall.c has the closest relative on the machine - the
+*  resolver lock around sysnet_dns_take() - and this one deliberately differs
+*  from it in one place. That one takes the flag with an xchg and then records
+*  the owner in a second store, which leaves a window: a task preempted
+*  between the two holds a lock whose owner still reads as whatever the last
+*  release left, and a sweep like the one below would look at that stale pid,
+*  find it dead and break a lock that was just legitimately taken. On one CPU
+*  cli is both stronger and simpler than xchg, and it makes the flag and its
+*  owner ONE indivisible update, so the window does not exist. There is no
+*  second processor for xchg to defend against here; there is a timer.
+*
+*  WHAT IT PROTECTS. fat_buf and dat_buf and their validity flags, the
+*  geometry fat_mount() derives, fat_alloc_hint, and the read-only latch. Not
+*  fat_err - see fat_last_error() at the bottom of the read half.
+*
+*  WHO DOES NOT TAKE IT, and this is a decision rather than an oversight:
+*  fat_mounted(), fat_type(), fat_label(), fat_cluster_bytes(),
+*  fat_total_bytes(), fat_bytes_written() and fat_last_error() read statics
+*  and do arithmetic on them. They touch no cache, issue no transfer and can
+*  therefore not be interleaved into anything: the worst a preemption costs
+*  them is an answer that was true a moment ago. Making them block would put a
+*  status line behind a file copy for no gain at all. */
+
+/* Longest anybody waits to get in before being told the filesystem is busy.
+*
+*  This is a backstop and not the recovery mechanism - fat_lock_reap() below
+*  is that, and it deals with the case this bound cannot: an owner that is
+*  never going to run again. What is left for the bound is an owner that is
+*  alive but stuck, which today means a driver retrying against a device that
+*  has stopped answering, and for that the only useful behaviour is to give
+*  the waiter an error rather than a machine that appears to have died.
+*
+*  Fifteen seconds is chosen above the longest honest hold and below the point
+*  where a user concludes the machine has crashed. The longest honest hold is
+*  fat_free_bytes() on a stick: a FAT16 volume with a megabyte of FAT is two
+*  thousand bulk round trips and takes seconds, which is written down at that
+*  function and is exactly the number this has to sit above. It is the same
+*  reasoning, and coincidentally the same value, as SYS_NET_RECV_MS.
+*
+*  FAT_LOCK_POLL_MS is not a polling interval in the old sense - a release
+*  wakes the channel, so a waiter normally never reaches it. It is the bound
+*  on ONE wait, and it exists so that a waiter comes back to fat_lock_reap()
+*  at a known rate. A lock left behind by a task that died wakes nobody, so a
+*  wait with no bound at all would be a wait for a wake that is never coming;
+*  a quarter of a second is how long that case can last. */
+#define FAT_LOCK_MS       15000
+#define FAT_LOCK_POLL_MS    250
+
+/* Not volatile, and that is an argument rather than an omission. Every read
+*  of either sits inside a cli block whose inline assembly carries a "memory"
+*  clobber, and the one loop that re-reads fat_lock across a point where it
+*  can change - fat_lock_wait() - does so around a call to task_wait(), which
+*  is external and is handed &fat_lock. The compiler therefore has to assume
+*  both may have been written and reloads them. volatile would say the same
+*  thing less precisely and would force a cast at every call that takes the
+*  address as a channel. */
+static int fat_lock = 0;
+static int fat_lock_owner = -1;
+
+/* Interrupts off, and back to what the caller had. net.c, kb.c, uhci.c and
+*  syscall.c each carry a pair of these and every one of them is static to its
+*  file; there is no global one, so this file carries its own rather than
+*  inventing a cross-file interface for six lines of inline assembly.
+*
+*  pushfl before cli, so a caller that already had interrupts off gets them
+*  back off. That matters here: a system call arrives through a TRAP gate and
+*  therefore with IF set, but the shell can reach this file from anywhere. */
+static unsigned long fat_irq_save(void)
+{
+    unsigned long flags;
+
+    __asm__ __volatile__ ("pushfl; popl %0; cli" : "=r" (flags) : : "memory");
+    return flags;
+}
+
+static void fat_irq_restore(unsigned long flags)
+{
+    __asm__ __volatile__ ("pushl %0; popfl" : : "r" (flags) : "memory", "cc");
+}
+
+/* Milliseconds since a reading of timer_get_ticks(), which counts in
+*  milliseconds of uptime and wraps. The unsigned subtraction is correct
+*  across the wrap and the signed one is not, which is the same argument
+*  tasks.c makes above time_reached(). */
+static uint32_t fat_ms_since(uint32_t start)
+{
+    return (uint32_t)timer_get_ticks() - start;
+}
+
+/* Is the task that holds the lock never going to give it back?
+*
+*  EXITED counts as well as ABORTED, for the reason sysnet_reap() gives about
+*  connections: a program that returned without finishing what it started
+*  holds the lock exactly as firmly as one that faulted, and it is the more
+*  ordinary of the two. SUSPENDED does not count - a suspended task is alive,
+*  the shell suspends tasks, and taking the lock away from one would be this
+*  file manufacturing the corruption it exists to prevent.
+*
+*  A holder with no task behind it is the kernel itself: fat_mount() runs on
+*  the boot path before the shell exists, and taskmgr_get_currpid() answers -1
+*  there. That holder cannot be aborted out from under the lock, because there
+*  is no slot to abort - if it faults the machine panics - so it is never
+*  reaped. Without this test taskmgr_task_state(-1) would answer
+*  TASK_STATE_NULL and every such holder would read as dead. */
+static int fat_lock_dead(int pid)
+{
+    int state;
+
+    if (pid < 0)
+        return 0;
+
+    state = taskmgr_task_state(pid);
+
+    return (state == TASK_STATE_ABORTED
+         || state == TASK_STATE_EXITED
+         || state == TASK_STATE_NULL);
+}
+
+/* Breaks a lock whose owner is not going to give it back.
+*
+*  A task can stop running between any two instructions: a page fault aborts
+*  it, taskmgr_killall() aborts it, and neither runs another instruction of
+*  whatever function was holding this. A lock nobody can break is a filesystem
+*  nobody can use after one program faults at the wrong moment, and "reboot"
+*  is not a repair. Every acquisition sweeps first, which costs one state
+*  lookup - the same arrangement, and the same price, as sysnet_reap().
+*
+*  THE CACHES GO WITH IT, and that is what this does that the resolver's sweep
+*  does not. The DNS lock guards a state machine that dns_cancel() puts back;
+*  this one guards two sector caches, and a task that died in here may have
+*  left a MODIFIED sector in one of them. fat_patch_fat() edits fat_buf and
+*  then writes it out; dying between those two leaves a buffer that no longer
+*  describes the disk, and handing it to the next task would let that task
+*  write somebody else's abandoned edit back as though it were current. The
+*  caches are only ever caches, so dropping them costs a re-read and nothing
+*  else.
+*
+*  THE VOLUME IS NOT LATCHED READ ONLY, and it deliberately is not. A task
+*  that died in the middle of a write left the medium in one of the states the
+*  ordering above is built to leave - the file at its old extent, at worst
+*  with some unreferenced clusters. That is the crash case, reached without a
+*  crash, and it is recoverable by definition. fat_write_locked is for the one
+*  thing that is not: FAT copies known to disagree. */
+static void fat_lock_reap(void)
+{
+    unsigned long flags;
+    int broke = 0;
+
+    flags = fat_irq_save();
+    if (fat_lock != 0 && fat_lock_dead(fat_lock_owner))
+    {
+        fat_buf_valid = 0;
+        dat_buf_valid = 0;
+        fat_lock_owner = -1;
+        fat_lock = 0;
+        broke = 1;
+    }
+    fat_irq_restore(flags);
+
+    if (broke)
+        task_wake(&fat_lock);
+}
+
+/* Takes it if it is free. Returns 1 when it is now ours, 0 when somebody else
+*  has it. The flag and the owner are written under the same cli, which is the
+*  whole point - see the note on the resolver lock above. */
+static int fat_lock_grab(void)
+{
+    unsigned long flags;
+    int free_now;
+
+    flags = fat_irq_save();
+    free_now = (fat_lock == 0);
+    if (free_now)
+    {
+        fat_lock = 1;
+        fat_lock_owner = taskmgr_get_currpid();
+    }
+    fat_irq_restore(flags);
+
+    return free_now;
+}
+
+/* Gives it back and lets a waiter know. The owner is cleared with the flag
+*  rather than after it, so no instant exists at which the lock is free and
+*  still records a holder.
+*
+*  task_wake() outside the cli: it only changes task states and the scheduler
+*  does the rest at the next tick, so nothing can switch tasks underneath it.
+*  A task that grabs the lock in the gap between the restore and the wake
+*  costs the waiters one extra turn around their loop, which is exactly what
+*  the re-test in fat_lock_wait() is for. */
+static void fat_lock_release(void)
+{
+    unsigned long flags;
+
+    flags = fat_irq_save();
+    fat_lock_owner = -1;
+    fat_lock = 0;
+    fat_irq_restore(flags);
+
+    task_wake(&fat_lock);
+}
+
+/* Blocks until the lock looks free or the bound above expires.
+*
+*  This is the idiom system.h spells out above task_wait(), and none of it is
+*  optional. The condition is tested with interrupts ALREADY OFF, so nothing
+*  can change it between the test and the block - which on one CPU means no
+*  other task can run at all in that window, and a release therefore cannot
+*  slip past unnoticed. And it is tested AGAIN after every wake, so a wake
+*  that arrives while this task is marked blocked but has not yet stopped
+*  running is not lost; it costs one more turn.
+*
+*  Waiting rather than spinning is the entire reason this is not a busy loop.
+*  A spin would hold the CPU against the very task that has to finish before
+*  the lock can come back, on a scheduler that is not preemptive between
+*  equals in any useful sense, and on a USB transfer that means spinning
+*  through the whole time slice of the task that is sleeping on the transfer.
+*
+*  No task running - the boot path, before the shell exists - is a case
+*  task_wait() answers with an immediate timeout rather than a block, which
+*  here would be a spin. sleep() is the honest wait in that context, and there
+*  is nothing to contend with there anyway. */
+static void fat_lock_wait(void)
+{
+    unsigned long flags;
+
+    if (taskmgr_get_currpid() < 0)
+    {
+        sleep(FAT_LOCK_POLL_MS);
+        return;
+    }
+
+    flags = fat_irq_save();
+    while (fat_lock != 0)
+    {
+        if (!task_wait(&fat_lock, FAT_LOCK_POLL_MS))
+            break;                  /* the bound expired; go and reap */
+    }
+    fat_irq_restore(flags);
+}
+
+/* The way in. Returns 0 holding the lock, or -1 with fat_err set.
+*
+*  Every public entry point that touches a cache or the medium is a thin shell
+*  around this, its body, and fat_lock_release(). That shape is not decoration
+*  - it is the answer to RECURSION, and there was some. Two paths in this file
+*  reached from one public function into another:
+*
+*    fat_write_ready() -> fat_writable(),  used by all four write calls
+*    fat_bytes_of()    -> fat_cluster_bytes(), used by fat_total_bytes()
+*                                              and fat_free_bytes()
+*
+*  With a plain flag and no split, the first of those would have deadlocked on
+*  the first fat_create() anybody ever tried. The alternative was a recursive
+*  lock - a depth counter next to the owner - and it was rejected because it
+*  buys the right to be careless about which functions are entry points and
+*  which are internal, and that carelessness is what put the call there in the
+*  first place. The split makes it a compile time property instead: a body
+*  never calls a shell, so there is nothing to count. fat_write_ready() calls
+*  fat_writable_unlocked(); fat_bytes_of() calls fat_cluster_bytes(), which is
+*  one of the entry points that takes no lock at all and says so above.
+*
+*  EVERY WAY OUT RELEASES, which in a file with this many error returns is the
+*  other half of the argument for the split. The bodies below return -1 from
+*  thirty or so places between them and not one of them has to remember to
+*  unlock, because the shell is the only thing that ever locked. */
+static int fat_lock_acquire(void)
+{
+    uint32_t start;
+
+    fat_lock_reap();
+    if (fat_lock_grab())
+        return 0;
+
+    start = (uint32_t)timer_get_ticks();
+
+    for (;;)
+    {
+        fat_lock_wait();
+
+        fat_lock_reap();
+        if (fat_lock_grab())
+            return 0;
+
+        if (fat_ms_since(start) >= FAT_LOCK_MS)
+        {
+            /* Written without the lock, which fat_last_error() already had to
+            *  tolerate - see the note there. Degrading to an error is the
+            *  whole purpose of the bound: a lock lost despite the reaping
+            *  above must not become a machine that stops. */
+            fat_err = "the filesystem is busy";
+            return -1;
+        }
+    }
+}
+
 /* A directory in the only two shapes FAT12/16 has. is_root selects between
 *  them; the fields of the other shape are then meaningless. */
 typedef struct
@@ -329,6 +670,82 @@ static void fat_dev_err(const char *what, int with_reason)
     fat_err = fat_msg;
 }
 
+/* --- The ordering barrier --------------------------------------------------
+*
+*  Waits until everything written to this volume so far is ON THE MEDIUM, and
+*  not merely acknowledged by whatever is holding it.
+*
+*  The write half below is built on four ordering rules and every one of them
+*  is a statement about what has already landed when the next write is issued.
+*  Against ATA that held for free and nothing here said so, because nothing had
+*  to: ata_transfer() ends every write with a CACHE FLUSH command, so a return
+*  of 0 meant the sectors were out of the drive's buffer. blk_write() promises
+*  nothing of the sort and blockdev.h says so out loud - a stick acknowledges a
+*  SCSI WRITE(10) when it HAS the data, not when the flash does - and without
+*  this call the careful orderings would be the order the writes were asked for
+*  and nothing more.
+*
+*  A flush is not free and this is not called per sector. blockdev.h is blunt
+*  about the price: on a slow device each one is a round trip. It is called at
+*  the TRANSITIONS the ordering argument actually names and nowhere else -
+*  four of them, at seven places, and each place is marked with the sentence
+*  in the ordering rules that requires it:
+*
+*    rule 2  the backup FAT copies before the primary
+*              fat_put_fat_sector(), once per FAT sector write, and only on a
+*              volume that has more than one copy
+*    rule 3  the zeros - and the mark that took the cluster - before the link
+*              fat_file_cluster() growing a file,
+*              fat_dir_free_slot() growing a directory
+*    rule 4  the data and the chain before the directory entry
+*              fat_commit(), i.e. once per file operation that grows
+*    rule 4  the directory entry before the clusters are released
+*              fat_truncate() twice - the shortened entry, and the new end
+*              marker before the tail - and fat_delete() once
+*
+*  What that costs, per operation, on a two-FAT volume: a create is nothing
+*  unless the directory has to grow; an append is one per cluster allocated
+*  (its FAT write) plus one more for the link plus one for the commit; a
+*  delete or a shrink is one plus one per FAT sector the released chain
+*  touches. The last of those is the expensive one and it is expensive for a
+*  reason this file cannot fix from here: fat_free_chain() clears one entry
+*  per cluster and each clearing is its own write of the FAT sector, so a long
+*  chain pays per cluster rather than per sector. Batching those would mean a
+*  dirty flag on fat_buf and a different write path, which is a change to the
+*  ordering rather than to its cost.
+*
+*  What is deliberately NOT here is a flush at the END of an operation. That
+*  would buy durability - "the file is really there now" - and durability is
+*  not what the rules above promise; they promise that whatever survives is
+*  consistent. Adding one would cost a round trip on every call to buy a
+*  guarantee nothing in fat.h makes.
+*
+*  On a device whose writes already land - every ATA drive - blk_flush() has
+*  nothing to do and answers 0, so a hard disk pays for none of this.
+*
+*  A FLUSH THAT FAILS IS NOT NOTHING. It means the ordering the code was about
+*  to rely on did not happen, and the only question left is what the next step
+*  would have been. Every caller below answers it the same way and it is the
+*  answer the whole file already gives: the next step is always the DANGEROUS
+*  one - linking a cluster whose zeros may not be there, committing a size
+*  whose data may not be there, releasing clusters a directory entry may still
+*  claim - so it is not taken. What is left behind is the state the rules were
+*  aiming at anyway, a file at its old extent with at worst some unreferenced
+*  clusters. A leak is one fsck away; the thing not being risked here is a
+*  cross link, which is not repairable at all. Carrying on would be defensible
+*  where the next step is the safe one, and there is no such point below.
+*
+*  what is the phrase fat_dev_err() puts in front of the device name, so the
+*  message says which ordering was lost rather than only that one was. */
+static int fat_sync(const char *what)
+{
+    if (blk_flush(fat_drive) == 0)
+        return 0;
+
+    fat_dev_err(what, 1);
+    return -1;
+}
+
 /* --- Cached sector reads -------------------------------------------------- */
 
 static int fat_get_fat_sector(uint32_t lba)
@@ -371,23 +788,17 @@ static int fat_get_data_sector(uint32_t lba)
 *  somewhere the cache does not know about - which is what keeps the caches
 *  describing the disk rather than a version of it that used to be true.
 *
-*  WHAT "THE WRITE LANDED" MEANS, and it means less than it did. The ordering
-*  rules this file is built on - backups before the primary, data before the
-*  chain, the chain before the directory entry - are worth something only if
-*  an earlier write is on the medium before a later one is issued. Against
-*  ATA that was true for a reason that is not in this file at all: ata_write()
-*  ends every call with a CACHE FLUSH command, so a return of 0 meant the
-*  sectors were out of the drive's buffer.
-*
-*  blk_write() promises no such thing and has nowhere to promise it: there is
-*  no flush in blk_ops, and a USB stick acknowledges a SCSI WRITE(10) when it
-*  has the data, not when the flash has it. So on a removable device the
-*  orderings below are the order the writes are ISSUED in, and a device that
-*  reorders or buffers them can still leave a state none of the arguments
-*  here cover. That is worth writing down rather than pretending away; it is
-*  not worth changing anything for, because issuing them in the careful order
-*  is strictly better than issuing them in a careless one, and a flush this
-*  layer cannot ask for is not one it can fake. */
+*  WHAT "THE WRITE LANDED" MEANS. The ordering rules this file is built on -
+*  backups before the primary, data before the chain, the chain before the
+*  directory entry - are worth something only if an earlier write is on the
+*  medium before a later one is issued. blk_write() returning 0 does not say
+*  that: on a removable device it says the stick has the bytes, not that the
+*  flash does. fat_sync() is what turns "issued" back into "landed", and it is
+*  called at the transitions those rules name rather than after every sector.
+*  Neither of the two functions below flushes on its own account - a flush
+*  belongs to an ordering, and an ordering belongs to the caller that has one.
+*  The single exception is inside fat_put_fat_sector(), because the ordering
+*  it has to keep is between two writes it makes itself. */
 
 /* Writes the FAT sector currently held in fat_buf to every FAT copy on the
 *  volume. sec is the sector's index WITHIN a FAT, not an lba, and fat_buf
@@ -422,13 +833,45 @@ static int fat_get_data_sector(uint32_t lba)
 *
 *  Any failure also invalidates the cache: fat_buf then holds a
 *  modification that the disk does not have, and handing that back to a
-*  later read would be worse than the failed write itself. */
+*  later read would be worse than the failed write itself.
+*
+*  AND ALL OF THAT IS ABOUT ORDER, so on a device that only queues writes it
+*  needs fat_sync() to still mean anything. "The primary is the last thing to
+*  change" is a claim about the medium, not about the order two calls were
+*  made in: a stick that has both sectors in its buffer can commit them either
+*  way round, and the way round it must not choose is the one that leaves the
+*  copy every reader uses holding a change the caller was told had failed.
+*  There is one barrier for this, after all the backups and before the
+*  primary, not one between every pair - the argument only ever distinguishes
+*  the primary from the rest. A volume with a single FAT has no backup to
+*  order against and pays nothing.
+*
+*  A failed barrier here is the one place in the file where the state it
+*  leaves behind is the latched one rather than a leak. The backups were
+*  issued and cannot be un-issued, the primary will not be written, and this
+*  driver has no way to find out whether the copies now agree - which is
+*  exactly the condition fat_write_locked exists for. So it stops, for the
+*  same reason and with the same words as a copy that failed outright. */
 static int fat_put_fat_sector(uint32_t sec)
 {
     uint32_t k;
 
     for (k = fat_num_fats; k > 0; k--)
     {
+        /* Rule 2: every allocator change lands in every copy, BACKUPS FIRST,
+        *  the primary last. This is where "first" stops being a figure of
+        *  speech on a device that buffers. */
+        if (k == 1 && fat_num_fats > 1)
+        {
+            if (fat_sync("the device would not confirm the backup FAT copies"
+                         " - volume is now read only") < 0)
+            {
+                fat_buf_valid = 0;
+                fat_write_locked = 1;
+                return -1;
+            }
+        }
+
         if (blk_write(fat_drive,
                       fat_fat_lba + (k - 1) * fat_sec_per_fat + sec,
                       1, fat_buf) < 0)
@@ -1200,7 +1643,7 @@ static void fat_reset(void)
     fat_vol_label[0] = '\0';
 }
 
-int fat_mount(int drive)
+static int fat_mount_unlocked(int drive)
 {
     uint8_t bs[BLK_SECTOR_SIZE];
     uint32_t bytes_per_sec;
@@ -1393,6 +1836,34 @@ int fat_mount(int drive)
     return 0;
 }
 
+/* Mounting takes the lock like everything else that reads a sector, and it
+*  needs it more than most: fat_reset() clears the geometry every other
+*  function derives its offsets from, and a task walking a chain while those
+*  go to zero would be computing lbas from half a volume. fat_reset() clearing
+*  fat_is_mounted first is what makes the failure path safe rather than what
+*  makes the concurrency safe. */
+int fat_mount(int drive)
+{
+    int r;
+
+    if (fat_lock_acquire() < 0)
+        return -1;
+
+    r = fat_mount_unlocked(drive);
+
+    fat_lock_release();
+    return r;
+}
+
+/* --- The entry points that do not lock -------------------------------------
+*
+*  Everything from here to fat_free_bytes() reads statics and does arithmetic
+*  on them: no sector, no transfer, nothing that can block and so nothing a
+*  second task can be interleaved into. The lock section near the top of this
+*  file lists them and says why making them block would cost a status line a
+*  file copy's worth of waiting for an answer that cannot be wrong in any way
+*  a caller could act on. */
+
 int fat_mounted(void)
 {
     return fat_is_mounted;
@@ -1414,6 +1885,11 @@ const char *fat_label(void)
 
 /* --- Sizes ---------------------------------------------------------------- */
 
+/* MUST NOT take the lock, and this is the one of the unlocked entry points
+*  where that is a requirement rather than a preference: fat_bytes_of() below
+*  calls it, and fat_free_bytes() calls fat_bytes_of() while holding the lock.
+*  It is one of the two public-reaches-public paths the lock section names.
+*  A multiplication of two statics does not need one anyway. */
 uint32_t fat_cluster_bytes(void)
 {
     if (!fat_is_mounted)
@@ -1454,8 +1930,12 @@ uint32_t fat_total_bytes(void)
 *  cheaper way to count free clusters on FAT12/16 - there is no free count in
 *  the boot sector to trust, that is a FAT32 field - so this is not a bug,
 *  but a caller that wants a number on every screen refresh should know what
-*  it is asking for. */
-uint32_t fat_free_bytes(void)
+*  it is asking for.
+*
+*  It is also the longest anything holds the lock, which is why FAT_LOCK_MS is
+*  set where it is: a caller that asks for a free count while a stick is busy
+*  has to be able to wait for one that is already running. */
+static uint32_t fat_free_bytes_unlocked(void)
 {
     uint32_t c;
     uint32_t v;
@@ -1474,9 +1954,31 @@ uint32_t fat_free_bytes(void)
     return fat_bytes_of(free_clusters);
 }
 
-/* --- Public directory and file access ------------------------------------- */
+uint32_t fat_free_bytes(void)
+{
+    uint32_t r;
 
-int fat_readdir(const char *path, int index, fat_dirent *out)
+    /* Nothing to report rather than a number that was never counted. This
+    *  reads the same as an unreadable FAT, which is the existing answer for
+    *  "the count could not be made", and fat_last_error() says which. */
+    if (fat_lock_acquire() < 0)
+        return 0;
+
+    r = fat_free_bytes_unlocked();
+
+    fat_lock_release();
+    return r;
+}
+
+/* --- Public directory and file access --------------------------------------
+*
+*  From here down every entry point is a shell: take the lock, run the body,
+*  give the lock back. The bodies are what the functions used to be, unchanged
+*  apart from their names, and none of them has to release anything on the way
+*  out of its twenty-odd error returns - which is precisely why the split is
+*  the shape it is. See fat_lock_acquire(). */
+
+static int fat_readdir_unlocked(const char *path, int index, fat_dirent *out)
 {
     fat_dir d;
     int r;
@@ -1500,7 +2002,20 @@ int fat_readdir(const char *path, int index, fat_dirent *out)
     return fat_dir_nth(&d, index, out);
 }
 
-int fat_size(const char *path, uint32_t *size)
+int fat_readdir(const char *path, int index, fat_dirent *out)
+{
+    int r;
+
+    if (fat_lock_acquire() < 0)
+        return -1;
+
+    r = fat_readdir_unlocked(path, index, out);
+
+    fat_lock_release();
+    return r;
+}
+
+static int fat_size_unlocked(const char *path, uint32_t *size)
 {
     fat_dirent de;
     int is_root;
@@ -1531,7 +2046,21 @@ int fat_size(const char *path, uint32_t *size)
     return 0;
 }
 
-int fat_read(const char *path, uint32_t offset, uint32_t len, void *buf)
+int fat_size(const char *path, uint32_t *size)
+{
+    int r;
+
+    if (fat_lock_acquire() < 0)
+        return -1;
+
+    r = fat_size_unlocked(path, size);
+
+    fat_lock_release();
+    return r;
+}
+
+static int fat_read_unlocked(const char *path, uint32_t offset, uint32_t len,
+                             void *buf)
 {
     fat_dirent de;
     uint32_t cluster;
@@ -1629,6 +2158,48 @@ int fat_read(const char *path, uint32_t offset, uint32_t len, void *buf)
     return (int)done;
 }
 
+/* The whole read is one hold of the lock, from the path resolution to the
+*  last sector, and that is the point rather than a side effect: the chain
+*  walk caches a FAT sector, the copy out caches a data sector, and the two
+*  alternate. Letting go between sectors would hand the caches to somebody
+*  else and re-read both on every step - and worse, it would let another task
+*  delete the file half way through this one reading it.
+*
+*  syscall.c caps a single SYS_READ at a page for its own reasons, which
+*  happens to bound how long ring 3 can keep this held. */
+int fat_read(const char *path, uint32_t offset, uint32_t len, void *buf)
+{
+    int r;
+
+    if (fat_lock_acquire() < 0)
+        return -1;
+
+    r = fat_read_unlocked(path, offset, len, buf);
+
+    fat_lock_release();
+    return r;
+}
+
+/* Deliberately not locked, and it is the one entry point where that is a
+*  compromise rather than a free choice.
+*
+*  fat_err is a single pointer for the whole file, so a caller reads back the
+*  last message ANY task produced rather than the one its own call produced,
+*  and two tasks failing at once can hand one of them the other's reason. That
+*  was already true before there was a lock - it is what one static and two
+*  tasks means - and taking the lock here would not fix it: the overwrite
+*  happens inside the other task's own critical section, not next to it.
+*
+*  Fixing it properly needs the message to travel with the call, i.e. an out
+*  parameter or a per-task slot, and both change what fat.h promises. What is
+*  here instead is that the message is only ever wrong about WHICH failure it
+*  describes, never wrong about the volume: every string is either a constant
+*  or fat_msg, which names the device it is about.
+*
+*  Blocking here would also be wrong on its own terms. This is what a caller
+*  reaches for immediately after something failed, and making it wait behind
+*  the task that is still running is turning an error report into a second
+*  delay. */
 const char *fat_last_error(void)
 {
     return fat_err;
@@ -1667,8 +2238,15 @@ const char *fat_last_error(void)
 *  deliberately makes presence and size ONE answer: a device with no size is
 *  not a device anyone can use, and two answers that could disagree would be
 *  two chances to get it wrong. So there is no separate presence call below,
-*  and a stick that was pulled out reports zero sectors and fails here. */
-int fat_writable(void)
+*  and a stick that was pulled out reports zero sectors and fails here.
+*
+*  Split in two because it is one of the two places where a public entry point
+*  in this file reaches another one: fat_write_ready() asks this question with
+*  the lock already held, so the answer has to be reachable without taking it
+*  again. The shell below is what an outside caller gets, and the body is what
+*  fat_write_ready() calls. blk_sectors() is a cached number on both drivers,
+*  so neither version blocks on the device. */
+static int fat_writable_unlocked(void)
 {
     uint32_t sectors;
 
@@ -1693,6 +2271,23 @@ int fat_writable(void)
     return 1;
 }
 
+int fat_writable(void)
+{
+    int r;
+
+    /* Not writable is the answer a lock this call could not get has to give.
+    *  It is what fat.h asks this function for - can anything be saved - and
+    *  "no, and here is why" is a better thing to tell a user before they have
+    *  typed a filename than a yes that the next call will contradict. */
+    if (fat_lock_acquire() < 0)
+        return 0;
+
+    r = fat_writable_unlocked();
+
+    fat_lock_release();
+    return r;
+}
+
 uint32_t fat_bytes_written(void)
 {
     return fat_written;
@@ -1706,7 +2301,7 @@ static int fat_write_ready(void)
         fat_err = "no volume mounted";
         return -1;
     }
-    if (!fat_writable())
+    if (!fat_writable_unlocked())
     {
         /* Named rather than left as a bare sentence, because the most
         *  ordinary way to reach it is now that the medium is gone: on a
@@ -2202,7 +2797,21 @@ static int fat_dir_free_slot(const fat_dir *d, fat_slot *slot)
         return -1;
     /* Linked only once it holds zeros. The other order would splice a
     *  cluster of stale bytes into a directory, and stale bytes in a
-    *  directory are entries. */
+    *  directory are entries.
+    *
+    *  "Holds zeros" has to mean the medium holds them. The barrier also
+    *  carries the mark-as-used from fat_alloc_cluster() over ahead of the
+    *  link, which is the same rule one step earlier: a link that lands
+    *  without the mark leaves a cluster inside a chain that reads as free,
+    *  and the next allocation hands it to somebody else. Both writes are
+    *  before this point and one barrier orders them both.
+    *
+    *  Failing here leaves nc taken and unreferenced - a leak, reclaimed by
+    *  fsck - and the directory exactly one cluster shorter than it wanted to
+    *  be, which is the state it was in when this function was entered. */
+    if (fat_sync("the device would not confirm the new directory cluster"
+                 " before it is linked") < 0)
+        return -1;
     if (fat_set_entry(last, nc) < 0)
         return -1;
 
@@ -2289,12 +2898,38 @@ static int fat_open(const char *path, fat_file *f)
 *  the file describing the smaller of its two states.
 *
 *  The last write time is stamped here rather than at each of the callers,
-*  so that no path can modify a file and forget to age it. */
+*  so that no path can modify a file and forget to age it.
+*
+*  AND IT IS WHERE THE ORDERING BARRIER BELONGS, for the same reason it is the
+*  commit point. Rule 4 says the entry is written at the moment that makes the
+*  file describe the smaller of its two states, which is a statement about the
+*  medium: an entry that reaches the flash before the data and the chain it
+*  describes is an entry that names bytes nobody wrote. One barrier here
+*  covers everything the operation issued - every data sector fat_put() wrote,
+*  every cluster it took, every link it made - because a flush is about the
+*  device and not about a particular sector. That is the whole reason this
+*  costs one round trip per file operation rather than one per sector.
+*
+*  It sits inside this function rather than at its two callers so that a third
+*  caller cannot be added without it. Growing is the only direction that needs
+*  it; the shrinking paths commit first and then have their own barrier on the
+*  other side, before anything is released. Those therefore pay one round trip
+*  with nothing outstanding to order, which is the price of the barrier being
+*  a property of the commit point rather than a flag a caller passes - and a
+*  flag is exactly the kind of thing a later caller forgets to set.
+*
+*  Failing means not committing, which leaves the file exactly as it was plus
+*  whatever clusters the attempt took - unreferenced, reclaimable, and the
+*  failure mode this file leans towards everywhere else. */
 static int fat_commit(fat_file *f)
 {
     uint8_t *e;
     uint32_t date = 0;
     uint32_t time = 0;
+
+    if (fat_sync("the device would not confirm the data and the chain"
+                 " before the directory entry") < 0)
+        return -1;
 
     if (fat_get_data_sector(f->slot.lba) < 0)
         return -1;
@@ -2388,7 +3023,21 @@ static int fat_file_cluster(fat_file *f, uint32_t idx, int allocate,
             /* Linked last, and only once the cluster holds zeros: until
             *  this store the chain still ends at c, so a crash leaks nc
             *  rather than extending the file with whatever nc used to
-            *  contain. */
+            *  contain.
+            *
+            *  Rule 3, and the barrier is what makes "only once" true on a
+            *  device that buffers. It orders two earlier writes ahead of the
+            *  link, not one: the zeros, and fat_alloc_cluster()'s mark of nc
+            *  as an end of chain. A link that landed without the mark would
+            *  put a cluster that still reads as free inside a chain, and the
+            *  next allocation would hand it to a second file - a cross link,
+            *  which is the one outcome no repair tool can undo.
+            *
+            *  Failing leaves nc taken and referenced by nobody: a leak, and
+            *  the file at the length it already had. */
+            if (fat_sync("the device would not confirm the zeroed cluster"
+                         " before it is linked into the chain") < 0)
+                return -1;
             if (fat_set_entry(c, nc) < 0)
                 return -1;
             next = nc;
@@ -2468,9 +3117,17 @@ static uint32_t fat_put(fat_file *f, uint32_t pos, uint32_t len,
     return done;
 }
 
-/* --- The public write half ------------------------------------------------- */
+/* --- The public write half -------------------------------------------------
+*
+*  Same shape as the read half: a shell that locks, a body that does the work
+*  and returns from wherever it likes. On this side the lock is doing more
+*  than keeping the sector caches straight - it is what makes an operation
+*  atomic against the rest of the machine. Two tasks interleaving
+*  fat_alloc_cluster() would each scan the FAT, each find the same free entry
+*  and each take it, which is a cross link built without a crash and without a
+*  single bug in the ordering the file spends four rules on. */
 
-int fat_create(const char *path)
+static int fat_create_unlocked(const char *path)
 {
     fat_dir dir;
     fat_slot slot;
@@ -2527,7 +3184,35 @@ int fat_create(const char *path)
     if (fat_get_data_sector(slot.lba) < 0)
         return -1;
     memcpy(dat_buf + slot.within * DIR_ENTRY_SIZE, e, DIR_ENTRY_SIZE);
+
+    /* No barrier after this one, and that is deliberate: the entry write is
+    *  the last thing the operation does, so there is no later write whose
+    *  ordering against it could matter. If the directory had to be extended
+    *  to hold it, the link that made the new cluster reachable was already
+    *  ordered behind the zeros in fat_dir_free_slot(); the entry landing
+    *  without that link leaves nothing anybody can reach, and the link
+    *  landing without the entry leaves an empty slot. Neither is a state that
+    *  needs repairing.
+    *
+    *  What is therefore NOT promised is durability: fat_create() returning 0
+    *  means the entry was issued, not that the flash has it. That is the same
+    *  promise every write call here makes, and making it stronger would cost
+    *  a round trip on every operation to buy something no ordering rule asks
+    *  for. */
     return fat_put_data_sector();
+}
+
+int fat_create(const char *path)
+{
+    int r;
+
+    if (fat_lock_acquire() < 0)
+        return -1;
+
+    r = fat_create_unlocked(path);
+
+    fat_lock_release();
+    return r;
 }
 
 /* Writes len bytes at offset.
@@ -2550,8 +3235,8 @@ int fat_create(const char *path)
 *  A short return is not an error to hide: it is the contract, and the
 *  filesystem is consistent at every one of its values because the size
 *  committed in step 3 is computed from what step 1 and 2 reported. */
-int fat_write(const char *path, uint32_t offset, uint32_t len,
-              const void *buf)
+static int fat_write_unlocked(const char *path, uint32_t offset, uint32_t len,
+                              const void *buf)
 {
     fat_file f;
     uint32_t gap, got, wrote;
@@ -2622,6 +3307,20 @@ int fat_write(const char *path, uint32_t offset, uint32_t len,
     return (int)wrote;
 }
 
+int fat_write(const char *path, uint32_t offset, uint32_t len,
+              const void *buf)
+{
+    int r;
+
+    if (fat_lock_acquire() < 0)
+        return -1;
+
+    r = fat_write_unlocked(path, offset, len, buf);
+
+    fat_lock_release();
+    return r;
+}
+
 /* Sets the file's length.
 *
 *  The two directions commit in opposite orders, for the same reason:
@@ -2637,7 +3336,7 @@ int fat_write(const char *path, uint32_t offset, uint32_t len,
 *
 *  In both directions the state a crash can leave is the file at its old
 *  extent or at its new smaller one, never something in between. */
-int fat_truncate(const char *path, uint32_t size)
+static int fat_truncate_unlocked(const char *path, uint32_t size)
 {
     fat_file f;
     uint32_t cluster_bytes;
@@ -2688,6 +3387,20 @@ int fat_truncate(const char *path, uint32_t size)
     if (old_first == 0)
         return 0;                   /* nothing was allocated to begin with */
 
+    /* Rule 4 in the shrinking direction: the entry goes FIRST, and "first"
+    *  has to mean on the medium. Releasing a cluster the entry may still
+    *  claim is how the next allocation hands it to a second file while this
+    *  one still reads through it - a cross link, from the one order this
+    *  function exists to avoid. Placed after the early return above, so a
+    *  truncate that releases nothing pays nothing.
+    *
+    *  Failing means releasing nothing at all: the file is short, its chain is
+    *  as long as it ever was, and every cluster past the new end is
+    *  unreferenced. That is a leak and it is the intended one. */
+    if (fat_sync("the device would not confirm the shortened directory entry"
+                 " before the clusters are released") < 0)
+        return -1;
+
     if (keep == 0)
         return fat_free_chain(old_first);
 
@@ -2715,7 +3428,30 @@ int fat_truncate(const char *path, uint32_t size)
     if (fat_set_entry(last, fat_eoc()) < 0)
         return -1;
 
+    /* The other half of the same sentence, and the one the comment above
+    *  already insists on: the new end marker BEFORE the tail is released. If
+    *  the frees land and the marker does not, the kept part of the chain runs
+    *  on into clusters that read as free, and the next allocation splices one
+    *  of them into another file. Failing here leaves the whole tail
+    *  allocated, which is a leak and nothing worse. */
+    if (fat_sync("the device would not confirm the new end-of-chain marker"
+                 " before the tail is released") < 0)
+        return -1;
+
     return fat_free_chain(tail);
+}
+
+int fat_truncate(const char *path, uint32_t size)
+{
+    int r;
+
+    if (fat_lock_acquire() < 0)
+        return -1;
+
+    r = fat_truncate_unlocked(path, size);
+
+    fat_lock_release();
+    return r;
 }
 
 /* Removes a file.
@@ -2736,7 +3472,7 @@ int fat_truncate(const char *path, uint32_t size)
 *  Only the first byte of the entry changes. The rest, including the first
 *  cluster, stays exactly as it was: that is what FAT has always done, and
 *  it is what makes an undelete possible at all. */
-int fat_delete(const char *path)
+static int fat_delete_unlocked(const char *path)
 {
     fat_dir dir;
     fat_slot slot;
@@ -2783,5 +3519,33 @@ int fat_delete(const char *path)
     if (first == 0)
         return 0;                   /* an empty file owns no clusters */
 
+    /* The deletion mark has to be on the medium before a cluster is given
+    *  back. The comment above spells out why the other order is the one that
+    *  destroys a second file, and on a device that buffers, "first" is only
+    *  true if somebody asks.
+    *
+    *  Failing means the chain is not released: the entry says the file is
+    *  gone, its clusters stay allocated, and fsck calls them unreferenced and
+    *  offers to reclaim them. The caller is told the delete failed, which is
+    *  the honest answer - this cannot tell whether the mark landed, and a
+    *  caller that retries gets "no such file or directory" and loses
+    *  nothing. */
+    if (fat_sync("the device would not confirm the deleted directory entry"
+                 " before the clusters are released") < 0)
+        return -1;
+
     return fat_free_chain(first);
+}
+
+int fat_delete(const char *path)
+{
+    int r;
+
+    if (fat_lock_acquire() < 0)
+        return -1;
+
+    r = fat_delete_unlocked(path);
+
+    fat_lock_release();
+    return r;
 }

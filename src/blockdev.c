@@ -73,14 +73,32 @@ static uint32_t blk_write_total;
 *  ata_model() returns "" rather than null - so no adapter functions are
 *  needed. The wrapping lives here rather than in ata.c on purpose: ata.c is a
 *  driver for a disk controller and has no reason to know that anything sits
-*  above it. */
+*  above it.
+*
+*  THE FLUSH IS NULL, AND THAT IS THE ANSWER RATHER THAN A GAP. blockdev.h says
+*  a null flush is what a driver whose write() already reaches the medium looks
+*  like, and ata.c is that driver: the tail of ata_transfer() - the block guarded
+*  by "if(writing)" that issues ATA_CMD_CACHE_FLUSH (0xE7) and then waits for it
+*  through ata_wait_done() - runs after EVERY successful write, not once per
+*  session and not on a timer. So by the time ata_write() has returned 0 the
+*  sectors are out of the drive's write cache; a separate flush would be a
+*  second 0xE7 with nothing left to write back.
+*
+*  This was checked rather than assumed, because the whole point of the flush
+*  member is that an assumption like this one fails silently: if that block
+*  were ever removed from ata.c, or made conditional, nothing here would say so
+*  and the filesystem's write ordering on ATA would quietly stop holding. An
+*  adapter calling ata_transfer() with a zero count to reach the flush is not
+*  possible either - ata_transfer() returns before it, at "if(count == 0)".
+*  Anyone editing that tail should come back here. */
 static const blk_ops blk_ata_ops =
 {
     "ATA",
     ata_read,
     ata_write,
     ata_sectors,
-    ata_model
+    ata_model,
+    0                   /* flush: see above - ata.c flushes per write        */
 };
 
 static const char blk_empty[] = "";
@@ -173,7 +191,13 @@ int blk_register(int dev, const blk_ops *ops)
     /* A half filled ops struct would pass registration and then crash on the
     *  first call, in a driver whose author has long stopped looking. Every
     *  entry point below is called unconditionally by this file, so every one
-    *  of them is required here. */
+    *  of them is required here.
+    *
+    *  flush is the one exception and is deliberately absent from this list:
+    *  blockdev.h says it MAY be null, blk_flush() tests it before every call,
+    *  and a null one is a real answer - "my writes already land" - rather than
+    *  a driver that forgot to fill a field in. Requiring it would force every
+    *  such driver to carry a function that returns 0. */
     if(ops == 0 || ops->name == 0 || ops->read == 0 || ops->write == 0 ||
        ops->sectors == 0 || ops->describe == 0)
     {
@@ -232,6 +256,7 @@ void blk_unregister(int dev)
     blk_slots[dev].ops.write    = 0;
     blk_slots[dev].ops.sectors  = 0;
     blk_slots[dev].ops.describe = 0;
+    blk_slots[dev].ops.flush    = 0;
 }
 
 /* Called once at boot, after ata_init(). All four ATA numbers are claimed,
@@ -406,6 +431,96 @@ int blk_write(int dev, uint32_t lba, uint32_t count, const void *buf)
     /* The const is cast away to reach one shared body and put back before the
     *  driver is called. Nothing between here and there writes through it. */
     return blk_transfer(dev, lba, count, (void *)buf, 1);
+}
+
+/* Making what was written actually reach the medium.
+*
+*  WHY IT IS NOT PART OF blk_transfer(). It shares the refusals and the
+*  generation check and nothing else: there is no buffer to test, no count to
+*  reject, no range to compare against the size of the medium, and nothing moved
+*  to add to a counter afterwards. Threading a third mode through a function
+*  whose whole body is checks that do not apply would cost more in reading than
+*  the twenty lines it saves.
+*
+*  A NULL flush ANSWERS 0. blockdev.h explains why at length and the short form
+*  is that "I flushed it" and "there was nothing to flush because my writes
+*  already land" are indistinguishable to a caller: both mean the data is on the
+*  medium, which is the only thing the caller wanted to know. Returning an error
+*  for the second would have the filesystem report a failed commit on every
+*  write to an ATA disk, which is the one device where the guarantee has always
+*  held.
+*
+*  A NEGATIVE ANSWER IS LOAD BEARING and is not just a message. It means the
+*  device was asked and would not, so the write ordering the caller was relying
+*  on did not happen and whatever it was about to write next must not be written
+*  yet. That is why a device that has gone away is refused here rather than
+*  quietly answered 0: nothing reached a medium that is not in the machine any
+*  more, and saying otherwise would be the exact lie this call exists to
+*  prevent.
+*
+*  The byte counters are left alone. A flush moves no sectors, and counting it
+*  as bytes written would inflate a number the shell prints as throughput. */
+int blk_flush(int dev)
+{
+    blk_slot *s;
+    uint32_t  gen;
+    int       r;
+    int     (*fn)(int);
+
+    if(!blk_valid_dev(dev) || !blk_slots[dev].used)
+    {
+        blk_err_begin(dev);
+        blk_err_str("no such device");
+        return -1;
+    }
+
+    s = &blk_slots[dev];
+
+    /* The size doubles as the presence test, exactly as in blk_transfer(). A
+    *  removable device that has already been unregistered by its own driver -
+    *  a stick pulled while a file was open - answers 0 and is refused before a
+    *  driver is entered at all. */
+    if(s->ops.sectors(dev) == 0)
+    {
+        blk_err_begin(dev);
+        blk_err_str("device is not there");
+        return -1;
+    }
+
+    /* Copied out before the call, for the same reason blk_transfer() copies its
+    *  function pointers: the call below can block for as long as a device takes
+    *  to write its cache back, and another task may unregister the device in
+    *  that window. */
+    fn  = s->ops.flush;
+    gen = s->gen;
+
+    if(fn == 0)
+    {
+        return 0;
+    }
+
+    r = fn(dev);
+
+    /* Did the device survive it? A generation mismatch means the number now
+    *  belongs to something else, and a flush that succeeded against the device
+    *  that used to be here says nothing about the one that is. */
+    if(!s->used || s->gen != gen)
+    {
+        blk_err_begin(dev);
+        blk_err_str("device was removed during the flush");
+        return -1;
+    }
+
+    if(r < 0)
+    {
+        blk_err_begin(dev);
+        blk_err_str("flush failed (");
+        blk_err_str(s->ops.name);
+        blk_err_str(")");
+        return -1;
+    }
+
+    return 0;
 }
 
 /* --- What is there --------------------------------------------------------- */
