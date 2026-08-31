@@ -676,7 +676,7 @@ endef
 #  Targets
 # ===========================================================================
 .PHONY: all user run iso run-iso floppy run-floppy disk bootdisk run-bootdisk \
-        debug usb usb-install clean help
+        debug usb clean help
 
 all: $(KERNEL) user
 
@@ -1187,36 +1187,6 @@ debug: $(KERNEL) user $(DISK)
 # --- write the ISO to a USB stick ------------------------------------------
 # Usage: make usb DEV=/dev/sdX
 # There is deliberately no default device and no way to skip the prompt.
-# Installs onto a stick that already has a FAT filesystem, keeping it: GRUB
-# into the boot sector and the boot directory, the kernel and the programs into
-# the filesystem as files. The other half of the pair below, which overwrites
-# the device instead.
-#
-# The programs travel as Multiboot MODULES rather than as files the kernel
-# reads, and that is not a convenience -- it is the only thing that works. The
-# ATA driver speaks to IDE and SATA controllers, a USB stick is neither, and
-# the mass storage driver reaches the bus through UHCI, which no machine built
-# in the last fifteen years still has. GRUB reads the stick through the BIOS
-# and hands the programs over in RAM. See the header of the script.
-#
-# The logic lives in tools/usb-install.sh because most of it is refusals -- a
-# partition instead of a disk, a device that is not removable, one that is
-# mounted, a partition table GRUB's i386-pc target cannot use -- and each one
-# is worth a sentence saying what it is protecting against. That reads as a
-# script and does not read as a Makefile recipe.
-usb-install: $(KERNEL) $(USER_ELFS) $(STAGING_STAMP)
-	@if [ -z "$(DEV)" ]; then \
-		printf '\nERROR: no target device given.\n'; \
-		printf '       Usage:  make usb-install DEV=/dev/sdX\n'; \
-		printf '       Pass the DISK, not a partition. Find it with:\n'; \
-		printf '         lsblk -o NAME,SIZE,FSTYPE,LABEL,TRAN,MODEL\n\n'; \
-		exit 1; \
-	fi
-	@sh tools/usb-install.sh $(DEV) $(BUILD_DIR) $(STAGING_DIR) $(USER_PROGS)
-
-# Overwrites the whole device with the ISO. The shortest way to a bootable
-# stick, and it destroys everything on it -- use usb-install above for a stick
-# whose filesystem should survive.
 usb: $(ISO)
 	@if [ -z "$(DEV)" ]; then \
 		printf '\nERROR: no target device given.\n'; \
@@ -1272,8 +1242,7 @@ help:
 	@echo "              Boot that image in QEMU as a hard disk. No -kernel,"
 	@echo "              no -initrd, no GRUB: the BIOS starts stage 1."
 	@echo "  debug       Start QEMU halted with a GDB stub on :1234"
-	@echo "  usb-install install onto a FAT stick, keeping it: make usb-install DEV=/dev/sdX"
-	@echo "  usb         dd the ISO over a stick, destroying it: make usb DEV=/dev/sdX"
+	@echo "  usb         dd the ISO onto a USB stick: make usb DEV=/dev/sdX"
 	@echo "  clean       Remove $(BUILD_DIR)/"
 	@echo "  help        This text"
 	@echo ""

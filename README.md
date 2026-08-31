@@ -149,8 +149,7 @@ make run QEMU_KEYMAP=en-us
 | `make floppy` | Place the kernel into a copy of the GRUB Legacy floppy image (see note) |
 | `make run-floppy` | Boot that floppy image in QEMU (see note) |
 | `make debug` | Start QEMU halted with a GDB stub on port 1234 |
-| `make usb-install DEV=/dev/sdX` | Install onto a FAT stick, keeping its filesystem (asks first) |
-| `make usb DEV=/dev/sdX` | Write the ISO over a stick, destroying its contents (asks first) |
+| `make usb DEV=/dev/sdX` | Write the ISO to a USB stick (asks first) |
 | `make clean` | Remove `build/` |
 | `make help` | This list |
 
