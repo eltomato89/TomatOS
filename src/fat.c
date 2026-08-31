@@ -1,6 +1,6 @@
 /* TomatOS - v0.1 pre Alpha
 *  By:   Jens Köhler (eltomato@googlemail.com)
-*  Desc: FAT12/FAT16 filesystem, reading and writing.
+*  Desc: FAT12/FAT16/FAT32 filesystem, reading and writing.
 *
 *  Sits on blk_read() and blk_write(), and on nothing more specific than
 *  that. It used to call ata_read() and ata_write() by name, which was honest
@@ -21,21 +21,36 @@
 *  derivations of where the FAT begins is the bug that eats a volume, and
 *  the second one is always the one nobody tested.
 *
-*  Three things in FAT are traps, and each has a comment of its own further
+*  A FAT32 volume adds two more to that list and neither is an exception to
+*  it: the first cluster of the root directory, which is where a directory
+*  walk starts instead of at a fixed sector, and the sector holding FSInfo.
+*  Both come out of the same BPB read at the same moment as the other four.
+*
+*  Four things in FAT are traps, and each has a comment of its own further
 *  down, so only the summary here:
 *
-*    - The FAT type is NOT the "FAT12"/"FAT16" string in the boot sector.
-*      That field is documentation, it is frequently wrong, and Microsoft's
-*      own specification says not to look at it. The type follows from the
-*      count of data clusters and from nothing else. See fat_mount().
+*    - The FAT type is NOT the "FAT12"/"FAT16"/"FAT32" string in the boot
+*      sector. That field is documentation, it is frequently wrong - several
+*      formatters stamp "FAT32" into volumes that are nothing of the sort -
+*      and Microsoft's own specification says not to look at it. The type
+*      follows from the count of data clusters and from nothing else. One
+*      calculation answers both boundaries, 4085 and 65525. See fat_mount().
 *
 *    - The root directory of FAT12/16 is a fixed run of sectors right behind
 *      the FATs. It is not a cluster chain and it has no cluster number, so
-*      every directory walk here has two shapes. Subdirectories are ordinary
-*      chains. See struct fat_dir.
+*      a directory walk on those two has two shapes. On FAT32 it is an
+*      ordinary chain starting at BPB_RootClus, which REMOVES the second
+*      shape rather than adding a third. See struct fat_dir and
+*      fat_dir_root().
 *
 *    - A FAT12 entry is twelve bits and straddles byte boundaries. See
 *      fat_next_cluster().
+*
+*    - A FAT32 entry is thirty-two bits of which only the low TWENTY-EIGHT
+*      are the cluster number. The top four belong to whoever wrote the
+*      volume and must come back unchanged, so every write to one is a
+*      read-modify-write. See fat_set_entry(), where the mask that does it
+*      is the only difference from FAT16.
 *
 *  No allocation. Two static 512 byte buffers do all the work: one caches a
 *  FAT sector, one caches a data or directory sector. They are separate on
@@ -126,6 +141,34 @@
 #define BS_BootSig       38     /* 0x29 -> volume id, label and type follow */
 #define BS_VolLab        43     /* 11 bytes, space padded                   */
 
+/* The FAT32 half of the BPB. Everything from offset 36 on is a DIFFERENT
+*  structure on a FAT32 volume than on a FAT12/16 one - the extended boot
+*  record simply starts later, because the four fields below were pushed in
+*  front of it. So BS_BootSig and BS_VolLab move too, and reading the
+*  FAT12/16 pair on a FAT32 volume lands in the middle of BPB_RootClus. */
+#define BPB_FATSz32      36
+#define BPB_ExtFlags     40
+#define BPB_FSVer        42
+#define BPB_RootClus     44
+#define BPB_FSInfo       48
+#define BS32_BootSig     66
+#define BS32_VolLab      71
+
+/* FSInfo, byte offsets into its own sector. The two signatures are what
+*  make it worth reading at all: a sector that does not carry both of them
+*  is not FSInfo, whatever BPB_FSInfo said, and the free count in it is then
+*  somebody else's bytes rather than a number. */
+#define FSI_LeadSig       0     /* 0x41615252, "RRaA"                       */
+#define FSI_StrucSig    484     /* 0x61417272, "rrAa"                       */
+#define FSI_Free_Count  488     /* 0xFFFFFFFF -> not known                  */
+#define FSI_Nxt_Free    492     /* 0xFFFFFFFF -> no hint                    */
+#define FSI_TrailSig    508     /* 0xAA550000                               */
+
+#define FSI_LEAD_SIG    0x41615252UL
+#define FSI_STRUC_SIG   0x61417272UL
+#define FSI_TRAIL_SIG   0xAA550000UL
+#define FSI_UNKNOWN     0xFFFFFFFFUL
+
 #define BOOT_SIG_OFF     510    /* 0x55 0xAA                                */
 
 /* Directory entry, byte offsets into a 32 byte entry. Everything from
@@ -138,7 +181,7 @@
 #define DIR_CrtTime      14
 #define DIR_CrtDate      16
 #define DIR_LstAccDate   18
-#define DIR_FstClusHI    20     /* FAT32 only; zero on FAT12/16             */
+#define DIR_FstClusHI    20     /* FAT32 only; must be zero on FAT12/16     */
 #define DIR_WrtTime      22
 #define DIR_WrtDate      24
 #define DIR_FstClusLO    26
@@ -165,26 +208,46 @@
 
 /* The two cluster counts that separate the three FAT flavours. They are
 *  exact and they are not negotiable: a volume with 4084 data clusters is
-*  FAT12, one with 4085 is FAT16, and reading either with the other's entry
-*  width produces garbage rather than an error. */
+*  FAT12, one with 4085 is FAT16, one with 65524 is still FAT16 and one with
+*  65525 is FAT32, and reading any of them with another's entry width
+*  produces garbage rather than an error.
+*
+*  The second boundary is the entire reason FAT32 is in this file. 65524
+*  clusters is where FAT16 stops, which at the largest cluster size anybody
+*  formats with is 2 GB - so every stick above that is FAT32 whatever the
+*  label on it says, and a driver without this could only read media this
+*  kernel had formatted itself. */
 #define FAT12_MAX_CLUSTERS  4085
 #define FAT16_MAX_CLUSTERS  65525
+
+/* The part of a FAT32 entry that is a cluster number. The other four bits
+*  are reserved, they are not ours, and the two places that touch them are
+*  fat_entry(), which masks them away on the way in, and fat_set_entry(),
+*  which leaves them alone on the way out. Everything in between works on 28
+*  bit numbers and cannot get this wrong because it never sees the bits.
+*
+*  Overwriting them is the classic FAT32 bug precisely because nothing
+*  complains: the volume mounts, files read back, fsck passes, and a volume
+*  another driver wrote has had four bits per entry silently zeroed. */
+#define FAT32_MASK  0x0FFFFFFFUL
 
 /* --- Mounted volume ------------------------------------------------------- */
 
 static int      fat_is_mounted = 0;
 static int      fat_drive = 0;          /* block device number, not an ATA   */
                                         /* drive - see blockdev.h            */
-static int      fat_bits = 0;           /* 12 or 16                          */
+static int      fat_bits = 0;           /* 12, 16 or 32                      */
 
 static uint32_t fat_spc = 0;            /* sectors per cluster               */
-static uint32_t fat_num_fats = 0;
+static uint32_t fat_num_fats = 0;       /* copies the LAYOUT has room for    */
 static uint32_t fat_sec_per_fat = 0;
-static uint32_t fat_root_entries = 0;
+static uint32_t fat_root_entries = 0;   /* zero on FAT32                     */
 
-static uint32_t fat_fat_lba = 0;        /* first sector of the first FAT     */
+static uint32_t fat_fat_lba = 0;        /* first sector of the ACTIVE FAT    */
+static uint32_t fat_fat_copies = 0;     /* copies that are actually mirrored */
 static uint32_t fat_root_lba = 0;       /* first sector of the root area     */
 static uint32_t fat_root_sectors = 0;   /* length of the root area           */
+static uint32_t fat_root_cluster = 0;   /* FAT32: the root chain starts here */
 static uint32_t fat_data_lba = 0;       /* sector of cluster 2               */
 static uint32_t fat_clusters = 0;       /* number of DATA clusters           */
 static uint32_t fat_total_sectors = 0;  /* what the BPB claims the volume is */
@@ -198,6 +261,42 @@ static const char *fat_err = "";
 *  without it every allocation of a multi cluster file rescans the FAT from
 *  cluster 2, which turns writing one file into a quadratic walk. */
 static uint32_t fat_alloc_hint = 2;
+
+/* --- The free cluster count ------------------------------------------------
+*
+*  How many clusters read as free, once somebody has been made to find out.
+*
+*  Counting them means reading the WHOLE FAT, which the comment above
+*  fat_count_free() calls the most expensive thing in this file: on a stick a
+*  FAT16 volume with a megabyte of FAT is two thousand bulk round trips, and a
+*  FAT32 stick has more FAT than that. So the number is counted once and then
+*  KEPT, and every allocation and every release adjusts it by one. Those are
+*  the only two operations in the file that change how many clusters are free,
+*  and both of them already hold the old value of the entry they are about to
+*  write, so the bookkeeping costs nothing at all.
+*
+*  fat_free_known is what separates "zero clusters are free" from "nobody has
+*  counted". It goes back to zero whenever a FAT write failed in a way that
+*  leaves this driver unable to say whether the entry changed - the next
+*  question then pays for a fresh scan, which is the honest price of not
+*  knowing.
+*
+*  On FAT32 the first value can come from FSInfo instead of from a scan, which
+*  is the whole reason FSInfo is read - see fat_fsinfo_load(). The mechanism
+*  itself is the same on all three formats deliberately: a counter that only
+*  ran on the format nobody boots is a counter whose errors are found by
+*  somebody else. */
+static uint32_t fat_free_count = 0;
+static int      fat_free_known = 0;
+
+/* FSInfo, on the volumes that have one. Sector 0 is never FSInfo - that is
+*  the boot sector - so zero doubles as "this volume has none", the same way
+*  the valid flags on the sector caches avoid an impossible lba. */
+static uint32_t fat_fsinfo_lba = 0;
+
+/* Set when the count or the hint has moved since FSInfo was last written, so
+*  that a run of operations that allocate nothing writes nothing. */
+static int      fat_fsinfo_dirty = 0;
 
 /* Bytes handed to blk_write() since the volume was mounted. This counts
 *  METADATA too - the FAT copies and the directory entry are writes to the
@@ -274,7 +373,7 @@ static int      dat_buf_valid = 0;
 *
 *  WHO DOES NOT TAKE IT, and this is a decision rather than an oversight:
 *  fat_mounted(), fat_type(), fat_label(), fat_cluster_bytes(),
-*  fat_total_bytes(), fat_bytes_written() and fat_last_error() read statics
+*  fat_total_kib(), fat_bytes_written() and fat_last_error() read statics
 *  and do arithmetic on them. They touch no cache, issue no transfer and can
 *  therefore not be interleaved into anything: the worst a preemption costs
 *  them is an answer that was true a moment ago. Making them block would put a
@@ -291,10 +390,13 @@ static int      dat_buf_valid = 0;
 *
 *  Fifteen seconds is chosen above the longest honest hold and below the point
 *  where a user concludes the machine has crashed. The longest honest hold is
-*  fat_free_bytes() on a stick: a FAT16 volume with a megabyte of FAT is two
-*  thousand bulk round trips and takes seconds, which is written down at that
-*  function and is exactly the number this has to sit above. It is the same
-*  reasoning, and coincidentally the same value, as SYS_NET_RECV_MS.
+*  fat_free_kib() on a stick, on the one call that has to count: a FAT16
+*  volume with a megabyte of FAT is two thousand bulk round trips and takes
+*  seconds, which is written down at fat_count_free() and is exactly the
+*  number this has to sit above. A FAT32 stick has more FAT than that, and the
+*  cached count and FSInfo are what keep it from being paid twice rather than
+*  a reason to raise this. It is the same reasoning, and coincidentally the
+*  same value, as SYS_NET_RECV_MS.
 *
 *  FAT_LOCK_POLL_MS is not a polling interval in the old sense - a release
 *  wakes the channel, so a waiter normally never reaches it. It is the bound
@@ -511,6 +613,12 @@ static void fat_lock_wait(void)
 *    fat_bytes_of()    -> fat_cluster_bytes(), used by fat_total_bytes()
 *                                              and fat_free_bytes()
 *
+*  The second of those is gone as of the move to kibibytes: fat_kib_of() works
+*  in SECTORS and reaches fat_spc directly, because a cluster count in bytes
+*  is the thing that stopped fitting in 32 bits. The rule it was an instance
+*  of has not gone anywhere, and the one remaining instance is why the split
+*  is still the shape below.
+*
 *  With a plain flag and no split, the first of those would have deadlocked on
 *  the first fat_create() anybody ever tried. The alternative was a recursive
 *  lock - a depth counter next to the owner - and it was rejected because it
@@ -518,8 +626,9 @@ static void fat_lock_wait(void)
 *  which are internal, and that carelessness is what put the call there in the
 *  first place. The split makes it a compile time property instead: a body
 *  never calls a shell, so there is nothing to count. fat_write_ready() calls
-*  fat_writable_unlocked(); fat_bytes_of() calls fat_cluster_bytes(), which is
-*  one of the entry points that takes no lock at all and says so above.
+*  fat_writable_unlocked(), and the second path stopped existing rather than
+*  being fixed - which is the better outcome of the two and not one this
+*  arrangement can be relied on to produce.
 *
 *  EVERY WAY OUT RELEASES, which in a file with this many error returns is the
 *  other half of the argument for the split. The bodies below return -1 from
@@ -555,13 +664,59 @@ static int fat_lock_acquire(void)
     }
 }
 
-/* A directory in the only two shapes FAT12/16 has. is_root selects between
-*  them; the fields of the other shape are then meaningless. */
+/* A directory in the only two shapes a FAT volume has. is_root selects
+*  between them; the fields of the other shape are then meaningless.
+*
+*  is_root means THE FIXED ROOT AREA and not "this is the root directory",
+*  and the distinction is what keeps FAT32 from needing a third shape. On
+*  FAT12/16 the root is a fixed run of sectors with no cluster number, so it
+*  is the first shape and everything else is the second. On FAT32 the root is
+*  a chain like any other directory, so it is the SECOND shape - is_root is 0
+*  and cluster holds BPB_RootClus - and the first shape never occurs at all.
+*  Nothing below therefore had to learn about FAT32: the two places that build
+*  one of these went through fat_dir_root() and fat_dir_at(), and every walk,
+*  lookup and slot search downstream was already written for a chain. */
 typedef struct
 {
     int      is_root;       /* 1: fixed root area, 0: cluster chain          */
-    uint32_t cluster;       /* first cluster, subdirectories only            */
+    uint32_t cluster;       /* first cluster, chains only                    */
 } fat_dir;
+
+/* The root directory, in whichever shape this volume has it. Every path
+*  resolution starts here, so this is the one place that has to know that
+*  FAT32 put the root into the data area. */
+static void fat_dir_root(fat_dir *d)
+{
+    if (fat_bits == 32)
+    {
+        d->is_root = 0;
+        d->cluster = fat_root_cluster;
+    }
+    else
+    {
+        d->is_root = 1;
+        d->cluster = 0;
+    }
+}
+
+/* The directory a directory ENTRY names.
+*
+*  Cluster 0 is FAT's way of saying "the root", and it is not a corner case:
+*  the ".." entry of every first level subdirectory carries it, on FAT32 as
+*  much as on FAT12/16, because the specification says ".." points at 0 when
+*  the parent is the root even though the root there has a perfectly good
+*  cluster number of its own. So the mapping is needed on all three formats
+*  and it is needed in exactly one place. */
+static void fat_dir_at(fat_dir *d, uint32_t cluster)
+{
+    if (cluster == 0)
+    {
+        fat_dir_root(d);
+        return;
+    }
+    d->is_root = 0;
+    d->cluster = cluster;
+}
 
 /* --- Little endian field access ------------------------------------------- */
 
@@ -714,6 +869,13 @@ static void fat_dev_err(const char *what, int with_reason)
 *  dirty flag on fat_buf and a different write path, which is a change to the
 *  ordering rather than to its cost.
 *
+*  FSInfo is not on that list and is not an omission from it. It carries a
+*  cached free count and an allocation hint, both of which every driver -
+*  including this one - is required to re-derive rather than believe, so no
+*  ordering can be lost by it landing early, late or not at all. See
+*  fat_fsinfo_store(), which is the only write in this file with no barrier
+*  anywhere near it and says why.
+*
 *  What is deliberately NOT here is a flush at the END of an operation. That
 *  would buy durability - "the file is really there now" - and durability is
 *  not what the rules above promise; they promise that whatever survives is
@@ -800,10 +962,10 @@ static int fat_get_data_sector(uint32_t lba)
 *  The single exception is inside fat_put_fat_sector(), because the ordering
 *  it has to keep is between two writes it makes itself. */
 
-/* Writes the FAT sector currently held in fat_buf to every FAT copy on the
-*  volume. sec is the sector's index WITHIN a FAT, not an lba, and fat_buf
-*  must be holding that sector of the first copy - which it is, because
-*  fat_byte() only ever loads it from there.
+/* Writes the FAT sector currently held in fat_buf to every FAT copy that is
+*  mirrored on the volume. sec is the sector's index WITHIN a FAT, not an lba,
+*  and fat_buf must be holding that sector of the ACTIVE copy - which it is,
+*  because fat_byte() only ever loads it from there.
 *
 *  A FAT16 volume normally carries two copies, and BPB_NumFATs says so; the
 *  count is read rather than assumed, because a volume with one copy or with
@@ -811,6 +973,15 @@ static int fat_get_data_sector(uint32_t lba)
 *  change has to land in all of them: copies that disagree are what makes
 *  Linux and Windows offer to REPAIR the volume, which is how a user finds
 *  out something went wrong - afterwards.
+*
+*  fat_fat_copies rather than fat_num_fats, and on FAT12/16 they are always
+*  the same number. FAT32 alone can turn mirroring OFF in BPB_ExtFlags, and
+*  then exactly one copy is live and the others hold whatever they held when
+*  it was switched off. Writing all of them there would not corrupt anything
+*  this driver reads, but it would overwrite copies another driver is entitled
+*  to treat as stale history, and fat_mount() has already pointed fat_fat_lba
+*  at the live one - so the loop below is over one copy and the barrier costs
+*  nothing. See fat_mount().
 *
 *  The copies are written from the last one down to the first, so the
 *  primary is the last thing to change. Nothing here is atomic and nothing
@@ -856,12 +1027,12 @@ static int fat_put_fat_sector(uint32_t sec)
 {
     uint32_t k;
 
-    for (k = fat_num_fats; k > 0; k--)
+    for (k = fat_fat_copies; k > 0; k--)
     {
         /* Rule 2: every allocator change lands in every copy, BACKUPS FIRST,
         *  the primary last. This is where "first" stops being a figure of
         *  speech on a device that buffers. */
-        if (k == 1 && fat_num_fats > 1)
+        if (k == 1 && fat_fat_copies > 1)
         {
             if (fat_sync("the device would not confirm the backup FAT copies"
                          " - volume is now read only") < 0)
@@ -881,7 +1052,7 @@ static int fat_put_fat_sector(uint32_t sec)
             /* Copies after this one were already written, so the volume no
             *  longer has a consistent set. Nothing else may be written to
             *  it until it is mounted again. */
-            if (k < fat_num_fats)
+            if (k < fat_fat_copies)
             {
                 fat_write_locked = 1;
                 fat_dev_err("FAT copies left inconsistent"
@@ -957,7 +1128,16 @@ static int fat_byte(uint32_t off, uint8_t *out)
 
 /* Raw value of FAT entry n.
 *
-*  FAT16 is a plain array of 16 bit words. FAT12 is the interesting one: the
+*  FAT16 is a plain array of 16 bit words and FAT32 one of 32 bit ones, of
+*  which ONLY THE LOW 28 BITS are the cluster number. The top four are
+*  reserved, they belong to whatever wrote the volume, and they are masked off
+*  here rather than compared against - an entry with them set is an ordinary
+*  entry and not a broken one. Everything downstream, the end of chain test
+*  included, therefore sees a 28 bit number and never has to remember to mask
+*  again. fat_set_entry() is the other half of that promise: it puts the four
+*  bits back exactly as it found them.
+*
+*  FAT12 is the interesting one: the
 *  entries are packed three nibbles each, so entry n starts at byte offset
 *
 *      n + n/2                 (i.e. 1.5 bytes per entry, rounded down)
@@ -979,8 +1159,30 @@ static int fat_byte(uint32_t off, uint8_t *out)
 *  handles that; nothing here has to care. */
 static int fat_entry(uint32_t n, uint32_t *out)
 {
-    uint8_t b0, b1;
+    uint8_t b0, b1, b2, b3;
     uint32_t off, v;
+
+    if (fat_bits == 32)
+    {
+        off = n * 4;
+
+        if (fat_byte(off, &b0) < 0)
+            return -1;
+        if (fat_byte(off + 1, &b1) < 0)
+            return -1;
+        if (fat_byte(off + 2, &b2) < 0)
+            return -1;
+        if (fat_byte(off + 3, &b3) < 0)
+            return -1;
+
+        v = (uint32_t)b0
+          | ((uint32_t)b1 << 8)
+          | ((uint32_t)b2 << 16)
+          | ((uint32_t)b3 << 24);
+
+        *out = v & FAT32_MASK;
+        return 0;
+    }
 
     if (fat_bits == 12)
         off = n + (n / 2);
@@ -1007,10 +1209,18 @@ static int fat_entry(uint32_t n, uint32_t *out)
 }
 
 /* End of chain marker. Everything at or above this is a terminator; the one
-*  value below it, 0xFF7 / 0xFFF7, marks a bad cluster and is not a valid
-*  link either, which the range check in fat_next_cluster() catches. */
+*  value below it, 0xFF7 / 0xFFF7 / 0x0FFFFFF7, marks a bad cluster and is not
+*  a valid link either, which the range check in fat_next_cluster() catches.
+*
+*  The FAT32 value is a 28 bit one and the comparison it is used in is a
+*  comparison of 28 bit numbers, because fat_entry() has already masked the
+*  reserved bits off. Testing an unmasked entry against 0x0FFFFFF8 is the way
+*  this goes wrong: an ordinary link with a reserved bit set reads as a number
+*  above every terminator, and the file ends where it does not. */
 static uint32_t fat_eoc_min(void)
 {
+    if (fat_bits == 32)
+        return 0x0FFFFFF8UL;
     return (fat_bits == 12) ? 0x0FF8UL : 0xFFF8UL;
 }
 
@@ -1024,11 +1234,18 @@ static uint32_t fat_eoc_min(void)
 *  into cluster 4095, i.e. into whatever else lives there. Hence one
 *  function rather than one constant.
 *
-*  The value just below the terminators, 0x0FF7 / 0xFFF7, marks a bad
-*  cluster. The allocator never hands one out because it only ever takes an
-*  entry that reads as 0, and a bad cluster is not 0. */
+*  On FAT32 it is 0x0FFFFFFF, twenty-eight bits of ones and not thirty-two:
+*  the four above them are not this driver's to set any more than they are
+*  its to clear, and fat_set_entry() masks them out of every value it is
+*  given - a terminator included.
+*
+*  The value just below the terminators, 0x0FF7 / 0xFFF7 / 0x0FFFFFF7, marks
+*  a bad cluster. The allocator never hands one out because it only ever takes
+*  an entry that reads as 0, and a bad cluster is not 0. */
 static uint32_t fat_eoc(void)
 {
+    if (fat_bits == 32)
+        return FAT32_MASK;
     return (fat_bits == 12) ? 0x0FFFUL : 0xFFFFUL;
 }
 
@@ -1039,66 +1256,79 @@ static int fat_cluster_valid(uint32_t c)
 
 /* --- Writing the FAT -------------------------------------------------------
 *
-*  Read-modify-write of the one or two bytes a FAT entry occupies, in every
-*  copy of the FAT. off is the byte offset of the FIRST of the two bytes
-*  from the start of a FAT; m0/m1 select which bits of each byte belong to
-*  the entry, and only those are replaced.
+*  Read-modify-write of the two or four bytes a FAT entry occupies, in every
+*  mirrored copy of the FAT. off is the byte offset of the FIRST of them from
+*  the start of a FAT; m[i] selects which bits of byte i belong to the entry,
+*  and only those are replaced. n is 2 or 4.
 *
-*  The masks are the whole point. On FAT16 both are 0xFF and the function is
-*  a two byte store. On FAT12 one of the two bytes is SHARED with the
-*  neighbouring entry - three nibbles per entry means every second entry
-*  splits a byte with the one before or after it - and the neighbour's
-*  nibble has to come through untouched. Getting that wrong does not produce
-*  a visibly broken filesystem: it silently rewrites the length of some
-*  other file's chain.
+*  THE MASKS ARE THE WHOLE POINT, and they are the point twice over now.
 *
-*  And the two bytes need not be in the same sector. Offset off may be the
-*  last byte of one sector with off+1 the first byte of the next, which
-*  happens for every entry whose offset is 511 modulo 512 - on a FAT12
-*  volume that is entry 340, 682, 1024 and so on. Reading across that seam
-*  is free (fat_byte() goes through the cache one byte at a time); writing
-*  across it is a read-modify-write of two different sectors, in both FAT
-*  copies, and that case is spelled out below rather than left to fall out
-*  of anything. */
-static int fat_patch_fat(uint32_t off, uint8_t v0, uint8_t m0,
-                         uint8_t v1, uint8_t m1)
+*  On FAT16 both are 0xFF and the function is a two byte store. On FAT12 one
+*  of the two bytes is SHARED with the neighbouring entry - three nibbles per
+*  entry means every second entry splits a byte with the one before or after
+*  it - and the neighbour's nibble has to come through untouched. Getting that
+*  wrong does not produce a visibly broken filesystem: it silently rewrites
+*  the length of some other file's chain.
+*
+*  On FAT32 nothing is shared with a neighbour, but the top four bits of the
+*  fourth byte are RESERVED and belong to whatever last wrote the volume. The
+*  mask for that byte is 0x0F, and it is the same mechanism doing the same job
+*  one bit-field over: bits this driver did not put there come back as they
+*  were. That failure is quieter still than the FAT12 one - the volume mounts,
+*  files read, fsck passes - and it is the standard way a FAT32 driver
+*  corrupts a volume it did not create.
+*
+*  And the bytes need not be in the same sector. Offset off may be the last
+*  byte of one sector with off+1 the first byte of the next, which happens for
+*  every FAT12 entry whose offset is 511 modulo 512 - entry 340, 682, 1024 and
+*  so on. Reading across that seam is free (fat_byte() goes through the cache
+*  one byte at a time); writing across it is a read-modify-write of two
+*  different sectors, in every FAT copy, and the loop below spells that case
+*  out rather than leaving it to fall out of anything.
+*
+*  A FAT32 entry never splits, because four bytes at a four byte aligned
+*  offset cannot straddle a 512 byte boundary. The loop handles it anyway,
+*  because a loop that handles the general case has no untested branch in it
+*  - and because the sentence above is a property of the arithmetic in
+*  fat_set_entry(), not of this function. */
+static int fat_patch_fat(uint32_t off, const uint8_t *v, const uint8_t *m,
+                         uint32_t n)
 {
-    uint32_t sec0 = off / BLK_SECTOR_SIZE;
-    uint32_t sec1 = (off + 1) / BLK_SECTOR_SIZE;
-    uint32_t i0 = off % BLK_SECTOR_SIZE;
-    uint32_t i1 = (off + 1) % BLK_SECTOR_SIZE;
+    uint32_t i = 0;
+    uint32_t j;
+    uint32_t sec;
+    uint32_t idx;
 
-    if (sec1 >= fat_sec_per_fat)
+    if ((off + n - 1) / BLK_SECTOR_SIZE >= fat_sec_per_fat)
     {
         fat_err = "FAT entry outside the FAT";
         return -1;
     }
 
-    if (fat_get_fat_sector(fat_fat_lba + sec0) < 0)
-        return -1;
-    fat_buf[i0] = (uint8_t)((fat_buf[i0] & (uint8_t)~m0) | (uint8_t)(v0 & m0));
-
-    /* The common case: both bytes in one sector, one round of writes. */
-    if (sec1 == sec0)
-        fat_buf[i1] = (uint8_t)((fat_buf[i1] & (uint8_t)~m1)
-                                | (uint8_t)(v1 & m1));
-
-    if (fat_put_fat_sector(sec0) < 0)
-        return -1;
-
-    /* The split case. Two sectors, so two rounds, and the entry is only
-    *  fully written once the second one has landed. A power cut in between
-    *  leaves half an entry - unavoidable without a journal, and the reason
-    *  the allocation order elsewhere in this file is arranged so that the
-    *  half written entry is the one nobody is following yet. */
-    if (sec1 != sec0)
+    /* One round of writes per sector the entry touches, which is one in
+    *  every case but the FAT12 split. The entry is only fully written once
+    *  the last round has landed; a power cut in between leaves half an entry
+    *  - unavoidable without a journal, and the reason the allocation order
+    *  elsewhere in this file is arranged so that the half written entry is
+    *  the one nobody is following yet. */
+    while (i < n)
     {
-        if (fat_get_fat_sector(fat_fat_lba + sec1) < 0)
+        sec = (off + i) / BLK_SECTOR_SIZE;
+
+        if (fat_get_fat_sector(fat_fat_lba + sec) < 0)
             return -1;
-        fat_buf[i1] = (uint8_t)((fat_buf[i1] & (uint8_t)~m1)
-                                | (uint8_t)(v1 & m1));
-        if (fat_put_fat_sector(sec1) < 0)
+
+        for (j = i; j < n && (off + j) / BLK_SECTOR_SIZE == sec; j++)
+        {
+            idx = (off + j) % BLK_SECTOR_SIZE;
+            fat_buf[idx] = (uint8_t)((fat_buf[idx] & (uint8_t)~m[j])
+                                     | (uint8_t)(v[j] & m[j]));
+        }
+
+        if (fat_put_fat_sector(sec) < 0)
             return -1;
+
+        i = j;
     }
 
     return 0;
@@ -1115,20 +1345,56 @@ static int fat_patch_fat(uint32_t off, uint8_t v0, uint8_t m0,
 *  so an even entry owns all of b0 and the LOW nibble of b1, and an odd one
 *  owns the HIGH nibble of b0 and all of b1. Those are the masks below.
 *
+*  AND THE SAME ARGUMENT MAKES THE FAT32 CASE. A 32 bit entry owns all of
+*  bytes 0, 1 and 2 and only the LOW NIBBLE of byte 3, because the four bits
+*  above it are reserved. They are not free space, they are not zero on a
+*  volume somebody else formatted, and they are not this driver's to touch:
+*  the mask 0x0F on the last byte is what carries them through a write
+*  unchanged, and it is the ONE place in this file where that happens. There
+*  is no second path to a FAT entry - fat_patch_fat() is private to this
+*  function and to nothing else - so this mask is the whole of the guarantee.
+*
+*  The value is masked as well as the byte. A caller that passed something
+*  with the top bits set - fat_eoc() would, if it were written as thirty-two
+*  ones - must not be able to smuggle them in through v; and v & FAT32_MASK
+*  makes the two halves of the rule agree instead of relying on every caller
+*  to have got it right.
+*
 *  Entries 0 and 1 are not clusters. Entry 0 holds the media descriptor and
-*  entry 1 the dirty flags, and a driver that writes a chain link into
-*  either has just told every other operating system that the volume needs
-*  checking. Neither is ever a legal cluster number, so refusing them here
-*  costs nothing and closes the case for good. */
+*  entry 1 the dirty flags - on FAT32 that is where the clean shutdown and
+*  hard error bits live - and a driver that writes a chain link into either
+*  has just told every other operating system that the volume needs checking.
+*  Neither is ever a legal cluster number, so refusing them here costs nothing
+*  and closes the case for good. */
 static int fat_set_entry(uint32_t n, uint32_t v)
 {
     uint32_t off;
-    uint8_t v0, m0, v1, m1;
+    uint8_t val[4];
+    uint8_t msk[4];
 
     if (!fat_cluster_valid(n))
     {
         fat_err = "refusing to write a FAT entry that is not a cluster";
         return -1;
+    }
+
+    if (fat_bits == 32)
+    {
+        off = n * 4;
+        v &= FAT32_MASK;
+
+        val[0] = (uint8_t)(v & 0xFF);
+        msk[0] = 0xFF;
+        val[1] = (uint8_t)((v >> 8) & 0xFF);
+        msk[1] = 0xFF;
+        val[2] = (uint8_t)((v >> 16) & 0xFF);
+        msk[2] = 0xFF;
+        /* The reserved four bits live in the top half of this byte, and
+        *  0x0F is what leaves them exactly as they were found. */
+        val[3] = (uint8_t)((v >> 24) & 0x0F);
+        msk[3] = 0x0F;
+
+        return fat_patch_fat(off, val, msk, 4);
     }
 
     if (fat_bits == 12)
@@ -1137,29 +1403,29 @@ static int fat_set_entry(uint32_t n, uint32_t v)
 
         if (n & 1)
         {
-            v0 = (uint8_t)((v << 4) & 0xF0);
-            m0 = 0xF0;
-            v1 = (uint8_t)((v >> 4) & 0xFF);
-            m1 = 0xFF;
+            val[0] = (uint8_t)((v << 4) & 0xF0);
+            msk[0] = 0xF0;
+            val[1] = (uint8_t)((v >> 4) & 0xFF);
+            msk[1] = 0xFF;
         }
         else
         {
-            v0 = (uint8_t)(v & 0xFF);
-            m0 = 0xFF;
-            v1 = (uint8_t)((v >> 8) & 0x0F);
-            m1 = 0x0F;
+            val[0] = (uint8_t)(v & 0xFF);
+            msk[0] = 0xFF;
+            val[1] = (uint8_t)((v >> 8) & 0x0F);
+            msk[1] = 0x0F;
         }
     }
     else
     {
         off = n * 2;
-        v0 = (uint8_t)(v & 0xFF);
-        m0 = 0xFF;
-        v1 = (uint8_t)((v >> 8) & 0xFF);
-        m1 = 0xFF;
+        val[0] = (uint8_t)(v & 0xFF);
+        msk[0] = 0xFF;
+        val[1] = (uint8_t)((v >> 8) & 0xFF);
+        msk[1] = 0xFF;
     }
 
-    return fat_patch_fat(off, v0, m0, v1, m1);
+    return fat_patch_fat(off, val, msk, 2);
 }
 
 static uint32_t fat_cluster_lba(uint32_t c)
@@ -1307,11 +1573,30 @@ static int fat_entry_usable(const uint8_t *e)
     return 1;
 }
 
+/* The first cluster out of a directory entry.
+*
+*  A cluster number is split across two fields sixteen bits apart, and only
+*  FAT32 uses the upper one. On FAT12/16 DIR_FstClusHI is reserved: the
+*  specification says it is zero, and a driver that reads it anyway is a
+*  driver that follows a stray value some other tool left there into a
+*  cluster the volume does not have. So it is read on FAT32 and ignored
+*  everywhere else, which is a decision about which field to trust rather
+*  than an optimisation. */
+static uint32_t fat_first_cluster(const uint8_t *e)
+{
+    uint32_t c = rd16(e, DIR_FstClusLO);
+
+    if (fat_bits == 32)
+        c |= rd16(e, DIR_FstClusHI) << 16;
+
+    return c;
+}
+
 static void fat_fill_dirent(const uint8_t *e, fat_dirent *out)
 {
     fat_name_of(e + DIR_Name, out->name);
     out->is_dir = (e[DIR_Attr] & ATTR_DIRECTORY) ? 1 : 0;
-    out->first_cluster = rd16(e, DIR_FstClusLO);
+    out->first_cluster = fat_first_cluster(e);
     out->size = out->is_dir ? 0 : rd32(e, DIR_FileSize);
 }
 
@@ -1326,6 +1611,10 @@ static void fat_fill_dirent(const uint8_t *e, fat_dirent *out)
 *  fat_root_lba, with room for exactly fat_root_entries entries and no way
 *  to grow. A subdirectory is a file like any other: a cluster chain, walked
 *  with fat_walk(), and it ends when the chain ends.
+*
+*  A FAT32 volume only ever reaches the second branch, root directory
+*  included, which is why adding FAT32 did not add a case here. Neither
+*  branch changed at all.
 *
 *  Split out of fat_dir_entry() so that the write half can name a directory
 *  slot without a second copy of this arithmetic. */
@@ -1531,8 +1820,7 @@ static int fat_resolve(const char *path, fat_dirent *out, int *is_root)
     const char *p = path;
     int r;
 
-    dir.is_root = 1;
-    dir.cluster = 0;
+    fat_dir_root(&dir);
     *is_root = 1;
 
     if (path == 0)
@@ -1562,17 +1850,8 @@ static int fat_resolve(const char *path, fat_dirent *out, int *is_root)
                 return -1;
             }
             /* ".." in a first level subdirectory carries cluster 0, which
-            *  is FAT's way of saying "the root" - it has no cluster. */
-            if (out->first_cluster == 0)
-            {
-                dir.is_root = 1;
-                dir.cluster = 0;
-            }
-            else
-            {
-                dir.is_root = 0;
-                dir.cluster = out->first_cluster;
-            }
+            *  is FAT's way of saying "the root" - see fat_dir_at(). */
+            fat_dir_at(&dir, out->first_cluster);
         }
 
         r = fat_dir_lookup(&dir, comp, out);
@@ -1599,8 +1878,7 @@ static int fat_dir_of(const char *path, fat_dir *d)
 
     if (is_root)
     {
-        d->is_root = 1;
-        d->cluster = 0;
+        fat_dir_root(d);
         return 0;
     }
     if (!de.is_dir)
@@ -1608,14 +1886,7 @@ static int fat_dir_of(const char *path, fat_dir *d)
         fat_err = "not a directory";
         return -1;
     }
-    if (de.first_cluster == 0)
-    {
-        d->is_root = 1;
-        d->cluster = 0;
-        return 0;
-    }
-    d->is_root = 0;
-    d->cluster = de.first_cluster;
+    fat_dir_at(d, de.first_cluster);
     return 0;
 }
 
@@ -1630,17 +1901,157 @@ static void fat_reset(void)
     fat_sec_per_fat = 0;
     fat_root_entries = 0;
     fat_fat_lba = 0;
+    fat_fat_copies = 0;
     fat_root_lba = 0;
     fat_root_sectors = 0;
+    fat_root_cluster = 0;
     fat_data_lba = 0;
     fat_clusters = 0;
     fat_total_sectors = 0;
     fat_buf_valid = 0;
     dat_buf_valid = 0;
     fat_alloc_hint = 2;
+    fat_free_count = 0;
+    fat_free_known = 0;
+    fat_fsinfo_lba = 0;
+    fat_fsinfo_dirty = 0;
     fat_written = 0;
     fat_write_locked = 0;
     fat_vol_label[0] = '\0';
+}
+
+/* --- FSInfo ----------------------------------------------------------------
+*
+*  A FAT32 volume carries a sector - sector 1 in practice, but BPB_FSInfo says
+*  which - holding a cached count of free clusters and a hint at where the
+*  next free one is. Reading it is worth a great deal and believing it is not,
+*  and those two sentences are the whole design.
+*
+*  WHY IT IS WORTH READING. Counting free clusters means reading the entire
+*  FAT, which on a stick is the most expensive operation in this file by a
+*  wide margin - thousands of bulk round trips for a number a shell wants to
+*  print in a status line. FSInfo is one sector for the same answer.
+*
+*  WHY IT IS NOT BELIEVED. Nothing keeps it right. It is written by whatever
+*  last had the volume mounted, it is not updated on every change even by the
+*  drivers that maintain it, and a power cut leaves whatever was there. A
+*  driver that trusted a free-cluster HINT as a statement about which clusters
+*  are free would hand out one that is in use, and that is a cross link - the
+*  one outcome nothing can repair.
+*
+*  SO HERE IS WHAT EACH FIELD IS ALLOWED TO DO.
+*
+*    FSI_Nxt_Free becomes fat_alloc_hint and nothing else. That variable
+*    already documents itself as never trusted: the allocator reads every
+*    entry it considers and only takes one that reads as 0, so a hint that is
+*    wrong costs a slower search and cannot cost anything else. It is range
+*    checked here anyway, because a hint outside the volume would make the
+*    first scan wrap.
+*
+*    FSI_Free_Count becomes the initial value of fat_free_count, which is only
+*    ever REPORTED - by fat_free_kib(), to a caller that wants to draw a bar.
+*    The allocator never consults it. So the worst a wrong count can do is
+*    misstate free space, and the worst that can do is make a write fail with
+*    "no free clusters left" that a user thought would fit.
+*
+*  AND IT IS VALIDATED, three ways before any of that: both signatures and the
+*  trailing one have to be exactly right, the count has to be 0xFFFFFFFF or no
+*  larger than the number of data clusters on the volume, and the hint has to
+*  be a cluster this volume has. Anything else and the sector is treated as
+*  though it were not there - the count stays unknown, and the first call that
+*  wants one pays for a scan. The scan is the fallback for every one of those
+*  paths and it never goes away.
+*
+*  Returns nothing: a volume without a usable FSInfo is an ordinary volume,
+*  not a failed mount. */
+static void fat_fsinfo_load(uint32_t sec, uint32_t reserved)
+{
+    uint32_t count;
+    uint32_t next;
+
+    if (sec == 0 || sec == 0xFFFFUL)
+        return;                     /* the BPB says there is none */
+
+    /* Inside the reserved area, or it is not a sector this volume set aside
+    *  for the purpose and something else owns those bytes. Compared against
+    *  the reserved count rather than against fat_fat_lba, which does not mean
+    *  the same thing on a volume with mirroring switched off. */
+    if (sec >= reserved)
+        return;
+
+    if (fat_get_data_sector(sec) < 0)
+    {
+        /* Not a mount failure. The volume is readable, this one sector was
+        *  not, and the count simply stays unknown. */
+        fat_err = "";
+        return;
+    }
+
+    if (rd32(dat_buf, FSI_LeadSig) != FSI_LEAD_SIG
+     || rd32(dat_buf, FSI_StrucSig) != FSI_STRUC_SIG
+     || rd32(dat_buf, FSI_TrailSig) != FSI_TRAIL_SIG)
+        return;
+
+    fat_fsinfo_lba = sec;
+
+    count = rd32(dat_buf, FSI_Free_Count);
+    if (count != FSI_UNKNOWN && count <= fat_clusters)
+    {
+        fat_free_count = count;
+        fat_free_known = 1;
+    }
+
+    next = rd32(dat_buf, FSI_Nxt_Free);
+    if (next != FSI_UNKNOWN && fat_cluster_valid(next))
+        fat_alloc_hint = next;
+}
+
+/* Writes the count and the hint back, if this volume has somewhere to put
+*  them and either has moved.
+*
+*  DELIBERATELY OUTSIDE THE ORDERING RULES. Every fat_sync() in this file
+*  guards a transition where one write landing without another can cross-link
+*  two files or leave a size describing bytes nobody wrote. Nothing here can:
+*  FSInfo is a hint by definition, this driver re-derives both numbers from
+*  the FAT the moment they look wrong, and every other driver is required to
+*  treat them the same way. So there is no barrier before it and none after,
+*  and it is written after the commit point rather than before - which means
+*  that on a device that buffers it may reach the medium first. That is
+*  allowed for the same reason: the field it lands in is one nobody may act
+*  on without checking.
+*
+*  What a crash leaves is therefore a stale number, and a stale number is
+*  exactly the case the validation in fat_fsinfo_load() exists for - and a
+*  crash mid-operation has left leaked clusters too, so the volume was going
+*  to be handed to fsck either way.
+*
+*  A FAILED WRITE IS NOT REPORTED, and that is the one thing here that needs
+*  arguing. The caller is a shell that has just run a real operation and has
+*  its own result and its own error message; failing a successful delete
+*  because a hint could not be cached would be reporting a problem that did
+*  not happen, and overwriting fat_err would replace the reason a real failure
+*  failed with the reason a cache update did. So the message is saved and put
+*  back, and the dirty flag stays set so the next operation tries again. */
+static void fat_fsinfo_store(void)
+{
+    const char *saved;
+
+    if (fat_fsinfo_lba == 0 || !fat_fsinfo_dirty)
+        return;
+
+    saved = fat_err;
+
+    if (fat_get_data_sector(fat_fsinfo_lba) == 0)
+    {
+        wr32(dat_buf, FSI_Free_Count,
+             fat_free_known ? fat_free_count : FSI_UNKNOWN);
+        wr32(dat_buf, FSI_Nxt_Free, fat_alloc_hint);
+
+        if (fat_put_data_sector() == 0)
+            fat_fsinfo_dirty = 0;
+    }
+
+    fat_err = saved;
 }
 
 static int fat_mount_unlocked(int drive)
@@ -1652,6 +2063,9 @@ static int fat_mount_unlocked(int drive)
     uint32_t root_bytes;
     uint32_t meta_sectors;
     uint32_t data_sectors;
+    uint32_t ext_flags;
+    uint32_t active;
+    uint32_t lab_off;
     uint32_t i;
     int last;
 
@@ -1717,20 +2131,28 @@ static int fat_mount_unlocked(int drive)
     }
 
     fat_root_entries = rd16(bs, BPB_RootEntCnt);
-    fat_sec_per_fat = rd16(bs, BPB_FATSz16);
 
-    /* A zero BPB_FATSz16 means the size lives in BPB_FATSz32, which only
-    *  FAT32 has - and FAT32 is out of scope here, so this is a rejection
-    *  rather than a second place to look. */
+    /* THE 16 BIT FIELDS ARE ZERO ON FAT32 AND THE 32 BIT ONES CARRY THE
+    *  VALUE, for both of the two fields that exist twice. This is where a
+    *  FAT32 volume gets mistaken for a broken FAT16 one: read BPB_FATSz16,
+    *  find zero, and conclude the FAT has no size.
+    *
+    *  Neither field is chosen by the format - the format has not been
+    *  decided yet at this point and cannot be, because deciding it needs the
+    *  cluster count and the cluster count needs these numbers. The rule is
+    *  the one the specification actually states: the 16 bit field is used
+    *  when it is non-zero, and when it is zero the 32 bit one is the truth.
+    *  It reads the same for both fields and it does not need to know the
+    *  format, which is what makes it correct in this order. */
+    fat_sec_per_fat = rd16(bs, BPB_FATSz16);
+    if (fat_sec_per_fat == 0)
+        fat_sec_per_fat = rd32(bs, BPB_FATSz32);
     if (fat_sec_per_fat == 0)
     {
-        fat_err = "FAT size is zero - looks like FAT32, unsupported";
+        fat_err = "FAT size is zero - not a FAT volume";
         return -1;
     }
 
-    /* Total sectors sits in one of two fields. The 16 bit one is used when
-    *  it fits; when it does not, it is zero and the 32 bit one carries the
-    *  value. A volume that has neither is not usable. */
     total_sectors = rd16(bs, BPB_TotSec16);
     if (total_sectors == 0)
         total_sectors = rd32(bs, BPB_TotSec32);
@@ -1747,11 +2169,17 @@ static int fat_mount_unlocked(int drive)
     /* Layout. Root directory entries are 32 bytes each and the area is
     *  rounded up to whole sectors; on FAT12/16 it always divides evenly in
     *  practice, but the rounding costs nothing and a malformed BPB should
-    *  not shift the data area by half a sector. */
+    *  not shift the data area by half a sector.
+    *
+    *  BPB_RootEntCnt is zero on FAT32, so the area is zero sectors long and
+    *  the data area starts directly behind the FATs. That falls out of the
+    *  same arithmetic rather than needing a branch, which is the reason this
+    *  runs before the type is known and can. */
     root_bytes = fat_root_entries * DIR_ENTRY_SIZE;
     fat_root_sectors = (root_bytes + BLK_SECTOR_SIZE - 1) / BLK_SECTOR_SIZE;
 
     fat_fat_lba = reserved;
+    fat_fat_copies = fat_num_fats;
     fat_root_lba = reserved + fat_num_fats * fat_sec_per_fat;
     fat_data_lba = fat_root_lba + fat_root_sectors;
 
@@ -1764,21 +2192,30 @@ static int fat_mount_unlocked(int drive)
 
     /* --- The one calculation that decides the FAT type -------------------
     *
-    *  Not the "FAT12"/"FAT16" string at offset 54. That field is advisory,
-    *  is wrong on plenty of real media, and Microsoft's own specification
-    *  says explicitly that it must not be used to determine the type. The
-    *  type is a function of the number of data clusters and of nothing
-    *  else:
+    *  Not the "FAT12"/"FAT16"/"FAT32" string at offset 54 or at offset 82.
+    *  Those fields are advisory, they are wrong on plenty of real media -
+    *  several formatters stamp "FAT32   " into anything they make - and
+    *  Microsoft's own specification says explicitly that they must not be
+    *  used to determine the type. The type is a function of the number of
+    *  data clusters and of nothing else:
     *
     *      data sectors  = total - reserved - FATs - root directory
     *      data clusters = data sectors / sectors per cluster
     *
     *      < 4085   -> FAT12
     *      < 65525  -> FAT16
-    *      otherwise   FAT32, which this driver does not implement
+    *      otherwise   FAT32
     *
     *  The division truncates, and that is correct: a trailing partial
-    *  cluster is not addressable and is not counted. */
+    *  cluster is not addressable and is not counted.
+    *
+    *  THE THIRD BRANCH IS THE SAME CALCULATION AS THE OTHER TWO. Adding
+    *  FAT32 added one comparison against one more constant and did not
+    *  change a line of the arithmetic above it, which is the argument for
+    *  having written it this way in the first place: the boundary at 65525
+    *  is where FAT16 runs out of entries, exactly as 4085 is where FAT12
+    *  does, and both are properties of the entry width rather than of
+    *  anything a formatter writes down. */
     data_sectors = total_sectors - meta_sectors;
     fat_clusters = data_sectors / fat_spc;
 
@@ -1792,10 +2229,104 @@ static int fat_mount_unlocked(int drive)
     else if (fat_clusters < FAT16_MAX_CLUSTERS)
         fat_bits = 16;
     else
+        fat_bits = 32;
+
+    /* A BPB THAT CONTRADICTS ITSELF, in either direction.
+    *
+    *  The cluster count decides the type and nothing else does, which leaves
+    *  the question of what to do with a volume whose FIELDS were laid out for
+    *  one type while its cluster count says another. BPB_FATSz16 is the field
+    *  that gives it away, because it is the one that is zero on FAT32 and
+    *  never zero on FAT12/16.
+    *
+    *  Both directions are refused rather than resolved, and the case is not
+    *  hypothetical: mformat will happily produce a volume with a FAT32 BPB
+    *  and 65273 clusters if it is told to, and fsck.vfat warns about exactly
+    *  that one. Reading it as the cluster count says would give a volume with
+    *  no root directory at all - BPB_RootEntCnt is zero, so the fixed root
+    *  area is zero sectors long and every listing comes back empty - and
+    *  reading it as the fields say would mean letting a formatter's choice
+    *  override the one calculation this file insists is the answer.
+    *
+    *  So neither. A volume this driver cannot read the same way twice is one
+    *  it says no to, with a message that names what is wrong rather than
+    *  leaving somebody to wonder why their files vanished. */
+    if ((fat_bits == 32) != (rd16(bs, BPB_FATSz16) == 0))
     {
         fat_bits = 0;
-        fat_err = "too many clusters - this is FAT32, unsupported";
+        fat_err = "boot sector layout and cluster count disagree on the type";
         return -1;
+    }
+
+    /* --- What only a FAT32 volume has ------------------------------------
+    *
+    *  Everything below is read AFTER the type is known, and every one of
+    *  these fields would be some other structure's bytes on a FAT12/16
+    *  volume: offset 36 onwards is the extended boot record there, so
+    *  BPB_RootClus would land in the middle of a volume serial number. */
+    if (fat_bits == 32)
+    {
+        /* A version this driver has never seen. The field is defined so
+        *  that a future layout can be refused rather than misread, and
+        *  refusing is the only thing to do with it: the fields below may
+        *  mean something else entirely in a version that does not exist
+        *  yet. */
+        if (rd16(bs, BPB_FSVer) != 0)
+        {
+            fat_bits = 0;
+            fat_err = "FAT32 version is not 0 - unsupported";
+            return -1;
+        }
+
+        /* The specification requires both of these to be zero on FAT32,
+        *  and the layout computed above already assumed it. A volume that
+        *  breaks it would have had its data area put in the wrong place by
+        *  the arithmetic further up, so this is a check on a number that
+        *  has already been used rather than a check before use - which is
+        *  why it refuses instead of correcting. */
+        if (fat_root_entries != 0 || fat_root_sectors != 0)
+        {
+            fat_bits = 0;
+            fat_err = "FAT32 volume with a fixed root directory - malformed";
+            return -1;
+        }
+
+        fat_root_cluster = rd32(bs, BPB_RootClus) & FAT32_MASK;
+        if (!fat_cluster_valid(fat_root_cluster))
+        {
+            fat_bits = 0;
+            fat_err = "root directory starts at a cluster that does not exist";
+            return -1;
+        }
+
+        /* MIRRORING CAN BE TURNED OFF, and only on FAT32. Bit 7 of
+        *  BPB_ExtFlags means exactly one FAT is live and the low four bits
+        *  say which; the others hold whatever they held when it was
+        *  switched off and are not copies of anything.
+        *
+        *  Honouring it costs four lines and buys two things. Reads come out
+        *  of the copy that is actually maintained rather than out of a
+        *  stale one, which on such a volume is the difference between the
+        *  current filesystem and last week's. And writes stop overwriting
+        *  copies this driver was told are not mirrors, which is the same
+        *  courtesy the reserved bits above are given: bytes another driver
+        *  owns come back as they were.
+        *
+        *  Every formatter in ordinary use leaves this at zero, so the
+        *  common path is the one line below it. */
+        ext_flags = rd16(bs, BPB_ExtFlags);
+        if (ext_flags & 0x0080)
+        {
+            active = ext_flags & 0x000F;
+            if (active >= fat_num_fats)
+            {
+                fat_bits = 0;
+                fat_err = "active FAT is one the volume does not have";
+                return -1;
+            }
+            fat_fat_lba = reserved + active * fat_sec_per_fat;
+            fat_fat_copies = 1;
+        }
     }
 
     /* The FAT has to be big enough for the entries the cluster count
@@ -1807,8 +2338,10 @@ static int fat_mount_unlocked(int drive)
 
         if (fat_bits == 12)
             need_bytes = ((fat_clusters + 2) * 3 + 1) / 2;
-        else
+        else if (fat_bits == 16)
             need_bytes = (fat_clusters + 2) * 2;
+        else
+            need_bytes = (fat_clusters + 2) * 4;
 
         if (fat_sec_per_fat * (uint32_t)BLK_SECTOR_SIZE < need_bytes)
         {
@@ -1818,19 +2351,31 @@ static int fat_mount_unlocked(int drive)
         }
     }
 
-    /* Volume label out of the extended boot record, if there is one. */
+    /* Volume label out of the extended boot record, if there is one. It sits
+    *  thirty-two bytes further along on FAT32, because the four fields above
+    *  were pushed in front of it - reading the FAT12/16 offsets there would
+    *  return the middle of BPB_RootClus as a name. */
+    lab_off = (fat_bits == 32) ? (uint32_t)BS32_VolLab : (uint32_t)BS_VolLab;
+
     fat_vol_label[0] = '\0';
-    if (bs[BS_BootSig] == 0x29)
+    if (bs[(fat_bits == 32) ? BS32_BootSig : BS_BootSig] == 0x29)
     {
         last = -1;
         for (i = 0; i < 11; i++)
         {
-            fat_vol_label[i] = (char)bs[BS_VolLab + i];
+            fat_vol_label[i] = (char)bs[lab_off + i];
             if (fat_vol_label[i] != ' ')
                 last = (int)i;
         }
         fat_vol_label[last + 1] = '\0';
     }
+
+    /* Last, because it validates against fat_clusters and reads a sector of
+    *  its own through the data cache, so everything it leans on has to be
+    *  derived already. A volume without one, or with one that does not
+    *  validate, mounts exactly the same - see fat_fsinfo_load(). */
+    if (fat_bits == 32)
+        fat_fsinfo_load(rd16(bs, BPB_FSInfo), reserved);
 
     fat_is_mounted = 1;
     return 0;
@@ -1857,7 +2402,7 @@ int fat_mount(int drive)
 
 /* --- The entry points that do not lock -------------------------------------
 *
-*  Everything from here to fat_free_bytes() reads statics and does arithmetic
+*  Everything from here to fat_total_kib() reads statics and does arithmetic
 *  on them: no sector, no transfer, nothing that can block and so nothing a
 *  second task can be interleaved into. The lock section near the top of this
 *  file lists them and says why making them block would cost a status line a
@@ -1873,7 +2418,9 @@ const char *fat_type(void)
 {
     if (!fat_is_mounted)
         return "";
-    return (fat_bits == 12) ? "FAT12" : "FAT16";
+    if (fat_bits == 12)
+        return "FAT12";
+    return (fat_bits == 16) ? "FAT16" : "FAT32";
 }
 
 const char *fat_label(void)
@@ -1885,11 +2432,17 @@ const char *fat_label(void)
 
 /* --- Sizes ---------------------------------------------------------------- */
 
-/* MUST NOT take the lock, and this is the one of the unlocked entry points
-*  where that is a requirement rather than a preference: fat_bytes_of() below
-*  calls it, and fat_free_bytes() calls fat_bytes_of() while holding the lock.
-*  It is one of the two public-reaches-public paths the lock section names.
-*  A multiplication of two statics does not need one anyway. */
+/* Kept as bytes, and it is the one size here that can stay that way: a
+*  cluster is at most 32 KiB by every formatter and at most 32 MiB by the
+*  widest reading of the specification, so it fits in 32 bits with room to
+*  spare. It is a unit a caller uses to round a file size, not a unit anybody
+*  measures a volume in.
+*
+*  MUST NOT take the lock, and this is the one unlocked entry point where that
+*  used to be a requirement rather than a preference - fat_bytes_of() called
+*  it from inside the lock. That caller is gone with the move to kibibytes and
+*  the requirement with it, but a multiplication of two statics does not need
+*  a lock in any case. */
 uint32_t fat_cluster_bytes(void)
 {
     if (!fat_is_mounted)
@@ -1897,25 +2450,55 @@ uint32_t fat_cluster_bytes(void)
     return fat_spc * (uint32_t)BLK_SECTOR_SIZE;
 }
 
-/* clusters * cluster size, saturating. A FAT16 volume with 64 sectors per
-*  cluster is already at 2 GiB, and there is no 64 bit arithmetic here, so
-*  the multiplication is checked instead of widened. */
-static uint32_t fat_bytes_of(uint32_t clusters)
+/* --- Volume sizes, in kibibytes --------------------------------------------
+*
+*  WHY NOT BYTES ANY MORE. A byte count in 32 bits stops at 4 GB. That was
+*  survivable while a volume was a floppy or a 32 MB image and it stopped
+*  being survivable the moment a USB stick was in the picture, because FAT32
+*  exists precisely for media above the 2 GB FAT16 ceiling - a byte count
+*  cannot describe the volumes the format was added for. Kibibytes carry 4 TB
+*  in the same 32 bits, which is past what a 32 bit LBA can address at all, so
+*  the unit cannot be the limit again.
+*
+*  AND THERE IS NO 64 BIT ARITHMETIC HERE to reach for instead. The way this
+*  is computed is the way the constraint asks for: think in SECTORS, which is
+*  what the volume is measured in and what can never overflow because a 32 bit
+*  LBA is the largest sector number the block layer can name, and convert to
+*  kibibytes at the very end by dividing by two. The intermediate that would
+*  have overflowed - the byte count - is never formed at all.
+*
+*  ROUNDED DOWN, both of them, which the odd case makes a real decision rather
+*  than a consequence of integer division. A volume with one sector per
+*  cluster and an odd number of free clusters has half a kibibyte this cannot
+*  express, and it is reported as absent. A free count that rounded UP would
+*  say there is room for a file that will not fit, and a caller that believed
+*  it would get a short write it had been told would not happen. */
+static uint32_t fat_kib_of(uint32_t clusters)
 {
-    uint32_t cb = fat_cluster_bytes();
+    uint32_t sectors;
 
-    if (cb == 0)
+    if (fat_spc == 0)
         return 0;
-    if (clusters > 0xFFFFFFFFUL / cb)
+
+    /* Cannot overflow on any volume that mounted: fat_clusters was computed
+    *  as data_sectors / fat_spc, so this product is at most data_sectors and
+    *  therefore at most the sector count of the medium. The test is here for
+    *  the caller that has not mounted anything yet and for a BPB with an
+    *  absurd sectors-per-cluster, and it saturates rather than wraps because
+    *  a size that reads as tiny is worse than one that reads as enormous. */
+    if (clusters > 0xFFFFFFFFUL / fat_spc)
         return 0xFFFFFFFFUL;
-    return clusters * cb;
+
+    sectors = clusters * fat_spc;
+
+    return sectors / (1024UL / BLK_SECTOR_SIZE);
 }
 
-uint32_t fat_total_bytes(void)
+uint32_t fat_total_kib(void)
 {
     if (!fat_is_mounted)
         return 0;
-    return fat_bytes_of(fat_clusters);
+    return fat_kib_of(fat_clusters);
 }
 
 /* Counts free clusters by scanning the FAT. Entries 0 and 1 are reserved
@@ -1926,35 +2509,66 @@ uint32_t fat_total_bytes(void)
 *  One pass is still one sector transfer per 512 bytes of FAT, and on a stick
 *  that is the most expensive thing in this file by a wide margin: a FAT16
 *  volume with a megabyte of FAT is two thousand bulk round trips, seconds
-*  rather than the milliseconds the same call costs on IDE. There is no
-*  cheaper way to count free clusters on FAT12/16 - there is no free count in
-*  the boot sector to trust, that is a FAT32 field - so this is not a bug,
-*  but a caller that wants a number on every screen refresh should know what
-*  it is asking for.
+*  rather than the milliseconds the same call costs on IDE. A FAT32 stick is
+*  worse again - four bytes an entry over millions of clusters - which is why
+*  the count is cached the moment it has been made and why FSInfo exists to
+*  save making it at all.
 *
-*  It is also the longest anything holds the lock, which is why FAT_LOCK_MS is
-*  set where it is: a caller that asks for a free count while a stick is busy
-*  has to be able to wait for one that is already running. */
-static uint32_t fat_free_bytes_unlocked(void)
+*  This remains the FALLBACK and it never goes away: FSInfo is a hint that can
+*  be missing, unreadable, unsigned or simply wrong, and every one of those
+*  paths ends here. It is also the longest anything holds the lock, which is
+*  why FAT_LOCK_MS is set where it is.
+*
+*  Returns 0 with *out set, or negative when the FAT could not be read - which
+*  is a different answer from a count of zero, and the reason this does not
+*  simply return the number. */
+static int fat_count_free(uint32_t *out)
 {
     uint32_t c;
     uint32_t v;
     uint32_t free_clusters = 0;
 
-    if (!fat_is_mounted)
-        return 0;
-
     for (c = 2; c <= fat_clusters + 1; c++)
     {
         if (fat_entry(c, &v) < 0)
-            return 0;
+            return -1;
         if (v == 0)
             free_clusters++;
     }
-    return fat_bytes_of(free_clusters);
+
+    *out = free_clusters;
+    return 0;
 }
 
-uint32_t fat_free_bytes(void)
+static uint32_t fat_free_kib_unlocked(void)
+{
+    uint32_t n;
+
+    if (!fat_is_mounted)
+        return 0;
+
+    /* Counted once and then kept - by FSInfo at mount time on FAT32, by this
+    *  scan otherwise - and adjusted by one at each of the two places that
+    *  change how many clusters are free. See the note above fat_free_count. */
+    if (!fat_free_known)
+    {
+        if (fat_count_free(&n) < 0)
+            return 0;
+        fat_free_count = n;
+        fat_free_known = 1;
+
+        /* Worth writing back once somebody has paid for it, so that the next
+        *  mount of this volume does not pay again. Not written from here:
+        *  this is a query, a query that writes to the medium is a surprise,
+        *  and the next operation that changes the volume anyway will carry
+        *  it out for free. */
+        fat_fsinfo_dirty = 1;
+    }
+
+    return fat_kib_of(fat_free_count);
+}
+
+uint32_t fat_free_kib(void)
 {
     uint32_t r;
 
@@ -1964,7 +2578,7 @@ uint32_t fat_free_bytes(void)
     if (fat_lock_acquire() < 0)
         return 0;
 
-    r = fat_free_bytes_unlocked();
+    r = fat_free_kib_unlocked();
 
     fat_lock_release();
     return r;
@@ -2429,9 +3043,40 @@ static int fat_alloc_cluster(uint32_t *out)
         if (v == 0)
         {
             if (fat_set_entry(c, fat_eoc()) < 0)
+            {
+                /* The write may have landed in some copies and not others,
+                *  or in one sector of a split FAT12 entry and not the other,
+                *  so whether this cluster is now taken is not something this
+                *  driver can say. A count that might be one out is worse
+                *  than no count: the next question pays for a scan. */
+                fat_free_known = 0;
+                fat_fsinfo_dirty = 1;
                 return -1;
+            }
 
             fat_alloc_hint = (c + 1 > fat_clusters + 1) ? 2 : c + 1;
+
+            /* One cluster fewer, and the FSInfo copy of both numbers is now
+            *  behind. Free rather than a second pass over the FAT: the entry
+            *  that changed was read a few lines up, so its old value is
+            *  known and the new one was just written.
+            *
+            *  A count of zero here is a count that has just been DISPROVED -
+            *  a free cluster was found on a volume the number said had none
+            *  - so it is thrown away rather than clamped. That is the second
+            *  half of how FSInfo is validated: the checks at mount time catch
+            *  a number that is impossible, and this catches one that is
+            *  merely wrong, at the first moment the FAT itself contradicts
+            *  it. Clamping would keep the wrong number for ever. */
+            if (fat_free_known)
+            {
+                if (fat_free_count == 0)
+                    fat_free_known = 0;
+                else
+                    fat_free_count--;
+            }
+            fat_fsinfo_dirty = 1;
+
             *out = c;
             return 0;
         }
@@ -2471,7 +3116,27 @@ static int fat_free_chain(uint32_t c)
             return -1;              /* corrupt or unreadable: stop here */
 
         if (fat_set_entry(c, 0) < 0)
+        {
+            /* Same argument as in fat_alloc_cluster(): a FAT write that
+            *  failed part way leaves this driver unable to say whether the
+            *  cluster is free, so it stops claiming to know the count. */
+            fat_free_known = 0;
+            fat_fsinfo_dirty = 1;
             return -1;
+        }
+
+        /* And the mirror image of the disproof in fat_alloc_cluster(): a
+        *  cluster was just released on a volume the count said was already
+        *  entirely free, so the count is wrong and is dropped rather than
+        *  held at the ceiling. */
+        if (fat_free_known)
+        {
+            if (fat_free_count >= fat_clusters)
+                fat_free_known = 0;
+            else
+                fat_free_count++;
+        }
+        fat_fsinfo_dirty = 1;
 
         /* Freeing below the hint makes the space visible to the next
         *  allocation without a wrap around scan. */
@@ -2674,8 +3339,7 @@ static int fat_resolve_parent(const char *path, fat_dir *dir, char *last)
         return -1;
     }
 
-    dir->is_root = 1;
-    dir->cluster = 0;
+    fat_dir_root(dir);
 
     for (;;)
     {
@@ -2705,17 +3369,8 @@ static int fat_resolve_parent(const char *path, fat_dir *dir, char *last)
                 return -1;
             }
             /* ".." in a first level subdirectory carries cluster 0, which
-            *  is FAT's way of saying "the root" - it has no cluster. */
-            if (de.first_cluster == 0)
-            {
-                dir->is_root = 1;
-                dir->cluster = 0;
-            }
-            else
-            {
-                dir->is_root = 0;
-                dir->cluster = de.first_cluster;
-            }
+            *  is FAT's way of saying "the root" - see fat_dir_at(). */
+            fat_dir_at(dir, de.first_cluster);
         }
 
         strcpy(last, comp);
@@ -2743,10 +3398,16 @@ static int fat_resolve_parent(const char *path, fat_dir *dir, char *last)
 *  where that is not true the directory was already broken before this
 *  driver touched it.
 *
-*  A full root directory is a hard error - the root is a fixed run of
-*  sectors on FAT12/16 and cannot grow. A full subdirectory is a chain like
-*  any other and is extended by one zeroed cluster, whose 32 byte entries
-*  are all 0x00 and therefore exactly a valid empty tail. */
+*  A full root directory is a hard error ON FAT12/16 - there the root is a
+*  fixed run of sectors and cannot grow, and the count of them was fixed when
+*  the volume was formatted. A full subdirectory is a chain like any other and
+*  is extended by one zeroed cluster, whose 32 byte entries are all 0x00 and
+*  therefore exactly a valid empty tail.
+*
+*  On FAT32 the root is one of those chains, so it takes the second path and
+*  grows. Nothing here tests for the format to decide that: d->is_root is only
+*  ever set for the fixed area, so the volumes that do not have one never
+*  reach the error at all. */
 static int fat_dir_free_slot(const fat_dir *d, fat_slot *slot)
 {
     uint32_t lba, within;
@@ -2868,7 +3529,7 @@ static int fat_open(const char *path, fat_file *f)
         return -1;
     }
 
-    f->first = rd16(e, DIR_FstClusLO);
+    f->first = fat_first_cluster(e);
     f->size = rd32(e, DIR_FileSize);
     f->attr = e[DIR_Attr];
     f->cur_index = 0;
@@ -2936,13 +3597,23 @@ static int fat_commit(fat_file *f)
 
     e = dat_buf + f->slot.within * DIR_ENTRY_SIZE;
 
-    wr16(e, DIR_FstClusLO, f->first);
+    wr16(e, DIR_FstClusLO, f->first & 0xFFFF);
     wr32(e, DIR_FileSize, f->size);
 
-    /* On FAT12/16 the high half of the cluster number is reserved and must
-    *  be zero. Nothing reads it here, but a non zero value would make a
-    *  FAT32 aware tool follow a cluster number this volume does not have. */
-    wr16(e, DIR_FstClusHI, 0);
+    /* The other half of the cluster number, and it is written on every
+    *  format rather than only on FAT32 - with a different value and for a
+    *  different reason.
+    *
+    *  On FAT32 it is the top twelve bits of the first cluster, and a driver
+    *  that left it alone would produce a file whose chain starts somewhere in
+    *  the first 65536 clusters whatever the file actually uses.
+    *
+    *  On FAT12/16 it is reserved and must be zero. Nothing here reads it -
+    *  fat_first_cluster() ignores it below FAT32 precisely because it cannot
+    *  be trusted there - but a non zero value would make a FAT32 aware tool
+    *  follow a cluster number this volume does not have, so it is written as
+    *  zero rather than merely not written. */
+    wr16(e, DIR_FstClusHI, (fat_bits == 32) ? ((f->first >> 16) & 0xFFFF) : 0);
 
     /* The archive bit means "changed since the last backup", and this is
     *  precisely that change. */
@@ -3211,6 +3882,16 @@ int fat_create(const char *path)
 
     r = fat_create_unlocked(path);
 
+    /* Still inside the lock, and in the SHELL rather than in the body.
+    *  There are four of these and between them thirty-odd ways out of a
+    *  body, several of which change the free count on their way to
+    *  reporting a failure; putting the write-back at the one point every
+    *  one of them passes through is the same argument that made the shells
+    *  the only thing that ever unlocks. It does nothing at all unless
+    *  something moved, and it cannot change what this call returns - see
+    *  fat_fsinfo_store(). */
+    fat_fsinfo_store();
+
     fat_lock_release();
     return r;
 }
@@ -3316,6 +3997,8 @@ int fat_write(const char *path, uint32_t offset, uint32_t len,
         return -1;
 
     r = fat_write_unlocked(path, offset, len, buf);
+
+    fat_fsinfo_store();
 
     fat_lock_release();
     return r;
@@ -3450,6 +4133,8 @@ int fat_truncate(const char *path, uint32_t size)
 
     r = fat_truncate_unlocked(path, size);
 
+    fat_fsinfo_store();
+
     fat_lock_release();
     return r;
 }
@@ -3508,7 +4193,7 @@ static int fat_delete_unlocked(const char *path)
         return -1;
     }
 
-    first = rd16(e, DIR_FstClusLO);
+    first = fat_first_cluster(e);
 
     if (fat_get_data_sector(slot.lba) < 0)
         return -1;
@@ -3545,6 +4230,8 @@ int fat_delete(const char *path)
         return -1;
 
     r = fat_delete_unlocked(path);
+
+    fat_fsinfo_store();
 
     fat_lock_release();
     return r;

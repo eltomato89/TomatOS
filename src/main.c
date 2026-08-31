@@ -3086,8 +3086,8 @@ static void fs_explain_unmounted(void)
 static void fs_df(void)
 {
 	const char *label;
-	uint32_t total;
-	uint32_t avail;
+	uint32_t total_kib;
+	uint32_t avail_kib;
 	uint32_t sectors;
 	int drives;
 	int drive;
@@ -3098,30 +3098,35 @@ static void fs_df(void)
 	{
 		printf("  Nothing is mounted -- no path can be read.\n");
 	} else {
-		total = fat_total_bytes();
-		avail = fat_free_bytes();
+		/* Kibibytes from fat.h now, and the second column is MiB rather
+		*  than KiB: the byte figure the first column used to carry cannot
+		*  be formed at all once a volume passes 4 GiB, which is the case
+		*  FAT32 exists for. The columns and their widths are unchanged, so
+		*  the three rows still line up under each other. */
+		total_kib = fat_total_kib();
+		avail_kib = fat_free_kib();
 		label = fat_label();
 
 		printf("  Type:          %s\n", fat_type());
 		printf("  Label:         %s\n", label[0] == EOS ? "(none)" : label);
 
 		printf("  Total:   ");
-		mem_print_right(total, 12);
-		printf(" bytes (");
-		mem_print_right(total / 1024, 8);
-		printf(" KiB)\n");
+		mem_print_right(total_kib, 12);
+		printf(" KiB (");
+		mem_print_right(total_kib / 1024, 8);
+		printf(" MiB)\n");
 
 		printf("  Used:    ");
-		mem_print_right(total - avail, 12);
-		printf(" bytes (");
-		mem_print_right((total - avail) / 1024, 8);
-		printf(" KiB)\n");
+		mem_print_right(total_kib - avail_kib, 12);
+		printf(" KiB (");
+		mem_print_right((total_kib - avail_kib) / 1024, 8);
+		printf(" MiB)\n");
 
 		printf("  Free:    ");
-		mem_print_right(avail, 12);
-		printf(" bytes (");
-		mem_print_right(avail / 1024, 8);
-		printf(" KiB)\n");
+		mem_print_right(avail_kib, 12);
+		printf(" KiB (");
+		mem_print_right(avail_kib / 1024, 8);
+		printf(" MiB)\n");
 
 		printf("  Cluster size:  %u bytes\n", (int)fat_cluster_bytes());
 	}

@@ -175,8 +175,11 @@ typedef struct
 {
 	char     type[8];            /* "FAT12" / "FAT16", empty if not mounted  */
 	char     label[12];          /* volume label, may be empty               */
-	uint32_t total_bytes;
-	uint32_t free_bytes;
+	uint32_t total_kib;             /* KIBIBYTES, not bytes -- a byte count in
+	                                 *  32 bits stops at 4 GB and cannot
+	                                 *  describe the FAT32 media this now
+	                                 *  mounts. Both round down. */
+	uint32_t free_kib;
 	uint32_t cluster_bytes;
 	int32_t  drive;              /* ATA drive it sits on, -1 if none         */
 } sys_fsinfo;

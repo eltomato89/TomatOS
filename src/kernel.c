@@ -913,8 +913,8 @@ static void disk_init(void)
 
 	printf("Filesystem: %s on hd%i, %i KiB of %i KiB free\n",
 		fat_type(), drive,
-		(int)(fat_free_bytes() / 1024u),
-		(int)(fat_total_bytes() / 1024u));
+		(int)fat_free_kib(),
+		(int)fat_total_kib());
 }
 
 /* Tries to mount whatever removable block device turned up after disk_init()
@@ -944,8 +944,8 @@ static void removable_init(void)
 
 		printf("Filesystem: %s on %s (%s), %i KiB of %i KiB free\n",
 			fat_type(), blk_describe(dev), blk_bus(dev),
-			(int)(fat_free_bytes() / 1024u),
-			(int)(fat_total_bytes() / 1024u));
+			(int)fat_free_kib(),
+			(int)fat_total_kib());
 		return;
 	}
 }

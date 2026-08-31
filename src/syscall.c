@@ -1699,8 +1699,8 @@ static int sys_statfs(struct regs *r)
 
 	field_copy(info.type,  (int)sizeof(info.type),  fat_type());
 	field_copy(info.label, (int)sizeof(info.label), fat_label());
-	info.total_bytes   = fat_total_bytes();
-	info.free_bytes    = fat_free_bytes();
+	info.total_kib     = fat_total_kib();
+	info.free_kib      = fat_free_kib();
 	info.cluster_bytes = fat_cluster_bytes();
 	info.drive         = (int32_t)fs_drive();
 
@@ -2591,6 +2591,36 @@ static int sysfs_is_dir(const char *path)
 	return fat_readdir(path, 0, &entry) >= 0;
 }
 
+/* Non-zero when a byte count is at or past the end of a volume of "kib"
+*  kibibytes -- that is, exactly when bytes >= kib * 1024.
+*
+*  The multiplication is never performed, and that is the whole point of the
+*  function. fat.h reports a volume in kibibytes precisely because its size in
+*  bytes does not fit in 32 bits any more, so forming kib * 1024 here would
+*  wrap for every volume of 4 GiB or more and hand the guards below a bound
+*  smaller than the offset they are meant to admit -- a check that refuses the
+*  writes it exists to allow. Converting the other way, offset / 1024, cannot
+*  overflow: dividing only ever makes a number smaller.
+*
+*  Dividing loses the low ten bits of the offset, and it is worth saying why
+*  that costs nothing. Write bytes = q * 1024 + rem with rem < 1024. If
+*  q >= kib then bytes >= kib * 1024 as well, since rem is not negative. If
+*  q < kib then q <= kib - 1, so bytes <= (kib - 1) * 1024 + 1023, which is
+*  less than kib * 1024. The two directions meet, so "q >= kib" is not an
+*  approximation of "bytes >= kib * 1024" but the same test, off-by-one
+*  included: the last byte of the volume passes and the first byte past it
+*  does not.
+*
+*  A volume too large for a 32-bit byte offset to reach at all -- 4 GiB and up,
+*  which is what FAT32 is for -- makes this false for every possible argument,
+*  because bytes / 1024 tops out at 4194303 and kib is larger. That is the
+*  right answer rather than a hole in the guard: no offset a caller can express
+*  is outside such a volume, so there is nothing to refuse. */
+static int fs_past_volume_end(uint32_t bytes, uint32_t kib)
+{
+	return (bytes / 1024u) >= kib;
+}
+
 /* fcreate(path) -- creates an empty file. Returns 0 or a negative code.
 *
 *  Fails when the file is already there, which is fat_create()'s contract kept
@@ -2689,7 +2719,7 @@ static int sys_fwrite(struct regs *r)
 	uint32_t offset;
 	uint32_t len;
 	uint32_t buf;
-	uint32_t total;
+	uint32_t total_kib;
 	uint32_t unused;
 	int err;
 	int wrote;
@@ -2730,9 +2760,15 @@ static int sys_fwrite(struct regs *r)
 	*  report a size cannot turn every write into SYS_ENOSPC. What is left
 	*  unbounded is the legitimate case -- an offset just inside the volume
 	*  still zero-fills up to the end of it -- and that bound belongs in fat.c,
-	*  which is the only code that knows how far it has got. */
-	total = fat_total_bytes();
-	if(total != 0 && offset >= total) return SYS_ENOSPC;
+	*  which is the only code that knows how far it has got.
+	*
+	*  The offset is in bytes and the volume is in kibibytes, so the comparison
+	*  goes through fs_past_volume_end(), which does it without ever forming
+	*  the volume's size in bytes. Doing it the obvious way -- total_kib * 1024
+	*  -- would wrap on exactly the media the unit was changed for and leave
+	*  this line refusing legitimate writes. */
+	total_kib = fat_total_kib();
+	if(total_kib != 0 && fs_past_volume_end(offset, total_kib)) return SYS_ENOSPC;
 
 	/* The caller's buffer is handed to fat_write() directly rather than bounced
 	*  through the kernel stack, for the reason sys_read() gives: every page of
@@ -2816,13 +2852,23 @@ static int sys_unlink(struct regs *r)
 *  for would be lying to its caller about the one thing it does.
 *
 *  What can be done is to refuse the sizes that could never be reached. A file
-*  cannot be larger than the volume holding it, so a size above
-*  fat_total_bytes() is answered SYS_ENOSPC before anything is written, instead
-*  of after every free cluster on the disk has been spent on zeroes to learn
-*  the same thing. That is not a complete bound -- a size that does fit still
-*  zero-fills up to the size of the volume -- and the rest of it belongs in
-*  fat.c, which is the only code that knows how far it has got. It is a bound
-*  on what a typo can cost, which is what an argument check is for.
+*  cannot be larger than the volume holding it, so a size above the volume is
+*  answered SYS_ENOSPC before anything is written, instead of after every free
+*  cluster on the disk has been spent on zeroes to learn the same thing. That
+*  is not a complete bound -- a size that does fit still zero-fills up to the
+*  size of the volume -- and the rest of it belongs in fat.c, which is the only
+*  code that knows how far it has got. It is a bound on what a typo can cost,
+*  which is what an argument check is for.
+*
+*  The size is in bytes and fat_total_kib() is in kibibytes, so the comparison
+*  goes through fs_past_volume_end() for the reason SYS_FWRITE gives. That
+*  helper tests "at or past the end", and what is wanted here is "past" -- a
+*  file exactly filling the volume is a size that could be reached, while one
+*  byte more cannot. So the test is applied to size - 1, which turns > into >=
+*  downwards, where a uint32_t cannot wrap. Doing it upwards, on size + 1,
+*  would wrap at 0xFFFFFFFF and wave through the largest argument of all --
+*  the very one this check exists to stop. A size of 0 is excluded first,
+*  because it is the shrink case, never past anything, and has no size - 1.
 *
 *  The failure split uses the size the file already had, which the existence
 *  probe hands over for free. A grow that failed ran out of room, and
@@ -2836,7 +2882,7 @@ static int sys_truncate(struct regs *r)
 {
 	char path[SYS_PATH_MAX];
 	uint32_t size;
-	uint32_t total;
+	uint32_t total_kib;
 	uint32_t have;
 	int err;
 
@@ -2848,8 +2894,9 @@ static int sys_truncate(struct regs *r)
 	err = sysfs_rofs();
 	if(err != 0) return err;
 
-	total = fat_total_bytes();
-	if(total != 0 && size > total) return SYS_ENOSPC;
+	total_kib = fat_total_kib();
+	if(total_kib != 0 && size != 0 && fs_past_volume_end(size - 1u, total_kib))
+		return SYS_ENOSPC;
 
 	if(fat_truncate(path, size) != 0)
 	{

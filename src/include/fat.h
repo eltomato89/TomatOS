@@ -1,6 +1,12 @@
-/* TomatOS - FAT12/FAT16 filesystem
+/* TomatOS - FAT12/FAT16/FAT32 filesystem
 *  Desc: Enough to list a directory, and to read and write a file on a real
 *        disk.
+*
+*  Three formats rather than one, and that is not indecision. FAT12 carries the
+*  floppy path, the boot image is FAT16 by construction (see the geometry block
+*  in the Makefile, which argues the cluster-count boundaries at length), and
+*  FAT32 is what any USB stick larger than 2 GB actually is -- so without it
+*  the mass storage driver could only read media this kernel formatted itself.
 *
 *  Writing is the first thing in this kernel that can DESTROY data. Everything
 *  before it was additive: a wrong packet is dropped, a wrong pixel is
@@ -55,8 +61,23 @@ extern const char *fat_type(void);
 /* Volume label from the boot sector, or "" if it has none. */
 extern const char *fat_label(void);
 
-extern uint32_t fat_total_bytes(void);
-extern uint32_t fat_free_bytes(void);
+/* Volume size, in KIBIBYTES rather than bytes.
+*
+*  Bytes in 32 bits stop at 4 GB, which was survivable while a volume was a
+*  32 MB image or a floppy and is not once a USB stick is in the picture: FAT32
+*  exists precisely for media above the 2 GB FAT16 ceiling, so a byte count
+*  could not describe the volumes the format is for. Kibibytes carry 4 TB in
+*  the same 32 bits, past what a 32-bit LBA can address at all.
+*
+*  Renamed rather than quietly re-scaled. A function that keeps its name and
+*  changes its unit breaks every caller silently, and two of them in syscall.c
+*  compare a byte offset against this -- exactly the arithmetic that would go
+*  wrong without a word from the compiler.
+*
+*  Rounded DOWN, both of them. A free count that rounds up says there is room
+*  for a file that will not fit. */
+extern uint32_t fat_total_kib(void);
+extern uint32_t fat_free_kib(void);
 extern uint32_t fat_cluster_bytes(void);
 
 /* Entry number index of a directory, "" or "/" meaning the root.
