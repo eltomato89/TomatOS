@@ -48,11 +48,26 @@ KERNEL_MAX_SECTORS  equ 511
 MODULES_LBA         equ 528
 MODULES_MAX_SECTORS equ 512         ; 256 KiB for all of them together
 
-; Where they are loaded, physically. Chosen so it cannot collide with the
-; kernel by construction rather than by checking: the kernel starts at
-; KERNEL_PHYS and is at most KERNEL_MAX_SECTORS long, which ends at 0x13FE00,
-; and this is the next page boundary above that.
-MODULES_PHYS        equ 0x00140000
+; Where they are loaded, physically.
+;
+; THIS WAS 0x140000 AND THAT WAS WRONG, in a way worth writing down because the
+; reasoning looked airtight. The argument was: the kernel starts at KERNEL_PHYS
+; and the image is at most KERNEL_MAX_SECTORS long, so it ends by 0x13FE00 and
+; the next page above that is safe "by construction rather than by checking".
+;
+; The image is not the kernel. .bss is NOBITS: it occupies no bytes on disk and
+; every one of them in RAM. It runs to physical 0x1516E4, so 0x140000 sat in
+; the middle of it, and the kernel wiped five of the seven modules the moment
+; it cleared its own .bss. QEMU hid it completely -- the shell found the same
+; programs on the FAT volume and ran them -- and on a machine that cannot read
+; its own medium, which is the entire reason this mechanism exists, it would
+; have been a shell with no commands and no clue why.
+;
+; So: above the .bss, with room, and NOT trusted. The Makefile computes the
+; kernel's real end from the ELF's program headers and refuses to build an
+; image whose modules would land below it. A constant picked from today's
+; measurement is the same mistake one size larger.
+MODULES_PHYS        equ 0x00200000
 
 ; The multiboot_module array and the command line strings it points at. Both
 ; live in low memory next to the rest of the multiboot structures, because the

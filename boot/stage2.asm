@@ -26,10 +26,13 @@
 ;      mem_upper      fallback if E820 was not available.
 ;
 ;   4. Kernel load    Needs A20 (step 1) and unreal mode. Deliberately BEFORE
-;                     the graphics mode: disk reads are the longest and most
+;      and modules    the graphics mode: disk reads are the longest and most
 ;                     failure-prone part of the boot, and we want to be able
 ;                     to see the progress messages while it happens. Once a
 ;                     VBE mode is set, int 10h teletype output goes nowhere.
+;                     The modules follow the kernel rather than preceding it
+;                     because a machine that cannot read its own disk should
+;                     say so before it has spent time on the user programs.
 ;
 ;   5. Graphics mode  Last of the BIOS calls, for exactly that reason. It is
 ;                     also the only step that is allowed to fail without
@@ -95,6 +98,30 @@ s2_magic:
 s2_kernel_sectors:
         dd      KERNEL_MAX_SECTORS      ; file offset 12 .. 15
 
+; How many multiboot modules follow, and where each of them lives on the disk.
+; The Makefile patches both once it knows which programs were built and where
+; it wrote them; layout.inc states the offsets so that both sides can code to
+; the same numbers without either having to read the other.
+;
+; The default is a count of zero, which is the same courtesy s2_kernel_sectors
+; extends to an unpatched image: stage 2 then hands the kernel no modules at
+; all and boots exactly as it did before any of this existed. Zero is also the
+; honest answer for a disk built without programs, so the "unpatched" and the
+; "nothing to load" cases need no distinction.
+;
+; The table is padded out to MB_MODS_MAX entries whether they are used or not.
+; A fixed-size table means the Makefile can seek straight to entry n and the
+; layout does not depend on how many programs happen to exist, at a cost of
+; MB_MODS_MAX * S2MOD_ENTRY_SIZE bytes -- 384 of the 8 KiB budget, which is
+; cheap next to having two build steps disagree about where entry 3 begins.
+        times   S2HDR_MODCOUNT_OFF-($-$$) db 0
+s2_module_count:
+        dd      0                       ; file offset 16 .. 19
+
+        times   S2HDR_MODTAB_OFF-($-$$) db 0
+s2_module_table:
+        times   MB_MODS_MAX * S2MOD_ENTRY_SIZE db 0     ; file offset 20 ..
+
 ; ---------------------------------------------------------------------------
 s2_start:
         cli
@@ -156,6 +183,20 @@ s2_start:
         call    s2_unreal_enter
         call    s2_load_kernel          ; halts on its own on a disk error
         mov     si, s2_msg_ok
+        call    s2_print
+
+        ; --- 4b. multiboot modules -------------------------------------------
+        ; The user programs, if the Makefile patched any into the table above.
+        ; "none" here is a perfectly good boot on a disk built without them,
+        ; and a diagnosis on a disk that was supposed to have them.
+        mov     si, s2_msg_mods
+        call    s2_print
+        call    s2_load_modules         ; halts on its own on a bad table
+        mov     si, s2_msg_ok
+        test    eax, eax
+        jnz     .mods_print
+        mov     si, s2_msg_skip
+.mods_print:
         call    s2_print
 
         ; --- 5. graphics mode ------------------------------------------------
@@ -738,9 +779,24 @@ s2_load_kernel:
         mov     dword [s2_lba], KERNEL_LBA
         mov     dword [s2_dest], KERNEL_PHYS
 
-        ; Ask once whether the drive supports the LBA read (int 13h AH=42h).
-        ; The kernel lives at LBA 17..527, comfortably inside CHS range, so a
-        ; CHS fallback is genuinely usable on machines without extensions.
+        call    s2_disk_probe
+        call    s2_read_run
+        ret
+
+; ---------------------------------------------------------------------------
+; s2_disk_probe -- decide once how this drive is going to be read.
+;
+; int 13h AH=41h asks whether the drive supports the packet interface (AH=42h,
+; the one that takes an LBA outright). Everything the boot chain reads lives
+; below LBA 1040, comfortably inside CHS range, so the fallback is not a
+; formality: on a machine without the extensions the CHS path really does have
+; to work, and it is exercised by every BIOS old enough to lack AH=42h.
+;
+; Cheap enough to call again before each load rather than making one caller
+; responsible for having probed for the others; the answer cannot change.
+; ---------------------------------------------------------------------------
+s2_disk_probe:
+        pusha
         mov     ah, 0x41
         mov     bx, 0x55AA
         mov     dl, [s2_boot_drive]
@@ -751,11 +807,26 @@ s2_load_kernel:
         test    cl, 1                   ; bit 0: packet access supported
         jz      .no_lba
         mov     byte [s2_use_lba], 1
-        jmp     .loop
+        popa
+        ret
 .no_lba:
         mov     byte [s2_use_lba], 0
         call    s2_chs_geometry
+        popa
+        ret
 
+; ---------------------------------------------------------------------------
+; s2_read_run -- read [s2_remaining] sectors from [s2_lba] to [s2_dest],
+; buffering each chunk through DISK_BUFFER. The caller sets those three and
+; has already called s2_disk_probe.
+;
+; Split out of s2_load_kernel so the module loader can use it as it stands:
+; the two differ only in where they read from and where they put it, and a
+; second copy of the chunking arithmetic is a second place to get the
+; sectors-to-bytes shift wrong.
+; ---------------------------------------------------------------------------
+s2_read_run:
+        pushad
 .loop:
         mov     eax, [s2_remaining]
         test    eax, eax
@@ -780,6 +851,7 @@ s2_load_kernel:
         jmp     .loop
 
 .done:
+        popad
         ret
 
 ; ---------------------------------------------------------------------------
@@ -953,6 +1025,183 @@ s2_copy_chunk:
         popad
         ret
 
+; ---------------------------------------------------------------------------
+; s2_load_modules -- read the user programs off the disk and describe them to
+; the kernel as multiboot modules. Returns the number loaded in eax.
+;
+; WHY STAGE 2 DOES THIS AT ALL. The kernel cannot read the medium it booted
+; from on the machine this is aimed at: a USB stick is not an IDE or a SATA
+; controller, so the ATA driver's port I/O does not reach it, and the USB mass
+; storage driver talks UHCI, which every chipset since Panther Point replaced
+; with EHCI and xHCI. The BIOS has no such trouble -- int 13h is how stage 1
+; and stage 2 got into memory in the first place -- so the programs are read
+; here, while int 13h is still callable, and handed over through the same
+; mechanism GRUB uses. Without this the machine boots to a shell with no
+; commands in it.
+;
+; WHAT IS BUILT. Three things, in low memory where the kernel's direct mapping
+; can see them (layout.inc has the map):
+;
+;   MODULES_PHYS  the module images themselves, back to back, each one
+;                 starting on a 4 KiB boundary
+;   MB_MODS       one 16-byte multiboot_module per module: mod_start, mod_end
+;                 (exclusive), cmdline, reserved
+;   MB_MODSTR     the names, NUL terminated and packed, which the entries'
+;                 cmdline fields point at
+;
+; The page alignment is not required by multiboot; it is a kindness to the
+; other end. The kernel's ELF loader copies out of the module and its pmm
+; reserves the frames a module covers, and both of those are simpler when a
+; module neither begins nor ends in the middle of a frame that another module
+; also lives in. It costs at most 4 KiB of RAM per program.
+;
+; WHY IT REFUSES RATHER THAN TRUNCATES. Every limit below is one that could be
+; silently exceeded instead: read a sector too many and the filesystem's first
+; FAT ends up inside a program, write a byte too many and the module lands on
+; whatever the kernel put above MODULES_PHYS, drop a name that did not fit and
+; the module keeps a cmdline pointing at the previous module's name. All three
+; surface much later as a program that fails to parse as an ELF, or as a file
+; that reads back as garbage -- symptoms with no path back to this routine. A
+; named halt here costs a boot and explains itself.
+; ---------------------------------------------------------------------------
+s2_load_modules:
+        mov     eax, [s2_module_count]
+        test    eax, eax
+        jz      .none                   ; nothing patched in: not a failure,
+                                        ; and the flag stays clear
+        cmp     eax, MB_MODS_MAX
+        ja      .too_many
+        mov     [s2_mod_left], eax
+
+        ; Four cursors, all kept in memory rather than in registers: the loop
+        ; body calls the BIOS by way of s2_read_run, and this file has already
+        ; been bitten once (see s2_e820) by BIOSes that return with registers
+        ; they had no business touching.
+        mov     word  [s2_mod_entry], s2_module_table
+        mov     word  [s2_mod_arr], MB_MODS
+        mov     word  [s2_mod_str], MB_MODSTR
+        mov     dword [s2_mod_dest], MODULES_PHYS
+
+        call    s2_disk_probe
+
+.next:
+        mov     bx, [s2_mod_entry]
+
+        ; --- how much of the disk this module claims ------------------------
+        mov     eax, [bx + S2MOD_BYTES_OFF]
+        mov     [s2_mod_bytes], eax
+        add     eax, 511                ; a partial last sector is still read
+        jc      .bad_disk               ; a length near 4 GiB is not a program
+        shr     eax, 9
+        mov     [s2_remaining], eax
+
+        mov     edx, [bx + S2MOD_LBA_OFF]
+        mov     [s2_lba], edx
+        cmp     edx, MODULES_LBA        ; below the region is the kernel image
+        jb      .bad_disk
+        add     eax, edx                ; first sector behind this module
+        jc      .bad_disk
+        cmp     eax, MODULES_LBA + MODULES_MAX_SECTORS
+        ja      .bad_disk               ; above it is the FAT16 volume
+
+        ; --- and how much memory it needs -----------------------------------
+        ; Against the rounded-up length, not the byte count: whole sectors are
+        ; what s2_read_run actually writes, so those are what has to fit.
+        mov     eax, [s2_remaining]
+        shl     eax, 9
+        add     eax, [s2_mod_dest]
+        cmp     eax, MODULES_PHYS + MODULES_MAX_SECTORS * 512
+        ja      .bad_mem
+
+        ; --- the name, and room for it among the strings --------------------
+        ; S2MOD_NAME_MAX bytes, NUL padded -- so a name that fills the field
+        ; has no terminator in it and the length is the field width.
+        lea     si, [bx + S2MOD_NAME_OFF]
+        xor     cx, cx
+.name_len:
+        cmp     cx, S2MOD_NAME_MAX
+        jae     .name_end
+        cmp     byte [si], 0
+        je      .name_end
+        inc     si
+        inc     cx
+        jmp     .name_len
+.name_end:
+        sub     si, cx                  ; back to the first byte for the copy
+
+        mov     di, [s2_mod_str]
+        mov     [s2_mod_name], di       ; where this module's cmdline points
+        mov     ax, di
+        add     ax, cx
+        inc     ax                      ; the NUL the kernel reads up to
+        cmp     ax, MB_MODSTR + MB_MODSTR_MAX
+        ja      .bad_name
+        mov     [s2_mod_str], ax
+
+        ; movsb writes through es, and int 13h's CHS path sets es for its own
+        ; purposes, so it is loaded here rather than assumed.
+        xor     ax, ax
+        mov     es, ax
+        rep     movsb
+        mov     byte [es:di], 0
+
+        ; --- the multiboot_module entry -------------------------------------
+        mov     bx, [s2_mod_arr]
+        mov     eax, [s2_mod_dest]
+        mov     [bx], eax                       ; mod_start
+        add     eax, [s2_mod_bytes]
+        mov     [bx + 4], eax                   ; mod_end, one past the last
+                                                ; byte, and the true length --
+                                                ; not the sector padding
+        movzx   eax, word [s2_mod_name]
+        mov     [bx + 8], eax                   ; cmdline
+        mov     dword [bx + 12], 0              ; reserved
+
+        ; --- read it in ------------------------------------------------------
+        ; s2_lba and s2_remaining are already set from the range checks above.
+        mov     eax, [s2_mod_dest]
+        mov     [s2_dest], eax
+        call    s2_read_run             ; halts itself on a hard disk error
+
+        ; --- on to the next --------------------------------------------------
+        ; Round the destination up to the next page. Rounding the byte count
+        ; rather than the sector count is safe and not an oversight: 4 KiB is
+        ; a multiple of 512, so the page boundary above a length is never
+        ; below the sector boundary above it, and the padding sector cannot
+        ; reach into the next module.
+        mov     eax, [s2_mod_dest]
+        add     eax, [s2_mod_bytes]
+        add     eax, 0xFFF
+        and     eax, 0xFFFFF000
+        mov     [s2_mod_dest], eax
+
+        add     word [s2_mod_arr], MB_MOD_SIZE
+        add     word [s2_mod_entry], S2MOD_ENTRY_SIZE
+
+        dec     dword [s2_mod_left]
+        jnz     .next
+
+        ; --- and tell the kernel where it all is ------------------------------
+        mov     eax, [s2_module_count]
+        mov     [MB_INFO + MBI_MODS_COUNT], eax
+        mov     dword [MB_INFO + MBI_MODS_ADDR], MB_MODS
+        or      dword [MB_INFO + MBI_FLAGS], MB_FLAG_MODS
+.none:
+        ret                             ; eax = the count, zero on the .none path
+
+.too_many:
+        mov     si, s2_msg_mod_many
+        jmp     s2_die
+.bad_disk:
+        mov     si, s2_msg_mod_disk
+        jmp     s2_die
+.bad_mem:
+        mov     si, s2_msg_mod_mem
+        jmp     s2_die
+.bad_name:
+        mov     si, s2_msg_mod_name
+        jmp     s2_die
+
 ; ===========================================================================
 ; 5. Graphics mode -- provided by vbe.inc
 ; ===========================================================================
@@ -1103,6 +1352,17 @@ s2_lba:         dd      0               ; next LBA to read
 s2_dest:        dd      0               ; next physical destination
 s2_remaining:   dd      0               ; sectors still to read
 s2_chs_lba:     dd      0
+
+; Module loader state. In memory rather than in registers because the loop it
+; belongs to makes BIOS calls; see the comment in s2_load_modules.
+s2_mod_left:    dd      0               ; modules still to load
+s2_mod_bytes:   dd      0               ; length of the current one
+s2_mod_dest:    dd      0               ; next page-aligned physical address
+s2_mod_entry:   dw      0               ; -> its entry in s2_module_table
+s2_mod_arr:     dw      0               ; -> its multiboot_module at MB_MODS
+s2_mod_str:     dw      0               ; next free byte of MB_MODSTR
+s2_mod_name:    dw      0               ; where its name was written
+
 s2_chunk:       dw      0               ; sectors in the current chunk
 s2_mmap_count:  dw      0               ; E820 entries recorded
 s2_spt:         dw      63              ; sectors per track
@@ -1120,6 +1380,7 @@ s2_msg_banner:  db      13, 10, "TomatOS stage2", 13, 10, 0
 s2_msg_a20:     db      "a20 ", 0
 s2_msg_e820:    db      "e820 ", 0
 s2_msg_load:    db      "load ", 0
+s2_msg_mods:    db      "mods ", 0
 s2_msg_vbe:     db      "vbe ", 0
 s2_msg_ok:      db      "ok", 13, 10, 0
 s2_msg_no:      db      "text", 13, 10, 0
@@ -1127,6 +1388,14 @@ s2_msg_skip:    db      "none", 13, 10, 0
 s2_msg_fail:    db      "FAILED", 13, 10, 0
 s2_msg_disk:    db      "disk error", 13, 10, 0
 s2_msg_unreal:  db      "unreal/a20 check failed", 13, 10, 0
+
+; The four ways the patched-in module table can be wrong. Each names the limit
+; it broke, because the fix is a different one in each case: fewer programs, a
+; smaller one, a bigger MODULES_MAX_SECTORS, or a shorter name.
+s2_msg_mod_many: db     "too many modules", 13, 10, 0
+s2_msg_mod_disk: db     "module outside the module area", 13, 10, 0
+s2_msg_mod_mem:  db     "modules too big for memory", 13, 10, 0
+s2_msg_mod_name: db     "module names too long", 13, 10, 0
 s2_msg_halt:    db      "halted", 13, 10, 0
 
 ; ===========================================================================

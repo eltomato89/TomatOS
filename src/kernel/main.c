@@ -836,6 +836,7 @@ static char run_upper(char c);
 static int  run_path(const char *word, char *path);
 static const char *run_arguments(char *cmd);
 static void run_wait(int pid, const char *name);
+static void run_not_found(const char *word, const char *path);
 static void run_program(const char *word, char *cmd);
 static void help_programs(void);
 
@@ -2953,7 +2954,7 @@ void execute(char *cmd)
 	/* A program that cannot be loaded says why: exec_last_error() carries the
 	   reason the loader refused it -- not an ELF, wrong machine, no free
 	   frame -- which is a good deal more use than a bare failure. */
-	pid = exec_spawn(index, TASK_PRIORITY_NORMAL);
+	pid = exec_spawn(index, 0, TASK_PRIORITY_NORMAL);
 	if(pid < 0)
 	{
 		printf("exec: %s could not be loaded: %s\n", name, exec_last_error());
@@ -3243,10 +3244,15 @@ static char run_upper(char c)
 *  refusal is not an error to report: nothing on this volume can be called
 *  that, so the answer to "is there a program of that name" is simply no.
 *
-*  Note what is NOT accepted: a name with an extension. "cat" becomes
-*  /BIN/CAT.ELF, and "cat.elf" is rejected rather than becoming
-*  /BIN/CAT.ELF.ELF -- the extension belongs to the mechanism, not to the
-*  command. */
+*  The extension belongs to the mechanism rather than to the command, and
+*  that cuts both ways: "cat" becomes /BIN/CAT.ELF, and a "cat.elf" that was
+*  typed anyway has the extension taken off again instead of becoming
+*  /BIN/CAT.ELF.ELF. It is not a name this shell would ever print -- "help"
+*  lists the programs without it -- but it is what somebody who has just read
+*  a module list or a directory listing will type, and the module lookup in
+*  exec.c ignores the extension for exactly the same reason. The two halves
+*  of "is there a program called this" have to agree on what the name is, or
+*  the same word finds a program on one machine and not on the next. */
 static int run_path(const char *word, char *path)
 {
 	int len;
@@ -3254,6 +3260,15 @@ static int run_path(const char *word, char *path)
 	int i;
 
 	len = (int)strlen(word);
+
+	/* The extension off before anything else, so that BIN_NAME_MAX still
+	*  bounds the eight characters of the 8.3 name and not the twelve a
+	*  fully spelled out "hello.elf" would occupy. */
+	if(len > (int)strlen(BIN_EXT) && word[len - 4] == '.'
+	   && run_upper(word[len - 3]) == 'E' && run_upper(word[len - 2]) == 'L'
+	   && run_upper(word[len - 1]) == 'F')
+		len -= (int)strlen(BIN_EXT);
+
 	if(len < 1 || len > BIN_NAME_MAX) return 0;
 
 	for(i = 0; i < len; i++)
@@ -3394,60 +3409,137 @@ static void run_wait(int pid, const char *name)
 	       pid);
 }
 
-/* A word the built-in list did not know: look for a program of that name in
-*  BIN_DIR and run it, and only say "Unknown command" when there is none.
+/* What the shell says when a word is neither a built-in command nor a program
+*  anywhere it looked.
 *
-*  The file is looked up with fat_size() before exec_spawn_path() is asked to
-*  load it, and that is not a redundant walk of the directory. It separates
-*  the two answers the user needs to be able to tell apart: a name that is on
-*  no disk is a typo and deserves "Unknown command", while a name that IS
-*  there and will not load is a broken program and deserves the loader's own
-*  reason for refusing it. Without the lookup both come back as one failed
-*  spawn. */
-static void run_program(const char *word, char *cmd)
+*  The old wording described one machine: it said the word was not in BIN_DIR
+*  and, when nothing was mounted, went straight into the ATA driver's account
+*  of finding no drive. On a machine that boots off a USB stick that is not
+*  merely incomplete, it is untrue in the part that matters. Such a machine
+*  has its programs -- they came in as modules -- and it will never have a
+*  mounted volume, because the ATA driver speaks to IDE controllers through
+*  port I/O and a USB stick is not one. Explaining a missing command with "no
+*  drive was found" sends the user looking for a disk that was never going to
+*  be there, when the real answer is that this particular program was not
+*  built into the image.
+*
+*  So the message reports the machine it is printed on: both places that were
+*  searched, what each of them actually held, and the one thing that would
+*  make the command exist. The unmounted volume is still explained -- it is a
+*  fact about the machine -- but it is one of two lines rather than the whole
+*  answer, and it no longer stands where the reason should be.
+*
+*  path is the file this word would have named, or 0 when no 8.3 name on a FAT
+*  volume could ever be spelled that way. */
+static void run_not_found(const char *word, const char *path)
 {
-	char path[BIN_PATH_MAX];
-	const char *args;
-	uint32_t size;
-	int pid;
+	int mods;
 
-	if(!run_path(word, path))
+	mods = exec_module_count();
+
+	printf("Unknown command: %s\n", word);
+	printf("      Not built in, and no program of that name was found.\n");
+	printf("      Two places were searched:\n");
+
+	if(mods == 0)
 	{
-		/* No file on this volume can carry that name, so there was never
-		   anywhere to look. */
-		printf("Unknown command: %s\n", word);
-		printf("      No file in %s can be called that. \"help\" lists them.\n",
-		       BIN_DIR);
-		return;
+		printf("      - modules: none were passed to this kernel, so nothing\n");
+		printf("        was built into the boot image to run.\n");
+	} else {
+		printf("      - modules: %i came with the boot image, none of them\n",
+		       mods);
+		printf("        called that. \"ps\" lists them by the name they answer to.\n");
 	}
 
 	if(!fat_mounted())
 	{
-		printf("Unknown command: %s\n", word);
-		printf("      Not built in, and nothing is mounted -- no %s to look\n",
+		printf("      - disk: nothing is mounted, so there is no %s to look in.\n",
 		       BIN_DIR);
-		printf("      a program up in.\n");
 		fs_explain_unmounted();
-		return;
+	} else if(path == 0) {
+		printf("      - disk: no 8.3 file name can be spelled that way, so\n");
+		printf("        nothing in %s could ever carry it.\n", BIN_DIR);
+	} else {
+		printf("      - disk: there is no %s on the mounted volume.\n", path);
 	}
 
-	if(fat_size(path, &size) != 0)
+	/* The one line that says what to do about it, and it depends on which
+	   machine this is. With modules and no volume there is nowhere to put a
+	   program at runtime, so the answer is the build; with a volume there
+	   is, so the answer is the directory. */
+	if(mods > 0 && !fat_mounted())
 	{
-		printf("Unknown command: %s\n", word);
-		printf("      Not built in, and there is no %s. \"help\" lists both.\n",
-		       path);
-		return;
+		printf("      Everything this machine can run came with its boot image,\n");
+		printf("      so a missing program is one that was not built into it.\n");
+	} else if(fat_mounted()) {
+		printf("      Put the program in %s as an 8.3 %s file to add it.\n",
+		       BIN_DIR, BIN_EXT);
 	}
 
+	printf("      \"help\" lists the built-in commands and the programs.\n");
+}
+
+/* A word the built-in list did not know: look for a program of that name and
+*  run it, and only say "Unknown command" when there is none.
+*
+*  Two places hold programs and they are asked in this order: the file in
+*  BIN_DIR first, the bootloader modules second. That order is the one a
+*  machine with a disk already had, and it is kept deliberately -- a program
+*  copied onto the volume is the one somebody put there most recently, and a
+*  module is what the image was built with months ago, so the disk is the
+*  place an update can appear. A machine with no volume simply never gets a
+*  hit in the first place and falls through to the second, which is the whole
+*  point: the module path must not sit behind a "nothing is mounted" check
+*  that gives up before reaching it.
+*
+*  The file is looked up with fat_size() before exec_spawn_path() is asked to
+*  load it, and that is not a redundant walk of the directory. It separates
+*  the two answers the user needs to be able to tell apart: a name that is on
+*  no disk is not yet an error -- there may well be a module of that name --
+*  while a name that IS there and will not load is a broken program and
+*  deserves the loader's own reason for refusing it. Without the lookup a
+*  broken file would fall through to the modules and be reported as a missing
+*  command. */
+static void run_program(const char *word, char *cmd)
+{
+	char path[BIN_PATH_MAX];
+	const char *args;
+	const char *from;
+	uint32_t size;
+	int have_path;
+	int index;
+	int pid;
+
+	/* Read before anything is spawned, because it points into the caller's
+	   own line and both sources are handed the very same string. Where the
+	   bytes of a program came from is not something the program should be
+	   able to tell from its own argv. */
 	args = run_arguments(cmd);
+
+	have_path = run_path(word, path);
+
+	if(have_path && fat_mounted() && fat_size(path, &size) == 0)
+	{
+		from = path;
+		pid  = exec_spawn_path(path, args, TASK_PRIORITY_NORMAL);
+	}
+	else if((index = exec_module_lookup(word)) >= 0)
+	{
+		from = "the module of that name";
+		pid  = exec_spawn(index, args, TASK_PRIORITY_NORMAL);
+	}
+	else
+	{
+		run_not_found(word, have_path ? path : 0);
+		return;
+	}
 
 	/* Everything the loader can refuse -- a text file with the right name, a
 	   truncated ELF, a 64-bit binary, no free frame -- comes back here as one
 	   negative return with the reason in exec_last_error(). */
-	pid = exec_spawn_path(path, args, TASK_PRIORITY_NORMAL);
 	if(pid < 0)
 	{
-		printf("%s: %s could not be loaded: %s\n", word, path,
+		printf("%s: %s could not be loaded: %s\n", word, from,
 		       exec_last_error());
 		return;
 	}
@@ -8778,7 +8870,10 @@ void netstat(char *cmd)
 	net_show_tcp();
 }
 
-/* The other half of what can be typed: the programs in BIN_DIR.
+/* The other half of what can be typed: the programs. There are two sources of
+*  them and both are listed, because both are typed the same way -- the ones
+*  the bootloader handed over as modules, and the ones sitting in BIN_DIR on
+*  the mounted volume. A machine usually has one or the other.
 *
 *  Read off the disk rather than written out here, and that is worth the
 *  twenty lines it costs. A hardcoded list would be a promise this file cannot
@@ -8798,10 +8893,36 @@ static void help_programs(void)
 	char name[FAT_NAME_MAX];
 	int index;
 	int shown;
+	int mods;
 	int len;
 	int ext;
 	int i;
 	int rc;
+
+	/* The modules first, and they are listed here rather than only under
+	   "ps" because on a machine that boots off a medium the kernel cannot
+	   read afterwards -- a USB stick, where the ATA driver has nothing to
+	   talk to -- they are the ONLY programs there are. A "help" that showed
+	   nothing but an empty /BIN on such a machine would say the thing has no
+	   programs at all, which is exactly wrong. They are typed like any other
+	   command; where a program came from is not part of its name. */
+	mods = exec_module_count();
+
+	if(mods > 0)
+	{
+		printf("Programs the boot image brought along, typed by name:\n");
+
+		for(i = 0; i < mods; i++)
+		{
+			if((i % BIN_PER_LINE) == 0) printf("\t");
+			ps_print_left(exec_module_name(i), BIN_NAME_WIDTH);
+			if((i % BIN_PER_LINE) == BIN_PER_LINE - 1) printf("\n");
+		}
+
+		if((mods % BIN_PER_LINE) != 0) printf("\n");
+
+		printf("  %i module(s), run with their arguments as typed.\n", mods);
+	}
 
 	printf("Programs in %s, typed by name without the extension:\n", BIN_DIR);
 

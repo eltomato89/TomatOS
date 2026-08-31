@@ -8,7 +8,14 @@ build/
 # legacy/tools/). The batch files next to it ARE tracked -- they are small and
 # they document how the project used to be built.
 legacy/tools/
-tools/
+
+# NOT a bare "tools/". That pattern has no slash in front of it, so git matches
+# it at EVERY depth, and the top level tools/ directory -- which holds the
+# scripts the Makefile invokes -- became invisible. Nothing errors when that
+# happens: "git add" says nothing, "git status" shows a clean tree, and the
+# file is simply not in the commit. It cost one script already, and the way it
+# announced itself was "git rm" reporting that the file it was looking at
+# matched nothing.
 
 # Editor and OS droppings
 .DS_Store

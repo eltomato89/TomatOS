@@ -46,17 +46,35 @@ extern const char *exec_module_name(int index);
 /* Size of a module in bytes. */
 extern uint32_t exec_module_size(int index);
 
-/* Index of the module with that name, or -1. */
+/* Index of the module with that name, or -1. Modules only: nothing on a
+*  filesystem is looked at, which is what a caller wants that has already
+*  searched the disk itself and knows the /BIN convention this file does not.
+*
+*  Names are matched by meaning rather than by spelling -- case is folded and
+*  a trailing ".elf" is ignored -- so "hello", "HELLO" and "hello.elf" all
+*  find the module the bootloader called "hello". That is deliberate: the same
+*  program is HELLO.ELF on a FAT volume and "hello" as a module, and which
+*  medium a machine booted from must not change what has to be typed. */
+extern int exec_module_lookup(const char *name);
+
+/* Index of the module with that name, or -- when there is a mounted volume
+*  and no such module -- of a file of that name registered on the way out.
+*  -1 if neither exists. The same name rules as exec_module_lookup(). */
 extern int exec_module_find(const char *name);
 
 /* Loads a module as a new ring 3 task and returns its pid, or a negative
 *  value on failure. The task is created suspended; the caller starts it
 *  with taskmgr_task_start(), which leaves room to inspect it first.
 *
+*  args is the rest of the command line as one string, or 0 when there is
+*  none, and is handled exactly as exec_spawn_path() handles it -- a program
+*  must not be able to tell from its own argv whether it was loaded out of a
+*  module or off a disk.
+*
 *  Everything the program needs is placed in its own address space before it
 *  ever runs -- which is the whole reason this exists as a separate step
 *  from taskmgr_add_user_task(). */
-extern int exec_spawn(int index, int prio);
+extern int exec_spawn(int index, const char *args, int prio);
 
 /* Loads the ELF file at path from the mounted volume as a new ring 3 task
 *  and returns its pid, or a negative value on failure, with the reason in

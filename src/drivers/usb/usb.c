@@ -88,6 +88,7 @@
 
 #include <system.h>
 #include <stdio.h>
+#include <pci.h>
 #include <usb.h>
 #include <uhci.h>
 
@@ -854,6 +855,131 @@ failed:
     return result;
 }
 
+/* --- What is on the bus that we cannot drive -----------------------------
+*
+*  This is the one place in this file that knows the bus underneath the
+*  controller exists, and it is here rather than in uhci.c on purpose: the
+*  question it answers is "what USB hardware does this machine have", which is
+*  a question about the machine and not about UHCI. It costs the layering
+*  nothing that matters -- usb.c already includes uhci.h to start the one
+*  controller it knows how to start -- and it buys the single most useful line
+*  the boot can print on a machine this kernel cannot serve.
+*
+*  Because "USB: no controller found" is a LIE on such a machine, and it is the
+*  expensive kind. A ThinkPad T430 has two EHCI controllers and an xHCI; that
+*  message tells whoever is looking at the screen that the PCI scan came up
+*  empty, which sends them to debug pci.c, which is fine. Saying "2x EHCI,
+*  1x xHCI found, this kernel drives UHCI only" tells them the truth in one
+*  line: the hardware is there, it was seen, and the missing piece is a driver.
+*
+*  All four interfaces live under one PCI class and are told apart ONLY by the
+*  programming interface byte. That byte is also what keeps uhci.c away from
+*  them: uhci_find() matches prog-if 0x00 exactly, so an EHCI is never handed
+*  to a driver that would write UHCI register offsets into it. */
+#define USB_PCI_CLASS       0x0C
+#define USB_PCI_SUBCLASS    0x03
+
+#define USB_PROGIF_UHCI     0x00
+#define USB_PROGIF_OHCI     0x10
+#define USB_PROGIF_EHCI     0x20
+#define USB_PROGIF_XHCI     0x30
+
+/* The order here is the order they are printed in, and the last entry is
+*  everything else -- prog-if 0x80 ("no specific interface") and 0xFE ("a USB
+*  device, not a host controller") both land there, and both are real values a
+*  machine can present. */
+enum
+{
+    USB_KIND_UHCI = 0,
+    USB_KIND_OHCI,
+    USB_KIND_EHCI,
+    USB_KIND_XHCI,
+    USB_KIND_OTHER,
+    USB_KIND_COUNT
+};
+
+static const char *usb_kind_name[USB_KIND_COUNT] =
+{
+    "UHCI", "OHCI", "EHCI", "xHCI", "unknown"
+};
+
+static int usb_kind_of(uint8_t prog_if)
+{
+    switch(prog_if)
+    {
+        case USB_PROGIF_UHCI: return USB_KIND_UHCI;
+        case USB_PROGIF_OHCI: return USB_KIND_OHCI;
+        case USB_PROGIF_EHCI: return USB_KIND_EHCI;
+        case USB_PROGIF_XHCI: return USB_KIND_XHCI;
+        default:              break;
+    }
+
+    return USB_KIND_OTHER;
+}
+
+/* One line, whatever the machine turns out to have. Called only when nothing
+*  registered itself, so everything counted here is by definition something
+*  this kernel did not bring up. */
+static void usb_report_unusable(void)
+{
+    const pci_device *d;
+    int count[USB_KIND_COUNT];
+    int total;
+    int kind;
+    int listed;
+    int i;
+    int n;
+
+    for(kind = 0; kind < USB_KIND_COUNT; kind++)
+        count[kind] = 0;
+
+    total = 0;
+    n     = pci_count();
+
+    for(i = 0; i < n; i++)
+    {
+        d = pci_get(i);
+        if(d == 0)
+            continue;
+        if(d->class_code != USB_PCI_CLASS || d->subclass != USB_PCI_SUBCLASS)
+            continue;
+
+        count[usb_kind_of(d->prog_if)]++;
+        total++;
+    }
+
+    if(total == 0)
+    {
+        /* The ordinary outcome on a machine QEMU started without a controller.
+        *  Nothing was found because nothing is there, and that is all the
+        *  screen needs to say. */
+        printf("USB: no controller found\n");
+        return;
+    }
+
+    printf("USB: ");
+    listed = 0;
+    for(kind = 0; kind < USB_KIND_COUNT; kind++)
+    {
+        if(count[kind] == 0)
+            continue;
+
+        printf("%s%dx %s", (listed++ == 0) ? "" : ", ", count[kind],
+               usb_kind_name[kind]);
+    }
+
+    /* A UHCI in that list is a different failure from all the others: it is
+    *  hardware this kernel does drive, so it was tried and something went
+    *  wrong. uhci_info() is where the reason is and "lsusb" prints it -- a
+    *  whole boot line spent on it would push something else off a 25 row
+    *  screen, and this is the one case where the machine is still usable
+    *  enough to type a command. */
+    if(count[USB_KIND_UHCI] > 0)
+        printf(" found, none usable (\"lsusb\" says why)\n");
+    else
+        printf(" found, this kernel drives UHCI only\n");
+}
+
 /* --- Bringing the whole thing up ----------------------------------------- */
 
 void usb_init(void)
@@ -869,11 +995,11 @@ void usb_init(void)
 
     if(!usb_hc)
     {
-        /* The ordinary outcome on a machine QEMU started without a controller,
-        *  and on any machine built in the last decade, which has xHCI and
-        *  nothing this kernel drives. Nothing here may keep the boot from
-        *  finishing. */
-        printf("USB: no controller found\n");
+        /* The ordinary outcome on any machine built in the last decade, which
+        *  has EHCI and xHCI and nothing this kernel drives. Nothing here may
+        *  keep the boot from finishing: the report is a printf over a table
+        *  the PCI scan already filled in, and touches no hardware at all. */
+        usb_report_unusable();
         return;
     }
 

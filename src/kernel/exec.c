@@ -142,6 +142,19 @@
 *  bootloader command line and are only ever compared and printed. */
 #define EXEC_NAME_MAX   32
 
+/* What module_name_from_cmdline() was able to make of a command line.
+*
+*  Anything other than EXEC_NAME_OK means the name now in the table is not the
+*  one the bootloader wrote: it is a placeholder, or it is the front of a
+*  string that did not fit. That matters to somebody sitting in front of the
+*  machine, because a name the kernel had to invent or cut short is a name
+*  that cannot be typed - so exec_init() prints the reason rather than leaving
+*  a module that quietly answers to nothing. */
+#define EXEC_NAME_OK    0
+#define EXEC_NAME_NONE  1	/* no command line, or one outside the mapping */
+#define EXEC_NAME_BLANK 2	/* a command line of nothing but blanks        */
+#define EXEC_NAME_CUT   3	/* first word longer than the buffer holds     */
+
 /* Same size as task_settings.error, so an error can be handed to
 *  taskmgr_task_abort() without being truncated there. */
 #define EXEC_ERROR_MAX  128
@@ -309,6 +322,77 @@ static void name_from_path(const char *path, char *dest, int max)
 		copy_bounded(dest, path + last + 1, max);
 }
 
+/* --- What counts as the same program name --------------------------------
+*
+*  One program has two names on this machine, and they are not spelled the
+*  same. On a FAT volume it is HELLO.ELF, upper case with an extension,
+*  because that is the only thing mcopy can write as an 8.3 short name and
+*  fat.c skips the long name entries. As a module it is whatever word the
+*  bootloader's command line begins with, and both grub.cfg and our own stage
+*  2 write that in lower case and without an extension. A user types neither
+*  of those. A user types "hello".
+*
+*  So names are compared by what they mean rather than by how they are
+*  spelled: case is folded, and a trailing ".elf" is not part of the name at
+*  all. The extension belongs to the mechanism that stores the program, and
+*  the mechanism is precisely what differs between the two places a program
+*  can come from - making it decide whether a command exists would be letting
+*  the boot medium rename the program.
+*
+*  This is what keeps the two lookups from disagreeing. The shell turns a
+*  typed word into /BIN/NAME.ELF for the file half; the module half now
+*  answers to the same four spellings - "hello", "HELLO", "hello.elf" and
+*  "HELLO.ELF" - so a machine that runs a program off the disk and a machine
+*  that runs the same program out of a module are typed at identically. */
+
+/* ASCII case folding, which is all these names need: everything outside
+*  A..Z is already what it has to be. */
+static char name_fold(char c)
+{
+	if (c >= 'A' && c <= 'Z') return (char)(c - 'A' + 'a');
+
+	return c;
+}
+
+/* Length of a name with a trailing ".elf" taken off, in any mixture of case.
+*  A name that is nothing BUT the extension keeps it: ".elf" is a strange
+*  thing to call a program, but it is a name, and stripping it would leave
+*  nothing left to compare. */
+static int name_len_bare(const char *name)
+{
+	int n;
+
+	n = (int)strlen(name);
+
+	if (n > 4 && name[n - 4] == '.' &&
+	    name_fold(name[n - 3]) == 'e' &&
+	    name_fold(name[n - 2]) == 'l' &&
+	    name_fold(name[n - 1]) == 'f')
+		n -= 4;
+
+	return n;
+}
+
+/* Non-zero if the two names stand for the same program under the rules
+*  above. An empty name matches nothing, not even another empty one - a word
+*  that is not there cannot name a program. */
+static int name_equal(const char *a, const char *b)
+{
+	int len;
+	int i;
+
+	len = name_len_bare(a);
+
+	if (len == 0 || len != name_len_bare(b)) return 0;
+
+	for (i = 0; i < len; i++)
+	{
+		if (name_fold(a[i]) != name_fold(b[i])) return 0;
+	}
+
+	return 1;
+}
+
 /* Non-zero if [phys, phys + len) lies inside the window P2V() describes.
 *  Written without an addition that could wrap: the length is compared
 *  against the room left above phys, not against phys + len. */
@@ -324,8 +408,13 @@ static int phys_range_ok(uint32_t phys, uint32_t len)
 /* First word of a module command line, which is what the kernel uses as the
 *  module's name. The command line address is physical and may be absent,
 *  outside the direct mapping or not terminated at all - all three end up as
-*  "?" rather than as a fault. */
-static void module_name_from_cmdline(uint32_t phys, char *dest)
+*  "?" rather than as a fault.
+*
+*  The return value is one of the EXEC_NAME_* codes and says whether dest is
+*  the name the bootloader wrote or something this function had to invent. The
+*  caller is the one that can put a module number to it, so the complaining is
+*  done there and not here. */
+static int module_name_from_cmdline(uint32_t phys, char *dest)
 {
 	const char *cmd;
 	uint32_t    room;
@@ -335,7 +424,7 @@ static void module_name_from_cmdline(uint32_t phys, char *dest)
 
 	copy_bounded(dest, "?", EXEC_NAME_MAX);
 
-	if (phys == 0 || phys > DIRECT_MAP_LIMIT) return;
+	if (phys == 0 || phys > DIRECT_MAP_LIMIT) return EXEC_NAME_NONE;
 
 	/* Never read past the end of the direct mapping, however long the
 	*  string claims to be. */
@@ -349,7 +438,7 @@ static void module_name_from_cmdline(uint32_t phys, char *dest)
 	while (start < limit && (cmd[start] == ' ' || cmd[start] == '\t'))
 		start++;
 
-	if (start >= limit || cmd[start] == '\0') return;	/* only blanks */
+	if (start >= limit || cmd[start] == '\0') return EXEC_NAME_BLANK;
 
 	for (i = 0; start + i < limit && i < EXEC_NAME_MAX - 1; i++)
 	{
@@ -361,6 +450,21 @@ static void module_name_from_cmdline(uint32_t phys, char *dest)
 	}
 
 	dest[i] = '\0';
+
+	/* The loop can stop for three reasons and only one of them leaves a
+	*  whole name behind: the word ended. If instead the buffer ran out, or
+	*  the readable window did, what is in dest is the front of a longer
+	*  name. Clamped rather than refused - the module is perfectly loadable
+	*  and a program nobody can name is still better than no program at all -
+	*  but the caller has to be able to say so, because what is now in the
+	*  table is not what anybody would type. */
+	if (start + i >= limit) return EXEC_NAME_CUT;
+
+	if (cmd[start + i] != '\0' && cmd[start + i] != ' ' &&
+	    cmd[start + i] != '\t')
+		return EXEC_NAME_CUT;
+
+	return EXEC_NAME_OK;
 }
 
 void exec_init(multiboot_info *mbi)
@@ -371,6 +475,7 @@ void exec_init(multiboot_info *mbi)
 	uint32_t          start;
 	uint32_t          end;
 	uint32_t          i;
+	int               named;
 
 	module_count = 0;
 	exec_set_error("");
@@ -420,10 +525,36 @@ void exec_init(multiboot_info *mbi)
 			continue;
 		}
 
+		/* Everything the kernel keeps is copied out here, and that is the
+		*  point of this loop. The descriptor array belongs to the
+		*  bootloader and nothing below promises it stays where it is, so
+		*  no pointer into it survives this function: start and size are
+		*  values, and the name is a copy in the table's own buffer rather
+		*  than a pointer to the command line. What the kernel cannot copy
+		*  is the module's contents - they are far too big to duplicate and
+		*  are used in place - which is why pmm_init() locks the module
+		*  list, every module's bytes and every command line before the
+		*  frame allocator ever hands anything out. */
 		modules[module_count].start = start;
 		modules[module_count].size  = end - start;
-		module_name_from_cmdline(mods[i].cmdline,
-		                         modules[module_count].name);
+
+		named = module_name_from_cmdline(mods[i].cmdline,
+		                                 modules[module_count].name);
+
+		/* A module with no usable name is loadable but not typable, so
+		*  the reason is printed rather than left to be discovered as
+		*  "no module called that". */
+		if (named == EXEC_NAME_NONE)
+			printf("EXEC: module %d has no readable command line, it is called \"?\"\n",
+			       (int)i);
+		else if (named == EXEC_NAME_BLANK)
+			printf("EXEC: module %d has a blank command line, it is called \"?\"\n",
+			       (int)i);
+		else if (named == EXEC_NAME_CUT)
+			printf("EXEC: module %d has a name longer than the %d characters kept, shortened to \"%s\"\n",
+			       (int)i, (int)(EXEC_NAME_MAX - 1),
+			       modules[module_count].name);
+
 		module_count++;
 	}
 }
@@ -538,6 +669,29 @@ uint32_t exec_module_size(int index)
 	return modules[index].size;
 }
 
+/* A module of that name, and nothing else. Separate from exec_module_find()
+*  because the shell already does its own, better, file lookup: it knows the
+*  /BIN convention and turns a typed word into the 8.3 path a FAT volume can
+*  actually hold, which this file deliberately does not know about. A caller
+*  that has already asked the disk and been told no wants the remaining half
+*  of the question answered, not the same half asked again in a weaker form.
+*
+*  Matching is by name_equal(), so case and a ".elf" extension do not decide
+*  whether a command exists. */
+int exec_module_lookup(const char *name)
+{
+	int i;
+
+	if (name == 0) return -1;
+
+	for (i = 0; i < module_count; i++)
+	{
+		if (name_equal(modules[i].name, name)) return i;
+	}
+
+	return -1;
+}
+
 /* A module of that name, or - since there is a filesystem - a file of that
 *  name on the mounted volume. Modules win, because they are the ones a
 *  "module" line in grub.cfg deliberately put there.
@@ -548,14 +702,12 @@ uint32_t exec_module_size(int index)
 *  describe it either way. */
 int exec_module_find(const char *name)
 {
-	int i;
+	int index;
 
 	if (name == 0) return -1;
 
-	for (i = 0; i < module_count; i++)
-	{
-		if (strcmp(modules[i].name, name) == 0) return i;
-	}
+	index = exec_module_lookup(name);
+	if (index >= 0) return index;
 
 	return file_lookup(name);
 }
@@ -1300,7 +1452,10 @@ static int stack_build(addrspace_t space, uint32_t page, const char *name,
 *  stack, the entry point set. Returns the pid, or -1 with last_error set.
 *
 *  args is the command line behind the program name and may be 0, which is
-*  what a module started with "exec NAME" passes. The argument block is built
+*  what "exec NAME" passes - its syntax has no room for arguments. A module
+*  started by typing its name gets the rest of the line exactly as a file
+*  does; where the bytes came from is not something a program should be able
+*  to tell from its own argv. The argument block is built
 *  either way - a program compiled as void _start(int argc, char **argv)
 *  reads [esp+4] and [esp+8] whether it was given anything or not, so a path
 *  that skipped this would hand it two words of whatever the stack page ends
@@ -1438,7 +1593,7 @@ int exec_spawn_path(const char *path, const char *args, int prio)
 	return pid;
 }
 
-int exec_spawn(int index, int prio)
+int exec_spawn(int index, const char *args, int prio)
 {
 	exec_image  img;
 	exec_file  *f;
@@ -1449,7 +1604,7 @@ int exec_spawn(int index, int prio)
 	*  module. It is handed on rather than duplicated here - the loader is
 	*  the same one, only the source of the bytes differs. */
 	f = file_at(index);
-	if (f != 0) return exec_spawn_path(f->path, 0, prio);
+	if (f != 0) return exec_spawn_path(f->path, args, prio);
 
 	if (index < 0 || index >= module_count)
 	{
@@ -1467,5 +1622,5 @@ int exec_spawn(int index, int prio)
 	img.path = 0;
 	img.noun = "module";
 
-	return spawn_image(&img, modules[index].name, 0, prio);
+	return spawn_image(&img, modules[index].name, args, prio);
 }

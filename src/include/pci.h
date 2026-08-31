@@ -13,7 +13,24 @@
 
 #include "typedefs.h"
 
-#define PCI_MAX_DEVICES  32   /* how many we are willing to remember */
+/* How many functions the scan will remember.
+*
+*  RAISED FROM 32, AND THE MARGIN IS THE POINT. A ThinkPad T430 enumerates
+*  roughly 20 to 23 PCI functions on its own, which fit -- but a machine in an
+*  Ultrabase or a Mini Dock adds a bridge and the devices behind it, and that
+*  crosses 32. What happens then is worse than it sounds: the scan keeps
+*  walking and keeps counting, so the shortfall IS reported, but every driver
+*  looks the device up in the table and a controller that landed past the end
+*  is simply not there. Reproduced deliberately in an overloaded machine, the
+*  symptom was "USB: no controller found" printed with the controller sitting
+*  on the bus -- a line that sends whoever reads it to look at the USB driver
+*  for a fault in the PCI scan.
+*
+*  Sixty-four costs 36 bytes per entry, so 1152 bytes of .bss over the old
+*  value. That is a cheap price for a failure mode whose message points at the
+*  wrong file. It is still a bound rather than a promise: the report line stays
+*  the thing to read when a device is missing. */
+#define PCI_MAX_DEVICES  64
 
 /* Config space registers we care about */
 #define PCI_VENDOR_ID    0x00

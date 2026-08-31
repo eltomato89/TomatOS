@@ -74,6 +74,12 @@ DISK        := $(BUILD_DIR)/tomatos_disk.img
 LINKER_SCRIPT      := linker.ld
 USER_LINKER_SCRIPT := $(USER_DIR)/user.ld
 
+# Helper scripts that are too long to be recipes. The usb-boot one is almost
+# entirely refusals, and a refusal is only worth having if the reason it
+# exists is written next to it -- see the target near the bottom of this file.
+TOOLS_DIR   := tools
+USB_BOOT_SH := $(TOOLS_DIR)/usb-boot.sh
+
 # ---------------------------------------------------------------------------
 #  Tools
 # ---------------------------------------------------------------------------
@@ -477,6 +483,62 @@ S2HDR_MAGIC_DISK_OFF   := $(shell expr $(STAGE2_LBA) \* 512 + $(S2HDR_MAGIC_OFF)
 S2HDR_SECTORS_DISK_OFF := $(shell expr $(STAGE2_LBA) \* 512 + $(S2HDR_SECTORS_OFF))
 
 # ---------------------------------------------------------------------------
+#  >>> HOW THE USER PROGRAMS REACH STAGE 2 <<<
+#  >>> the second half of the same contract; boot/layout.inc states it, <<<
+#  >>> this file writes it, boot/stage2.asm reads it <<<
+#
+#  Same mechanism as the kernel's length above, for the same reason: stage 2
+#  cannot look a file up, so the build writes down where the bytes are.
+#
+#  Why the programs are on the disk TWICE -- once as /BIN/*.ELF in the FAT
+#  volume and once as raw sectors from LBA $(MODULES_LBA) -- is argued at
+#  length in boot/layout.inc, and it is not redundancy. On the machine this
+#  boot chain exists for, a ThinkPad T430, the kernel cannot read the stick it
+#  booted from: its ATA driver speaks port I/O to IDE and SATA, and its USB
+#  mass storage driver reaches the bus through UHCI, which Panther Point
+#  replaced with EHCI and xHCI. /BIN would be unreachable and the shell would
+#  come up with no commands at all. The BIOS has no such problem -- int 13h is
+#  how stage 1 and stage 2 got there -- so stage 2 reads the programs while
+#  int 13h is still available and hands them over as Multiboot modules, the
+#  path the kernel already implements for GRUB and for "-kernel". /BIN stays
+#  for the machines where the ATA driver does work.
+#
+#      stage2.bin +$(S2HDR_MODCOUNT_OFF) .. +19   dd, how many modules follow
+#      stage2.bin +$(S2HDR_MODTAB_OFF) ..        $(MB_MODS_MAX) entries of $(S2MOD_ENTRY_SIZE) bytes:
+#                              +0   dd   first LBA of this module
+#                              +4   dd   its length in bytes
+#                              +8   16   its name, NUL padded
+#
+#  The name is deliberately the SAME string the grub.cfg in the iso rule
+#  writes: the bare lower case program name. The kernel takes the first word
+#  of a module's command line as the program's name, so "hello" has to be
+#  called "hello" whichever of the three boot paths brought it in -- otherwise
+#  the set of commands the shell offers would depend on how the machine was
+#  started, which is the kind of difference nobody thinks to look for.
+#
+#  Unlike the kernel's sector count there is no useful non-zero default here:
+#  an unpatched stage2.bin must come up with NO modules, not with sixteen
+#  garbage LBAs. That is why the $(STAGE2_BIN) rule insists the whole area is
+#  zero in what nasm produced -- see the check there.
+S2HDR_MODCOUNT_OFF := $(call layout_value,S2HDR_MODCOUNT_OFF,16)
+S2HDR_MODTAB_OFF   := $(call layout_value,S2HDR_MODTAB_OFF,20)
+S2MOD_ENTRY_SIZE   := $(call layout_value,S2MOD_ENTRY_SIZE,24)
+S2MOD_NAME_MAX     := $(call layout_value,S2MOD_NAME_MAX,16)
+MB_MODS_MAX        := $(call layout_value,MB_MODS_MAX,16)
+
+S2MOD_TABLE_BYTES  := $(shell expr $(MB_MODS_MAX) \* $(S2MOD_ENTRY_SIZE))
+
+# The count and the table together, as one span starting at the count. That
+# is the region the build writes and the region stage 2 has to reserve, so it
+# is also the region the "is it really reserved" check measures.
+S2HDR_MODAREA_BYTES := $(shell expr $(S2HDR_MODTAB_OFF) + $(S2MOD_TABLE_BYTES) \
+                                    - $(S2HDR_MODCOUNT_OFF))
+
+# Where those two live in the finished image.
+S2HDR_MODCOUNT_DISK_OFF := $(shell expr $(STAGE2_LBA) \* 512 + $(S2HDR_MODCOUNT_OFF))
+S2HDR_MODTAB_DISK_OFF   := $(shell expr $(STAGE2_LBA) \* 512 + $(S2HDR_MODTAB_OFF))
+
+# ---------------------------------------------------------------------------
 #  How big stage 2 is allowed to get
 #
 #  Two ceilings, and the lower one wins:
@@ -509,6 +571,45 @@ STAGE2_HEADROOM    := $(shell expr $(DISK_BUFFER) - $(STAGE2_ORG))
 STAGE2_MAX_BYTES   := $(shell if [ $(STAGE2_HEADROOM) -lt $(STAGE2_AREA_BYTES) ]; \
                               then echo $(STAGE2_HEADROOM); \
                               else echo $(STAGE2_AREA_BYTES); fi)
+
+# ---------------------------------------------------------------------------
+#  The sectors the modules live in, and the memory stage 2 reads them into
+#
+#  Read out of boot/layout.inc for the same reason the kernel's numbers are:
+#  the sector map has exactly one owner and it is not this file.
+#
+#  KERNEL_PHYS and MODULES_PHYS are here because the recipe for $(BOOTIMG)
+#  turns the sentence layout.inc writes about them -- "chosen so it cannot
+#  collide with the kernel by construction rather than by checking" -- into an
+#  actual check. Construction is only as good as the next person's arithmetic.
+MODULES_LBA         := $(call layout_value,MODULES_LBA,528)
+MODULES_MAX_SECTORS := $(call layout_value,MODULES_MAX_SECTORS,512)
+MODULES_MAX_BYTES   := $(shell expr $(MODULES_MAX_SECTORS) \* 512)
+
+KERNEL_PHYS         := $(or $(call layout_hex,KERNEL_PHYS),1048576)
+MODULES_PHYS        := $(or $(call layout_hex,MODULES_PHYS),1310720)
+
+# Where the kernel's load image ends in physical memory if it ever grows to
+# the largest size the sector map allows. Not where it ends today: the point
+# of the check is that a kernel which is allowed to reach KERNEL_MAX_SECTORS
+# must not be able to reach MODULES_PHYS, because stage 2 loads the modules
+# before anything would notice the overlap and the symptom is a triple fault
+# with an empty screen.
+KERNEL_PHYS_END     := $(shell expr $(KERNEL_PHYS) + $(KERNEL_MAX_BYTES))
+
+# ---------------------------------------------------------------------------
+#  The MBR partition table
+#
+#  Offsets from the IBM PC boot sector layout: four 16 byte entries at 446,
+#  then the 0x55AA signature at 510. Only the first entry is written; see the
+#  long block in the $(BOOTIMG) recipe for what goes in it and why a partition
+#  that starts at LBA 0 is the right answer on this image.
+MBR_PART_OFF        := 446
+MBR_PART_SIZE       := 16
+
+# 0x0E, "W95 FAT16 (LBA)". See the recipe for why this and not 0x06.
+MBR_PART_TYPE       := 14
+MBR_PART_ACTIVE     := 128
 
 # How the boot image is handed to QEMU: the same IDE 0 master the kernel's
 # ata.c talks to, only now the BIOS boots from it as well. No -kernel, no
@@ -676,7 +777,7 @@ endef
 #  Targets
 # ===========================================================================
 .PHONY: all user run iso run-iso floppy run-floppy disk bootdisk run-bootdisk \
-        debug usb clean help
+        debug usb usb-boot clean help
 
 all: $(KERNEL) user
 
@@ -1016,7 +1117,36 @@ $(STAGE2_BIN): $(STAGE2_SRC) $(BOOT_INCS) | $(BUILD_DIR)
 		printf '       s2_kernel_sectors block at the top of %s.\n\n' '$<'; \
 		rm -f $@; exit 1; \
 	 fi; \
-	 echo "  Stage 2: $$sz / $(STAGE2_MAX_BYTES) bytes used, header magic OK"
+	 if [ "$$sz" -lt "$(shell expr $(S2HDR_MODCOUNT_OFF) + $(S2HDR_MODAREA_BYTES))" ]; then \
+		printf '\nERROR: %s is %s bytes, too short to hold the module table.\n' '$@' "$$sz"; \
+		printf '       The table alone needs offsets %s..%s.\n\n' \
+		       '$(S2HDR_MODCOUNT_OFF)' \
+		       "`expr $(S2HDR_MODCOUNT_OFF) + $(S2HDR_MODAREA_BYTES) - 1`"; \
+		rm -f $@; exit 1; \
+	 fi; \
+	 area=`od -An -tx1 -j $(S2HDR_MODCOUNT_OFF) -N $(S2HDR_MODAREA_BYTES) -v $@ \
+	       | tr -d ' \n'`; \
+	 if [ "$$area" != "`printf '%0*d' $$(( $(S2HDR_MODAREA_BYTES) * 2 )) 0`" ]; then \
+		printf '\nERROR: offsets %s..%s of %s are not reserved.\n' \
+		       '$(S2HDR_MODCOUNT_OFF)' \
+		       "`expr $(S2HDR_MODCOUNT_OFF) + $(S2HDR_MODAREA_BYTES) - 1`" '$@'; \
+		printf '       The boot image rule is about to write a dword module count\n'; \
+		printf '       at %s and %s entries of %s bytes at %s over them. Those bytes\n' \
+		       '$(S2HDR_MODCOUNT_OFF)' '$(MB_MODS_MAX)' '$(S2MOD_ENTRY_SIZE)' \
+		       '$(S2HDR_MODTAB_OFF)'; \
+		printf '       are non-zero, which means they are still code or data that\n'; \
+		printf '       stage 2 needs -- patching them would replace instructions.\n'; \
+		printf '       boot/layout.inc defines the table; %s has to\n' '$<'; \
+		printf '       reserve it right behind s2_kernel_sectors, zero filled:\n'; \
+		printf '           s2_mod_count: dd 0\n'; \
+		printf '           s2_mod_table: times MB_MODS_MAX * S2MOD_ENTRY_SIZE db 0\n'; \
+		printf '       Zero and not a default: unlike the kernel sector count, an\n'; \
+		printf '       unpatched stage 2 must come up with NO modules rather than\n'; \
+		printf '       with sixteen garbage LBAs.\n\n'; \
+		rm -f $@; exit 1; \
+	 fi; \
+	 echo "  Stage 2: $$sz / $(STAGE2_MAX_BYTES) bytes used, header magic OK," \
+	      "$(S2HDR_MODAREA_BYTES) bytes reserved for $(MB_MODS_MAX) modules"
 
 # --- the kernel as a flat image --------------------------------------------
 # objcopy -O binary walks the ALLOC sections and places each one at
@@ -1118,6 +1248,118 @@ $(BOOTIMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_BIN) $(STAGING_STAMP) Makefile 
 	@echo "  BOOT    LBA 0        stage 1  (jump + code, BPB preserved)"
 	@dd if=$(STAGE1_BIN) of=$@ bs=1 count=3 conv=notrunc status=none
 	@dd if=$(STAGE1_BIN) of=$@ bs=1 skip=62 seek=62 count=450 conv=notrunc status=none
+	@# ---------------------------------------------------------------------
+	@#  The MBR partition table
+	@#
+	@#  WHY IT EXISTS. Without it this image is a "superfloppy": a filesystem
+	@#  at LBA 0 and bytes 446..509 all zero. SeaBIOS boots that from USB
+	@#  quite happily, so no amount of testing in QEMU says anything about the
+	@#  case that matters. Many real BIOSes will only offer a USB stick in the
+	@#  boot menu at all when it carries a partition table with an active
+	@#  partition -- that table is what tells them to treat the stick as a
+	@#  hard disk rather than as a floppy or as nothing. The ThinkPad T430
+	@#  this whole boot chain exists for is a likely case, and the failure it
+	@#  produces is a stick that simply never appears in the menu, with no
+	@#  message to search for.
+	@#
+	@#  WHY IT IS WRITTEN AFTER STAGE 1 AND NOT CARVED OUT OF IT. The dd above
+	@#  covers bytes 62..511, so on its way past it stamps zeros over 446..509
+	@#  -- stage 1's own image has nothing there. The alternative is to stop
+	@#  that dd short at 446 (count=384) and leave the area to mformat, which
+	@#  then needs a third dd for the 0x55AA at 510..511 that stage 1 carries.
+	@#  Letting it run and writing the entry afterwards is one dd instead of
+	@#  two, keeps the boot signature coming from stage 1 where the check at
+	@#  the end of this recipe expects it, and has a useful side effect: the
+	@#  three unused entries are provably zero rather than merely believed to
+	@#  be, because they were overwritten a line ago.
+	@#
+	@#  Stage 1 neither moves nor shrinks for this. Its code ends at offset
+	@#  314 and the table starts at 446, so 131 bytes sit unused in between;
+	@#  the boot sector is not the tight thing on this image.
+	@#
+	@#  THE AWKWARD PART, said plainly: the FAT boot sector IS the MBR here,
+	@#  so the partition has to start at LBA 0 and therefore contains the very
+	@#  sector that describes it. That is not how anyone lays out a disk on
+	@#  purpose -- a first partition normally starts at 2048 -- and fdisk will
+	@#  point out the overlap.
+	@#
+	@#  It has one measured consequence worth knowing before someone reports
+	@#  it as a bug. "fdisk -l" and "sfdisk --dump" read the table and print
+	@#  it; "partx --show" and "blkid -p -s PTTYPE" report no partition table
+	@#  at all. That is NOT the LBA 0 start -- moving the entry to LBA 1 does
+	@#  not help, and defacing the BPB while leaving the entry at LBA 0 makes
+	@#  partx list it immediately. libblkid simply refuses to look for a
+	@#  partition table on anything whose first sector is a filesystem, which
+	@#  this image is by design. Nothing in the boot path consults libblkid:
+	@#  the BIOS reads these sixteen bytes itself, and the kernel reads the
+	@#  BPB. The alternative layout above would fix the cosmetics and nothing
+	@#  else.
+	@#
+	@#  It is still the right trade, because the alternative is a real MBR at
+	@#  LBA 0 that chainloads a volume boot record at 2048, and that costs:
+	@#
+	@#    - stage 1 splits in two. An MBR half that walks the table for the
+	@#      active entry and loads its first sector, and a VBR half that is
+	@#      what stage 1 is today. Two boot sectors to keep in step.
+	@#    - every LBA in boot/layout.inc becomes partition relative, and both
+	@#      stage 1 and stage 2 have to add the partition base to every read.
+	@#      The numbers stop being checkable with dd and xxd from outside.
+	@#    - the kernel's fat_mount() reads the BPB at LBA 0. It would have to
+	@#      parse a partition table first, which is a FAT driver learning
+	@#      about partitioning for the benefit of nothing but the boot.
+	@#    - mformat's -H 0 becomes -H 2048, and the BPB hidden-sectors field
+	@#      starts to matter to code that today does not read it.
+	@#
+	@#  Four moving parts, three of them in assembly, to buy nothing the BIOS
+	@#  looks at: it reads this table for the active flag and the geometry,
+	@#  then loads LBA 0 and jumps, exactly as it does now.
+	@#
+	@#  TYPE 0x0E, "W95 FAT16 (LBA)", not 0x06. Stage 1 already requires the
+	@#  int 13h extensions -- it calls AH=41h and refuses to go on without
+	@#  them, then reads with AH=42h -- so a table advertising the CHS-only
+	@#  0x06 would be describing a disk this boot chain cannot boot from
+	@#  anyway. 0x0E is also what a current fdisk writes for a FAT16 stick,
+	@#  which matters when the user checks our table against a known good one.
+	@#
+	@#  CHS FILLED IN HONESTLY, not with the 0xFE 0xFF 0xFF "look it up via
+	@#  LBA" filler. The geometry block near the top of this file already
+	@#  constrains the image to heads <= 16 and sectors <= 63 so that CHS
+	@#  stays legal for a BIOS, so the true values exist and are exact. The
+	@#  filler is for volumes CHS cannot express; using it here would throw
+	@#  away information a CHS-only BIOS could still act on, in exchange for
+	@#  nothing. The check below is what keeps that claim true.
+	@set -e; \
+	 last=`expr $(DISK_TOTAL_SECS) - 1`; \
+	 track=`expr $(DISK_HEADS) \* $(DISK_SECS)`; \
+	 cyl=`expr $$last / $$track`; rem=`expr $$last % $$track`; \
+	 hd=`expr $$rem / $(DISK_SECS)`; sc=`expr $$rem % $(DISK_SECS) + 1`; \
+	 if [ "$$cyl" -gt 1023 ]; then \
+		printf '\nERROR: LBA %s is cylinder %s, and CHS stops at 1023.\n' \
+		       "$$last" "$$cyl"; \
+		printf '       The geometry C/H/S %s/%s/%s no longer fits a partition\n' \
+		       '$(DISK_CYLS)' '$(DISK_HEADS)' '$(DISK_SECS)'; \
+		printf '       entry. Either shrink the image or write the conventional\n'; \
+		printf '       0xFE 0xFF 0xFF filler into both CHS fields instead, which\n'; \
+		printf '       tells a BIOS to go by the LBA fields alone.\n\n'; \
+		exit 1; \
+	 fi; \
+	 printf '%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x' \
+	        $(MBR_PART_ACTIVE) 0 1 0 \
+	        $(MBR_PART_TYPE) $$hd $$(( sc | ((cyl >> 8) << 6) )) $$(( cyl & 255 )) \
+	        0 0 0 0 \
+	        $$(( $(DISK_TOTAL_SECS) & 255 )) $$(( $(DISK_TOTAL_SECS) >> 8 & 255 )) \
+	        $$(( $(DISK_TOTAL_SECS) >> 16 & 255 )) $$(( $(DISK_TOTAL_SECS) >> 24 & 255 )) \
+	   | xxd -r -p > $@.mbr; \
+	 dd if=$@.mbr of=$@ bs=1 seek=$(MBR_PART_OFF) conv=notrunc status=none; \
+	 rm -f $@.mbr; \
+	 got=`od -An -tu1 -j $(MBR_PART_OFF) -N 5 -v $@ | tr -s ' ' | sed 's/^ //'`; \
+	 [ "$$got" = "$(MBR_PART_ACTIVE) 0 1 0 $(MBR_PART_TYPE)" ] || { \
+		printf '\nERROR: partition entry reads back as "%s", expected "%s".\n\n' \
+		       "$$got" '$(MBR_PART_ACTIVE) 0 1 0 $(MBR_PART_TYPE)'; \
+		exit 1; \
+	 }; \
+	 echo "  BOOT    off $(MBR_PART_OFF)  partition 1  active, type 0x0e," \
+	      "LBA 0 + $(DISK_TOTAL_SECS), CHS 0/0/1 - $$cyl/$$hd/$$sc"
 	@echo "  BOOT    LBA $(STAGE2_LBA)        stage 2  (`stat -c%s $(STAGE2_BIN)` bytes)"
 	@dd if=$(STAGE2_BIN) of=$@ bs=512 seek=$(STAGE2_LBA) conv=notrunc status=none
 	@# Patch the kernel's length into stage 2's header ON THE DISK. See the
@@ -1147,6 +1389,181 @@ $(BOOTIMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_BIN) $(STAGING_STAMP) Makefile 
 	      "(stage2.bin itself keeps its $(KERNEL_MAX_SECTORS) default)"
 	@echo "  BOOT    LBA $(KERNEL_LBA)       kernel   (`stat -c%s $(KERNEL_BIN)` bytes, flat)"
 	@dd if=$(KERNEL_BIN) of=$@ bs=512 seek=$(KERNEL_LBA) conv=notrunc status=none
+	@# ---------------------------------------------------------------------
+	@#  Two things boot/layout.inc argues are true by construction, checked
+	@#  here so that a future edit to the layout trips over them.
+	@#
+	@#  The first one is asked of the LINKED KERNEL rather than of the sector
+	@#  budget, and that distinction is the whole value of the check. The
+	@#  obvious form -- KERNEL_PHYS plus KERNEL_MAX_SECTORS times 512 -- asks
+	@#  how long the IMAGE can be, and the image is not the kernel: .bss is
+	@#  NOBITS, it occupies no bytes on disk and every one of them in RAM.
+	@#  That version of this test passed while the modules sat inside .bss,
+	@#  and the kernel wiped five of seven of them clearing it. So the number
+	@#  comes out of the ELF's program headers, where memsz is the field that
+	@#  knows the difference.
+	@#
+	@#  The failure mode this prevents is the worst kind on the machine this
+	@#  is aimed at. In QEMU it hides: the shell finds the same programs on
+	@#  the FAT volume and runs them, and everything looks right. On a laptop
+	@#  that cannot read its own stick it is a shell with no commands.
+	@kend=`readelf -lW $(KERNEL) | awk '$$1=="LOAD"{print $$4"+"$$6}' | \
+	       { m=0; while read p; do e=$$(( $$p )); [ $$e -gt $$m ] && m=$$e; done; echo $$m; }`; \
+	 if [ "$$kend" -le 0 ]; then \
+		printf '\nERROR: could not read the load segments of %s.\n' '$(KERNEL)'; \
+		printf '       This check is what keeps the modules out of the kernel\n'; \
+		printf '       .bss, so it refuses rather than assuming they are clear.\n\n'; \
+		exit 1; \
+	 fi; \
+	 if [ "$$kend" -gt $(MODULES_PHYS) ]; then \
+		printf '\nERROR: the kernel and the modules overlap in memory.\n'; \
+		printf '       %s reaches physical %s (0x%X) once .bss is counted,\n' \
+		       '$(KERNEL)' "$$kend" "$$kend"; \
+		printf '       but MODULES_PHYS is %s.\n' '$(MODULES_PHYS)'; \
+		printf '       Raise MODULES_PHYS in boot/layout.inc above that, on a\n'; \
+		printf '       page boundary. Note this is the LINKED size including\n'; \
+		printf '       .bss, not the sector budget -- do not compare it against\n'; \
+		printf '       KERNEL_MAX_SECTORS.\n\n'; \
+		exit 1; \
+	 fi
+	@# The same statement about the disk rather than about memory: the module
+	@# region has to end at or before the first sector of the FAT16 volume,
+	@# because mformat has already written a filesystem there and dd would not
+	@# notice it was overwriting one.
+	@if [ `expr $(MODULES_LBA) + $(MODULES_MAX_SECTORS)` -gt $(RESERVED_SECTORS) ]; then \
+		printf '\nERROR: the module region runs into the filesystem.\n'; \
+		printf '       LBA %s plus %s sectors ends at %s, and the FAT16 volume\n' \
+		       '$(MODULES_LBA)' '$(MODULES_MAX_SECTORS)' \
+		       "`expr $(MODULES_LBA) + $(MODULES_MAX_SECTORS)`"; \
+		printf '       starts at LBA %s.\n' '$(RESERVED_SECTORS)'; \
+		printf '       Raise RESERVED_SECTORS in boot/layout.inc to match.\n\n'; \
+		exit 1; \
+	 fi
+	@# ---------------------------------------------------------------------
+	@#  The user programs, as raw sectors, plus the table in stage 2's header
+	@#  that finds them. See ">>> HOW THE USER PROGRAMS REACH STAGE 2 <<<" at
+	@#  the top of this file for why they are on the disk a second time.
+	@#
+	@#  Counted and measured before anything is written, because both of the
+	@#  ways this can go wrong go wrong LATE. A program past MB_MODS_MAX would
+	@#  simply not be in the table; a region past MODULES_MAX_SECTORS would be
+	@#  written straight through the filesystem. Either way the first symptom
+	@#  is exec_init() rejecting an ELF whose header turned out to be somebody
+	@#  else's data, one boot and several layers away from the cause.
+	@set -e; \
+	 n=0; secs=0; \
+	 for p in $(USER_PROGS); do \
+	   sz=`stat -c%s $(BUILD_DIR)/$$p.elf`; \
+	   n=$$((n + 1)); secs=$$((secs + (sz + 511) / 512)); \
+	   if [ $${#p} -ge $(S2MOD_NAME_MAX) ]; then \
+	     printf '\nERROR: module name "%s" is %s characters.\n' "$$p" "$${#p}"; \
+	     printf '       The name field is %s bytes and the kernel reads it as a\n' \
+	            '$(S2MOD_NAME_MAX)'; \
+	     printf '       command line, so it must end in a NUL: %s is the limit.\n\n' \
+	            "`expr $(S2MOD_NAME_MAX) - 1`"; \
+	     exit 1; \
+	   fi; \
+	 done; \
+	 if [ $$n -gt $(MB_MODS_MAX) ]; then \
+	   printf '\nERROR: %s programs in USER_PROGS, but the table holds %s.\n' \
+	          "$$n" '$(MB_MODS_MAX)'; \
+	   printf '       Truncating the list here would put a module on the disk\n'; \
+	   printf '       that nothing points at, and leave the shell missing a\n'; \
+	   printf '       command for reasons visible nowhere. Raise MB_MODS_MAX in\n'; \
+	   printf '       boot/layout.inc (MB_MODS at 0x7500 has room until 0x7600,\n'; \
+	   printf '       i.e. %s entries of MB_MOD_SIZE) or drop a program.\n\n' '16'; \
+	   exit 1; \
+	 fi; \
+	 if [ $$secs -gt $(MODULES_MAX_SECTORS) ]; then \
+	   printf '\nERROR: the modules need %s sectors, the region holds %s.\n' \
+	          "$$secs" '$(MODULES_MAX_SECTORS)'; \
+	   printf '       LBA %s .. %s in boot/layout.inc, %s bytes in total.\n' \
+	          '$(MODULES_LBA)' \
+	          "`expr $(MODULES_LBA) + $(MODULES_MAX_SECTORS) - 1`" \
+	          '$(MODULES_MAX_BYTES)'; \
+	   printf '       Raise MODULES_MAX_SECTORS and RESERVED_SECTORS together,\n'; \
+	   printf '       and check MODULES_PHYS still has that much room above it.\n\n'; \
+	   exit 1; \
+	 fi; \
+	 echo "  BOOT    LBA $(MODULES_LBA) ..    $$n modules, $$secs / $(MODULES_MAX_SECTORS) sectors"; \
+	 lba=$(MODULES_LBA); hex=''; \
+	 for p in $(USER_PROGS); do \
+	   sz=`stat -c%s $(BUILD_DIR)/$$p.elf`; \
+	   dd if=$(BUILD_DIR)/$$p.elf of=$@ bs=512 seek=$$lba conv=notrunc status=none; \
+	   dw=`printf '%02x%02x%02x%02x%02x%02x%02x%02x' \
+	       $$((lba & 255)) $$((lba >> 8 & 255)) \
+	       $$((lba >> 16 & 255)) $$((lba >> 24 & 255)) \
+	       $$((sz & 255)) $$((sz >> 8 & 255)) \
+	       $$((sz >> 16 & 255)) $$((sz >> 24 & 255))`; \
+	   nm=`printf '%s' "$$p" | od -An -tx1 -v | tr -d ' \n'`; \
+	   hex="$$hex$$dw$$nm"; \
+	   while [ $$(( $${#hex} % ($(S2MOD_ENTRY_SIZE) * 2) )) -ne 0 ]; do \
+	     hex="$${hex}00"; \
+	   done; \
+	   echo "  MOD     LBA $$lba   $$p  ($$sz bytes, name \"$$p\")"; \
+	   lba=$$((lba + (sz + 511) / 512)); \
+	 done; \
+	 while [ $${#hex} -lt $$(( $(S2MOD_TABLE_BYTES) * 2 )) ]; do hex="$${hex}00"; done; \
+	 magic=`dd if=$@ bs=1 skip=$(S2HDR_MAGIC_DISK_OFF) count=8 status=none`; \
+	 [ "$$magic" = '$(S2HDR_MAGIC)' ] || { \
+		printf '\nERROR: no "%s" magic at image offset %s.\n\n' \
+		       '$(S2HDR_MAGIC)' '$(S2HDR_MAGIC_DISK_OFF)'; \
+		exit 1; \
+	 }; \
+	 [ $$(( $(S2HDR_MODCOUNT_OFF) + 4 )) -eq $(S2HDR_MODTAB_OFF) ] || { \
+		printf '\nERROR: the module count at %s and the table at %s are not\n' \
+		       '$(S2HDR_MODCOUNT_OFF)' '$(S2HDR_MODTAB_OFF)'; \
+		printf '       adjacent, and this recipe writes them as one block.\n\n'; \
+		exit 1; \
+	 }; \
+	 printf '%02x%02x%02x%02x' \
+	        $$((n & 255)) $$((n >> 8 & 255)) \
+	        $$((n >> 16 & 255)) $$((n >> 24 & 255)) \
+	   | xxd -r -p > $@.mod; \
+	 printf '%s' "$$hex" | xxd -r -p >> $@.mod; \
+	 dd if=$@.mod of=$@ bs=1 seek=$(S2HDR_MODCOUNT_DISK_OFF) conv=notrunc status=none; \
+	 rm -f $@.mod; \
+	 echo "  BOOT    off $(S2HDR_MODCOUNT_DISK_OFF)   s2_mod_count = $$n," \
+	      "off $(S2HDR_MODTAB_DISK_OFF)  $(MB_MODS_MAX) x $(S2MOD_ENTRY_SIZE) byte table"
+	@# Read the table back OUT of the finished image and follow it, rather
+	@# than trusting the arithmetic that produced it. Cheap, and it is the
+	@# only place where "the table says LBA n" and "the program is at LBA n"
+	@# are ever compared -- stage 2 will believe the table without checking,
+	@# and by then the evidence is gone.
+	@set -e; \
+	 got=`od -An -tu4 -j $(S2HDR_MODCOUNT_DISK_OFF) -N 4 $@ | tr -d ' \n'`; \
+	 n=0; for p in $(USER_PROGS); do n=$$((n + 1)); done; \
+	 [ "$$got" = "$$n" ] || { \
+		printf '\nERROR: read back %s modules from image offset %s, wrote %s.\n\n' \
+		       "$$got" '$(S2HDR_MODCOUNT_DISK_OFF)' "$$n"; \
+		exit 1; \
+	 }; \
+	 i=0; \
+	 for p in $(USER_PROGS); do \
+	   e=$$(( $(S2HDR_MODTAB_DISK_OFF) + i * $(S2MOD_ENTRY_SIZE) )); \
+	   rlba=`od -An -tu4 -j $$e -N 4 $@ | tr -d ' \n'`; \
+	   rsz=`od -An -tu4 -j $$((e + 4)) -N 4 $@ | tr -d ' \n'`; \
+	   rnm=`dd if=$@ bs=1 skip=$$((e + 8)) count=$(S2MOD_NAME_MAX) status=none \
+	        | tr -d '\000'`; \
+	   sz=`stat -c%s $(BUILD_DIR)/$$p.elf`; \
+	   if [ "$$rsz" != "$$sz" ] || [ "$$rnm" != "$$p" ]; then \
+	     printf '\nERROR: entry %s of the module table says %s bytes named "%s",\n' \
+	            "$$i" "$$rsz" "$$rnm"; \
+	     printf '       expected %s bytes named "%s".\n\n' "$$sz" "$$p"; \
+	     exit 1; \
+	   fi; \
+	   dd if=$@ bs=512 skip=$$rlba count=$$(( (rsz + 511) / 512 )) status=none \
+	     | head -c $$rsz > $@.mod; \
+	   if ! cmp -s $@.mod $(BUILD_DIR)/$$p.elf; then \
+	     printf '\nERROR: the %s bytes at LBA %s are not %s.\n' \
+	            "$$rsz" "$$rlba" '$(BUILD_DIR)'/$$p.elf; \
+	     printf '       The table points somewhere the program is not.\n\n'; \
+	     rm -f $@.mod; exit 1; \
+	   fi; \
+	   rm -f $@.mod; \
+	   i=$$((i + 1)); \
+	 done; \
+	 echo "  BOOT    $$n modules verified against $(BUILD_DIR)/*.elf, byte for byte"
 	@# Prove the two-piece boot sector write did not break the BPB: if the
 	@# BPB were damaged mdir cannot locate the root directory and fails.
 	@$(MTOOLS_ENV) $(MDIR) -i $@ :: > /dev/null || { \
@@ -1211,6 +1628,29 @@ usb: $(ISO)
 	sudo dd if=$(ISO) of=$(DEV) bs=4M status=progress oflag=sync conv=fsync
 	@echo "  Done."
 
+# --- write the GRUB-free boot image to a USB stick -------------------------
+# Usage: make usb-boot DEV=/dev/sdX
+#
+# This is the one that matters on real hardware. $(BOOTIMG) carries our own
+# stage 1 at LBA 0, an MBR partition table so that a BIOS offers the stick as
+# a boot device at all, and the user programs as Multiboot modules in the
+# reserved sectors -- no GRUB anywhere, and nothing the kernel has to read
+# back off the stick once it is running.
+#
+# The refusals live in $(USB_BOOT_SH) rather than in this recipe, and there
+# are six of them. Each one gets a paragraph in that file saying which way of
+# losing a disk it prevents, and that reasoning does not survive being folded
+# into a recipe where every line ends in a backslash and every dollar is
+# doubled. The script is also runnable on its own, which is worth having when
+# the thing being debugged is the script.
+#
+# DEV is passed QUOTED. An unset DEV then reaches the script as an empty
+# second argument and is refused there, along with every other bad device,
+# instead of vanishing from the command line and shifting the image into the
+# device position -- which would put $(BOOTIMG) in front of dd's "of=".
+usb-boot: $(BOOTIMG)
+	@$(USB_BOOT_SH) $(BOOTIMG) '$(DEV)'
+
 # --- housekeeping ----------------------------------------------------------
 clean:
 	@echo "  RM      $(BUILD_DIR)"
@@ -1237,12 +1677,22 @@ help:
 	@echo "                LBA 0        stage 1, sharing the sector with the BPB"
 	@echo "                LBA $(STAGE2_LBA) .. $(shell expr $(STAGE2_LBA) + $(STAGE2_SECTORS) - 1)   stage 2"
 	@echo "                LBA $(KERNEL_LBA) .. $(shell expr $(KERNEL_LBA) + $(KERNEL_MAX_SECTORS) - 1)  kernel, flat (objcopy -O binary)"
-	@echo "                LBA $(RESERVED_SECTORS) ..    the filesystem proper"
+	@echo "                LBA $(MODULES_LBA) .. $(shell expr $(MODULES_LBA) + $(MODULES_MAX_SECTORS) - 1) the user programs, as Multiboot modules"
+	@echo "                LBA $(RESERVED_SECTORS) ..   the filesystem proper"
+	@echo "              plus an MBR partition table at offset $(MBR_PART_OFF): one active"
+	@echo "              entry, type 0x0e, spanning the volume. Many BIOSes only"
+	@echo "              offer a USB stick as a boot device when it has one."
 	@echo "  run-bootdisk"
 	@echo "              Boot that image in QEMU as a hard disk. No -kernel,"
 	@echo "              no -initrd, no GRUB: the BIOS starts stage 1."
 	@echo "  debug       Start QEMU halted with a GDB stub on :1234"
 	@echo "  usb         dd the ISO onto a USB stick: make usb DEV=/dev/sdX"
+	@echo "  usb-boot    dd $(BOOTIMG) onto a USB stick:"
+	@echo "                  make usb-boot DEV=/dev/sdX"
+	@echo "              The GRUB-free one, and the one for real hardware."
+	@echo "              $(USB_BOOT_SH) refuses a device that is not a"
+	@echo "              whole disk, not removable, not on the USB bus or has"
+	@echo "              something mounted, before it asks anything."
 	@echo "  clean       Remove $(BUILD_DIR)/"
 	@echo "  help        This text"
 	@echo ""
@@ -1294,6 +1744,15 @@ help:
 	@echo "      stage2.bin +0 .. +3    jmp s2_start"
 	@echo "      stage2.bin +$(S2HDR_MAGIC_OFF) .. +11   the magic \"$(S2HDR_MAGIC)\", checked, never written"
 	@echo "      stage2.bin +$(S2HDR_SECTORS_OFF) .. +15  dd, kernel size in sectors, patched"
+	@echo "      stage2.bin +$(S2HDR_MODCOUNT_OFF) .. +19  dd, how many modules follow, patched"
+	@echo "      stage2.bin +$(S2HDR_MODTAB_OFF) ..      $(MB_MODS_MAX) x $(S2MOD_ENTRY_SIZE) bytes: dd LBA, dd length,"
+	@echo "                             16 byte NUL padded name"
+	@echo "  The programs are on the disk twice: as /BIN/*.ELF for machines"
+	@echo "  whose disk the kernel can read, and as raw sectors from LBA"
+	@echo "  $(MODULES_LBA) for the ones where it cannot -- a T430 has no UHCI, so"
+	@echo "  the kernel cannot read the very stick it booted from, while the"
+	@echo "  BIOS can. Decode the table with:"
+	@echo "      xxd -s $(S2HDR_MODCOUNT_DISK_OFF) -l 64 $(BOOTIMG)"
 	@echo "  Patched at image offset $(S2HDR_SECTORS_DISK_OFF) (LBA $(STAGE2_LBA) + $(S2HDR_SECTORS_OFF)); $(STAGE2_BIN)"
 	@echo "  itself keeps its built-in default of $(KERNEL_MAX_SECTORS), so an unpatched"
 	@echo "  stage 2 still boots and just reads more than it needs."

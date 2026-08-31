@@ -1159,18 +1159,18 @@ int kernel(uint32_t magic, multiboot_info *mbi_phys)
 	*  kernel mapping of its own, so the rule above about page tables and
 	*  task spaces does not concern it.
 	*
-	*  One thing exec_init() cannot do, and this is a real hole: protect the
-	*  modules from the frame allocator. pmm_init() locks the multiboot info
-	*  structure and the memory map, but neither the module list at mods_addr
-	*  nor the module contents between mod_start and mod_end. Those frames sit
-	*  inside a region the memory map reports as available, so pmm_init()
-	*  releases them and pmm_alloc_frame() will hand them out - the first heap
-	*  growth or the first task page directory can overwrite a program long
-	*  before anybody tries to load it, and the failure then looks like a
-	*  broken ELF header rather than what it is. The fix belongs in
-	*  pmm_init(), next to the existing region_mark_used() calls, one per
-	*  module plus the list itself; recording addresses here does not make
-	*  the memory behind them any safer.
+	*  exec_init() records where the modules are and does not copy their
+	*  contents, which is safe because pmm_init() has already locked them:
+	*  region_mark_used() is called for the descriptor array at mods_addr,
+	*  then once per module for mod_start..mod_end and once for its command
+	*  line. Without that the frames would sit inside a region the memory map
+	*  reports as available, the allocator would hand them out, and the first
+	*  heap growth or task page directory would overwrite a program long
+	*  before anybody tried to load it - a failure that looks like a broken
+	*  ELF header rather than like what it is. That was a real hole once and
+	*  this comment described it; it is closed, and the code that closes it is
+	*  in pmm_init() rather than here, because recording an address here would
+	*  not have made the memory behind it any safer.
 	*
 	*  The disk hangs off the very end of the boot, behind the "sti", and it
 	*  is the one step that is not placed by what it needs from memory
