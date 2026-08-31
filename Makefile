@@ -401,9 +401,11 @@ QEMU_DISK := -drive file=$(notdir $(DISK)),format=raw,index=0,media=disk
 #  it rather than repeated here, so the two cannot drift apart.
 #
 #      LBA 0            stage 1, sharing the boot sector with the FAT16 BPB
+#                       and with an MBR partition table at offset 446
 #      LBA 1 .. 16      stage 2                       (8 KiB)
 #      LBA 17 .. 527    kernel, flat image            (255 KiB)
-#      LBA 528 ..       the FAT16 filesystem proper
+#      LBA 528 .. 1039  user programs as Multiboot modules      (256 KiB)
+#      LBA 1040 ..      the FAT16 filesystem proper
 #
 #  The ISO path deliberately keeps GRUB. The kernel is entered identically
 #  either way, so having both is a check on the handover, not duplication.
@@ -918,10 +920,18 @@ run-floppy: $(FLOPPY)
 # it in from outside. See the geometry block near the top for why the numbers
 # are what they are.
 #
-# The volume is NOT partitioned. There is no MBR partition table and no
+# THE FILESYSTEM IS NOT INSIDE A PARTITION, on either image. There is no
 # hidden-sector offset (-H 0): the FAT boot sector sits at LBA 0, which is
-# where fat_mount() looks for it. A partition table would mean the kernel had
-# to parse one before it could find the filesystem, and it does not.
+# where fat_mount() looks for it. A partition that started anywhere else would
+# mean the kernel had to parse a table before it could find the filesystem,
+# and it does not.
+#
+# $(BOOTIMG) does carry an MBR partition table -- a BIOS will not always offer
+# a USB stick without one -- but its single entry spans the whole volume from
+# LBA 0, so it describes the same sectors the BPB does rather than displacing
+# them. Both statements are true at once, which is unusual enough to be worth
+# saying plainly: the boot sector is the MBR, the volume boot record and the
+# BPB, all three. See the partition block in the $(BOOTIMG) recipe.
 #
 # Contents are laid out to give the shell something to walk:
 #
@@ -940,15 +950,20 @@ disk: $(DISK)
 #   $(1) = image file, $(2) = number of reserved sectors
 #
 # $(DISK) passes 1 (the boot sector and nothing else). $(BOOTIMG) passes
-# $(RESERVED_SECTORS) = 528, which is what keeps the filesystem out of the
-# boot chain's sectors -- mformat then starts the first FAT at LBA 528 and
-# the area below it is ours to write with dd.
+# $(RESERVED_SECTORS), which is what keeps the filesystem out of the boot
+# chain's sectors -- mformat then starts the first FAT above them and the area
+# below is ours to write with dd. That count grew from 528 to 1040 when the
+# user programs moved onto the disk as Multiboot modules; the constant is in
+# boot/layout.inc and is read out of it, so this paragraph does not name it.
 #
 # Raising the reserved count does not endanger the FAT16 classification the
-# geometry block above argues for: it costs 527 sectors out of 65520, so
-#   (65520 - 528 - 2*64 - 32) / 4 = 16208 clusters
-# instead of 16339. Both sit in the middle of the 4085..65524 band. Confirm
-# with "minfo -i <image> ::" -- it prints the reserved count and the type.
+# geometry block above argues for. With 1040 reserved sectors, two FATs of 63
+# sectors and a 32 sector root directory:
+#   (65520 - 1040 - 2*63 - 32) / 4 = 16080 clusters
+# instead of 16339. Both sit in the middle of the 4085..65524 band, and there
+# is room for the reserved area to grow a great deal before that stops being
+# true. Confirm with "minfo -i <image> ::" -- it prints the reserved count and
+# the type.
 define fat_format
 	$(call need,$(MFORMAT),mtools)
 	@rm -f $(1)
@@ -1028,8 +1043,11 @@ $(STAGING_STAMP): $(USER_ELFS) $(SYSROOT_FILES) $(SYSROOT_DIRS) Makefile | $(BUI
 		echo '  sectors/cluster    $(DISK_CLUSTER)'; \
 		echo ''; \
 		echo 'The cluster count puts this in the middle of the FAT16'; \
-		echo 'range. Nothing here is a partition: the boot sector is'; \
-		echo 'at LBA 0.'; \
+		echo 'range. The filesystem is not inside a partition: its'; \
+		echo 'boot sector is at LBA 0, which is where the driver'; \
+		echo 'looks. The bootable image carries an MBR table there'; \
+		echo 'as well, spanning the whole volume, because a BIOS'; \
+		echo 'will not always offer a stick without one.'; \
 		echo ''; \
 		echo 'If you can read this, directory traversal works.'; \
 	} > $(STAGING_DIR)/DOCS/DISK.TXT

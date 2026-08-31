@@ -240,8 +240,22 @@ dap_lba:    dq 0                    ; starting LBA
 ; Padding and signature
 ; ---------------------------------------------------------------------------
 
-%if ($ - $$) > 0x1FE
-    %error "stage 1 does not fit in the boot sector"
+; 446, NOT 510, and the difference is the whole point of this check.
+;
+; The sector has room to 0x1FE before the 0xAA55 signature, and that is what
+; this used to assert. It stopped being the limit when the image gained an MBR
+; partition table: the build writes stage 1 across bytes 62..511 and then
+; stamps the partition entry over 446..461. So anything stage 1 puts at 446 or
+; beyond is overwritten AFTER it assembles cleanly -- nasm is happy, the image
+; is built, and the tail of whatever landed there is simply gone. Depending on
+; what it was, that is a boot sector that hangs, or one that reads the wrong
+; sector, on a machine with nothing to print a diagnostic with.
+;
+; The last non-zero byte is currently at 314, so there are 131 bytes of room.
+; If this ever fires, the answer is not to raise the number: it is to move code
+; into stage 2, which has kilobytes to spare.
+%if ($ - $$) > 446
+    %error "stage 1 runs into the MBR partition table at offset 446 -- the build writes the partition entry over 446..461 after copying stage 1, so anything there is silently lost. Move code into stage 2."
 %endif
 
     times 0x1FE - ($ - $$) db 0

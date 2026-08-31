@@ -4,8 +4,10 @@ A 32-bit x86 hobby kernel (Multiboot 1) — preemptive scheduler, VGA text
 console, PS/2 keyboard with German layout, PIT timer, CMOS clock, physical
 frame allocator, kernel heap, paging, ring 3 with system calls, per-task
 address spaces, loadable programs, an ATA driver with a FAT12/16 filesystem,
-VGA graphics, a framebuffer console at 1024x768, and a small shell. Originally written between
-2006 and 2011, ported to a current Linux toolchain in 2026.
+VGA graphics, a framebuffer console in whatever mode the display will take,
+its own GRUB-free boot chain that starts from a USB stick, and a small shell.
+Originally written between 2006 and 2011, ported to a current Linux toolchain
+in 2026.
 
 ## Requirements
 
@@ -142,14 +144,19 @@ make run QEMU_KEYMAP=en-us
 
 | Command | Effect |
 |---|---|
-| `make` | Build the kernel to `build/kernel.elf` |
+| `make` | Build the kernel to `build/kernel.elf` and the programs to `build/*.elf` |
+| `make user` | Build the ring 3 programs only |
 | `make run` | Boot directly in QEMU (fastest test cycle) |
+| `make disk` | Build the 32 MB FAT16 hard disk `build/tomatos_disk.img` |
 | `make iso` | BIOS-bootable `build/tomatos.iso` via GRUB 2 |
 | `make run-iso` | Boot that ISO in QEMU |
+| `make bootdisk` | Build `build/tomatos_boot.img` — the same FAT16 volume plus TomatOS' own boot chain, with no GRUB anywhere |
+| `make run-bootdisk` | Boot that image in QEMU as a hard disk, starting at stage 1 |
 | `make floppy` | Place the kernel into a copy of the GRUB Legacy floppy image (see note) |
 | `make run-floppy` | Boot that floppy image in QEMU (see note) |
 | `make debug` | Start QEMU halted with a GDB stub on port 1234 |
 | `make usb DEV=/dev/sdX` | Write the ISO to a USB stick (asks first) |
+| `make usb-boot DEV=/dev/sdX` | Write `build/tomatos_boot.img` to a USB stick — the one for real hardware, see [docs/booting-from-usb.md](docs/booting-from-usb.md) |
 | `make clean` | Remove `build/` |
 | `make help` | This list |
 
@@ -175,13 +182,21 @@ one off `/BIN` rather than from a hardcoded list, so it cannot drift.
 
 Programs also arrive as **multiboot modules**, which is how they work with no
 disk attached: the bootloader loads them next to the kernel, `ps` lists them
-and `exec <name>` runs one.
+and `exec <name>` runs one. Typing a bare name works either way — the loader
+looks for a module and for `/BIN/NAME.ELF` and only gives up when neither
+exists — so the same command line runs the same program whichever source it
+came from. `argv[0]` is the one thing that differs: `hello` from a module,
+`HELLO.ELF` from the filesystem.
 
 ```sh
-make user      # builds build/hello.elf, build/ls.elf, build/cat.elf
+make user      # builds build/hello.elf and the other six
 make run       # QEMU passes them via -initrd, and attaches the disk image
 make run-iso   # GRUB passes them via module lines
+make bootdisk  # stage 2 reads them off the disk and passes them itself
 ```
+
+The last of those is not a convenience. It is what makes the system usable on
+hardware whose medium the kernel cannot read — see *Booting without GRUB*.
 
 A program is a static ELF32 built separately from the kernel — see `user/`.
 It links against `user/include/syscall.h` (the raw `int 0x80` wrappers) and
@@ -326,6 +341,26 @@ question: a 16:9 panel whose card stops short of 1920x1080 would drop to
 1280x1024, a 5:4 mode a widescreen monitor stretches. 1600x900 exists for that.
 What cannot be fixed by any ordering is a card offering only 5:4 modes — the
 shape of the monitor is not in the VBE information at all.
+
+**What the card offers and what the panel can show are different lists**, and
+on a laptop that difference is the whole problem: an Intel VBIOS advertises
+1920x1080 because the machine has VGA and DisplayPort outputs that can drive
+it, while the internal panel is 1366x768 and cannot. `4F02h` succeeds, the
+kernel boots perfectly, and the screen is black. So stage 2 reads the
+display's EDID with `int 10h AX=4F15h` and refuses modes larger than the
+preferred timing it reports. Measured: with QEMU's std VGA and 16 MB of video
+memory the boot lands at **1280x800**, the EDID's own size, and the same
+machine with `edid=off` lands at 1920x1080 — the pre-EDID behaviour, which is
+also what a card with no EDID still gets.
+
+That is not enough by itself, because a machine whose panel is dark is exactly
+the machine most likely to be lying about its EDID. **Holding either shift key
+while the machine powers on** makes stage 2 skip the mode set entirely and
+hand the kernel an 80x25 text screen. It is sampled from the BIOS shift-state
+byte at `0040:0017` before the kernel is even read, so it catches a key held
+before the power button; it beeps, because the speaker is the only channel
+left when the panel shows nothing; and the banner advertises it, because the
+day it is needed there is nothing on the screen to read.
 
 `FBCON_MAX_WIDTH`/`HEIGHT` in `src/include/fbcon.h` is the single place the
 ceiling is written down, and its comment names the four things that have to
@@ -711,23 +746,53 @@ suspended for the duration for the same reason.
 ### Booting without GRUB
 
 `make bootdisk` builds `build/tomatos_boot.img`, which carries its own boot
-chain — no GRUB involved. `make run-bootdisk` boots it as a hard disk.
+chain — no GRUB involved. `make run-bootdisk` boots it as a hard disk, and
+`make usb-boot DEV=/dev/sdX` writes it to a stick that a real machine will
+start from. [docs/booting-from-usb.md](docs/booting-from-usb.md) is the
+procedure for that, written for a ThinkPad T430.
 
 ```
-LBA 0        stage 1, sharing the boot sector with the FAT16 BPB
-LBA 1 .. 16  stage 2
-LBA 17 ..    the kernel, as a flat image
-LBA 528 ..   the FAT16 filesystem the kernel then mounts
+LBA    0        stage 1, sharing the boot sector with the FAT16 BPB
+LBA    1 .. 16  stage 2
+LBA   17 .. 527 the kernel, as a flat image
+LBA  528 ..1039 the user programs, as Multiboot modules
+LBA 1040 ..     the FAT16 filesystem the kernel then mounts
 ```
 
-Stage 2 and the kernel live in the volume's **reserved sectors**, the area
-a FAT filesystem sets aside before its first FAT. So the boot chain needs no
-FAT reader in assembly, and the filesystem stays perfectly ordinary.
+Stage 2, the kernel and the programs live in the volume's **reserved
+sectors**, the area a FAT filesystem sets aside before its first FAT. So the
+boot chain needs no FAT reader in assembly, and the filesystem stays perfectly
+ordinary. `boot/layout.inc` is the single source of truth for those numbers;
+the Makefile reads them out of it rather than repeating them.
+
+The boot sector also carries an **MBR partition table** at offset 446 — one
+active entry, type 0x0e, starting at LBA 0 and spanning the volume. It buys
+nothing that the boot chain itself needs, and it is there because many BIOSes
+only offer a USB stick in the boot menu at all when it has one: that table is
+what tells them to treat the stick as a hard disk rather than as a floppy or
+as nothing. The awkward part, said plainly, is that the FAT boot sector *is*
+the MBR here, so the partition starts at LBA 0 and contains the very sector
+that describes it. `fdisk` reads the entry and prints it; `partx` and `blkid`
+decline to look for a partition table on anything whose first sector is a
+filesystem. Nothing in the boot path consults either.
+
+**The programs are on the disk twice**, once as files in `/BIN` and once as
+raw sectors stage 2 hands over as Multiboot modules, and that redundancy is
+the whole point. On the machine this boot chain is aimed at, the kernel cannot
+read the stick it booted from: `ata.c` speaks legacy IDE ports and a stick is
+not that, and the USB mass storage driver reaches the bus through UHCI, which
+Panther Point and everything since dropped in favour of EHCI and xHCI. The
+BIOS has no such problem — int 13h is how stage 1 and stage 2 got there in the
+first place — so stage 2 loads the programs the same way it loads the kernel.
+Without them a real boot would reach a shell with no commands at all. With
+them, `df` on a T430 correctly reports nothing mounted and `hello`, `ls` and
+`cat` still run.
 
 The handover is deliberately identical to GRUB's: `eax = 0x2BADB002` and
 `ebx` pointing at a multiboot info structure that stage 2 fills in itself —
-memory map from `int 15h/E820`, and the framebuffer fields from VBE. Both
-boot paths therefore remain available, and the kernel cannot tell them apart.
+memory map from `int 15h/E820`, the module list, and the framebuffer fields
+from VBE. Both boot paths therefore remain available, and the kernel cannot
+tell them apart.
 
 **The reason for doing this at all:** stage 2 runs in real mode, where
 `int 0x10` is available. That is the only place a VBE mode such as 1024x768
@@ -737,9 +802,11 @@ boots it has to.
 
 ### The framebuffer console
 
-Booted from `make run-bootdisk`, stage 2 establishes a 1024x768 VBE mode and
-the console renders text into it — **128x48 characters** against the 80x25 of
-text mode. `gfx -i` reports the mode, the mapping and the console geometry.
+Booted from `make run-bootdisk`, stage 2 establishes a VBE mode — whichever
+one the negotiation above settles on, 1280x800 under QEMU today — and the
+console renders text into it: **160x50 characters** at that size, against the
+80x25 of text mode. `gfx -i` reports the mode, the mapping and the console
+geometry.
 
 Three things make it work:
 
@@ -1278,14 +1345,36 @@ Smaller items in the same pass:
 
 ## On real hardware
 
-`make iso` produces an image that boots via **legacy BIOS/CSM**. It goes onto
-a stick with `make usb DEV=/dev/sdX` — the target device is shown first and
-has to be confirmed with `yes`. Choose the device carefully; `lsblk` helps to
-identify it.
+There are two ways onto a stick, and **`make usb-boot` is the one that
+matters**:
 
-On UEFI-only machines without CSM the screen stays black: the kernel writes
-directly to the VGA text buffer at `0xB8000`, which no longer exists there.
-That would require a framebuffer output path.
+```sh
+make bootdisk
+make usb-boot DEV=/dev/sdX
+```
+
+That writes `build/tomatos_boot.img` — TomatOS' own boot chain, the flat
+kernel and the programs as modules — with no GRUB anywhere.
+[docs/booting-from-usb.md](docs/booting-from-usb.md) is the full procedure:
+which BIOS settings a ThinkPad T430 needs and why, which port to use, what a
+successful boot looks like line by line, and what to do about each way it can
+fail. Read it before plugging anything in.
+
+`make usb DEV=/dev/sdX` writes the **GRUB ISO** instead, which also boots via
+legacy BIOS/CSM. It is the older path and is kept because having two
+independent bootloaders reach the same kernel is a check on the handover.
+
+Both refuse to write to the wrong thing, but not equally hard. The ISO target
+shows the device and asks for `yes`. `tools/usb-boot.sh`, behind `usb-boot`,
+runs six checks *before* it asks anything — whole disk, removable, on the USB
+bus, nothing mounted — because the prompt is the weakest defence in the list:
+somebody who has decided to type `yes` will type `yes`. The `removable` check
+in particular is not overridable, and `sdc` and `sda` differ by one keystroke.
+
+On UEFI-only machines without CSM the screen stays black: stage 1 is a
+512 byte MBR boot sector that the firmware never looks at, and there is no EFI
+stub. Set `UEFI/Legacy Boot` to `Legacy Only` — the document above says why
+`Both` is worse than either.
 
 ## Debugging
 
@@ -1314,7 +1403,9 @@ user/           ring 3 programs, one directory each
   include/        the headers a program may see, and the whole of its world
   lib/            the C library every program links, plus opt-in ones
 linker.ld       linker script, loads at 1 MiB
-boot/           the GRUB-free boot chain: stage 1, stage 2, layout
+boot/           the GRUB-free boot chain: stage 1, stage 2, VBE, layout
+tools/          scripts the Makefile invokes that are too long to be recipes
+docs/           prose that does not belong in this file
 sysroot/        static contents of the disk image, named as they appear on it
 bin/            the original GRUB Legacy floppy image (template, never modified)
 legacy/         the 2011 Windows toolchain (DJGPP, VFD) and its batch files

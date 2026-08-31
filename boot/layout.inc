@@ -12,11 +12,14 @@
 ; the kernel mounts stays a perfectly ordinary FAT16 volume.
 ;
 ;   LBA 0            stage 1, in the boot sector, sharing it with the BPB
+;                    and, since the image became bootable from USB, with an
+;                    MBR partition table at 446
 ;   LBA 1  .. 16     stage 2                       (8 KiB)
 ;   LBA 17 .. 527    kernel image, raw             (255 KiB)
-;   LBA 528 ..       the FAT16 filesystem proper
+;   LBA 528 .. 1039  the user programs, as Multiboot modules  (256 KiB)
+;   LBA 1040 ..      the FAT16 filesystem proper
 ;
-; mformat is told to reserve 528 sectors, so nothing above ever overlaps
+; mformat is told to reserve RESERVED_SECTORS, so nothing above ever overlaps
 ; the filesystem. The kernel is written as a flat image, not as ELF: stage 2
 ; would otherwise have to parse program headers in real mode, and the
 ; Makefile can do that with objcopy instead.
