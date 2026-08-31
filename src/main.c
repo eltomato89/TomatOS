@@ -21,6 +21,8 @@
 #include <dns.h>
 #include <tcp.h>
 #include <mouse.h>
+#include <usb.h>
+#include <uhci.h>
 //#include <wmessages.h>
 
 #define NULL 0
@@ -690,6 +692,63 @@ typedef struct
 #define NET_TCP_PEER_TEXT    22   /* "255.255.255.255:65535" and the end   */
 #define NET_TCP_NUM_TEXT     11   /* ten digits of a uint32_t and the end  */
 
+/* --- usb -----------------------------------------------------------------
+*
+*  "lsusb" is the fourth command in this file that has to describe hardware
+*  which may not be there, so it borrows the shape the network commands
+*  established: a label column, then a table, then the paragraph that says
+*  what an empty listing means. Same padding helpers, for the same reason --
+*  printf() has no field widths.
+*/
+
+/* Width of the label column, two leading spaces included. The longest label
+*  is "Last error:", eleven characters, so fifteen leaves two spaces after
+*  every one of them. */
+#define USB_INFO_LABEL   15
+
+/* Text buffers, the same idea as NET_IP_TEXT: a value that has to be padded
+*  into a column is written into a buffer of its own first. */
+#define USB_ID_TEXT      10   /* "0627:0001" and the terminator          */
+#define USB_CLASS_TEXT    9   /* "03:01:01" and the terminator           */
+
+/* How long the frame number is watched for. Long enough that the reading is
+*  not dominated by the millisecond the timer counts in -- two hundred frames
+*  put the granularity at half a percent -- and short enough that nobody
+*  notices the command pausing. See usb_show_frames() for why a rate is taken
+*  at all rather than a single reading. */
+#define USB_FRAME_SAMPLE_MS   200
+
+/* What a running UHCI controller must read. A frame is one millisecond by
+*  definition, so this is not a measurement of this machine but a property of
+*  the bus, and the band around it is only there to absorb a sample the
+*  scheduler interrupted. */
+#define USB_FRAME_RATE_NOMINAL 1000
+#define USB_FRAME_RATE_LOW      900
+#define USB_FRAME_RATE_HIGH    1100
+
+/* A USB host controller on the PCI bus is class 0x0C subclass 0x03 -- and
+*  that pair says nothing about WHICH of the four incompatible interfaces it
+*  is, which is the whole point of pci.h keeping the prog-if byte. These are
+*  the four, and 0xFE, which is a device rather than a controller. */
+#define USB_PCI_SUBCLASS  0x03
+#define USB_PROGIF_UHCI   0x00
+#define USB_PROGIF_OHCI   0x10
+#define USB_PROGIF_EHCI   0x20
+#define USB_PROGIF_XHCI   0x30
+#define USB_PROGIF_DEV    0xFE
+
+/* The class triples worth spelling out, and they are the two classes this
+*  stack exists for. A HID interface with subclass 1 speaks the boot protocol,
+*  which is the fixed report format a BIOS can read without parsing anything,
+*  and protocol 1 and 2 are the only two there are: keyboard and mouse. Mass
+*  storage subclass 6 is the SCSI command set and protocol 0x50 is bulk-only
+*  transport, which together are what every USB disk made since 2000 is. */
+#define USB_HID_SUB_BOOT       0x01
+#define USB_HID_PROTO_KEYBOARD 0x01
+#define USB_HID_PROTO_MOUSE    0x02
+#define USB_MSC_SUB_SCSI       0x06
+#define USB_MSC_PROTO_BULK     0x50
+
 /* --- what the bootloader reported ----------------------------------------
 *
 *  kernel.c owns this record: it reads the framebuffer fields out of the
@@ -732,6 +791,7 @@ void execute(char *cmd);
 void diskfree(char *cmd);
 void graphics(char *cmd);
 void listpci(char *cmd);
+void listusb(char *cmd);
 void netconfig(char *cmd);
 void dhcpclient(char *cmd);
 void arptable(char *cmd);
@@ -876,6 +936,22 @@ static char *net_put_uint(char *p, uint32_t value);
 static void net_tcp_endpoint_text(uint32_t ip, uint16_t port, char *text);
 static void net_show_tcp(void);
 
+static void usb_info_label(const char *label);
+static const char *usb_speed_text(int speed);
+static const char *usb_endpoint_type_text(uint8_t type);
+static const char *usb_class_text(uint8_t iface_class, uint8_t subclass,
+                                  uint8_t protocol);
+static const char *usb_hc_kind_text(uint8_t prog_if);
+static int  usb_uhci_on_bus(void);
+static int  usb_show_hc_on_bus(void);
+static void usb_explain_layering(void);
+static void usb_explain_absent(void);
+static void usb_show_frames(void);
+static void usb_show_endpoints(const usb_device *dev);
+static void usb_show_devices(void);
+static void usb_show_counters(void);
+static void usb_show_bus(void);
+
 /* Self-test counters, maintained by mem_check(). */
 static int mem_tests_run = 0;
 static int mem_tests_ok = 0;
@@ -947,6 +1023,7 @@ void main()
 		else if(strcmp(word, "df") == 0) diskfree(cmd);
 		else if(strcmp(word, "gfx") == 0) graphics(cmd);
 		else if(strcmp(word, "lspci") == 0) listpci(cmd);
+		else if(strcmp(word, "lsusb") == 0) listusb(cmd);
 		else if(strcmp(word, "ifconfig") == 0) netconfig(cmd);
 		else if(strcmp(word, "dhcp") == 0) dhcpclient(cmd);
 		else if(strcmp(word, "arp") == 0) arptable(cmd);
@@ -7637,6 +7714,643 @@ static void net_show_tcp(void)
 	}
 }
 
+/* --- lsusb ---------------------------------------------------------------
+*
+*  What is on the USB bus, written for the machine where a device is NOT
+*  working -- which is the only reason anybody types this. So the states that
+*  had to read well are the empty ones, not the one where a keyboard is found,
+*  and they are told apart rather than run together into one "no USB":
+*
+*    - no USB host controller on the PCI bus at all, which is what
+*      "make run USB=0" gives;
+*    - one that is there and is not UHCI, which is every machine built in the
+*      last decade and is the case usb.h's layering was written for;
+*    - a UHCI that was found and did not come up, where uhci_info() is the
+*      only thing that knows why;
+*    - a controller that is up, with nothing plugged in or with devices the
+*      kernel enumerated and has no driver for.
+*
+*  Everything here asks usb.h, uhci.h and pci.h questions and formats the
+*  answers. No transfer is started from this file, and no register is touched.
+*
+*  The formatting is the house style of the "ps", "df", "lspci" and "netstat"
+*  tables: printf() has no field widths, so a value that has to line up in a
+*  column is written into a small buffer first and padded into place by
+*  ps_print_left(), fs_print_right_text() or mem_print_right(). */
+
+static void usb_info_label(const char *label)
+{
+	int used;
+
+	printf("  %s", label);
+
+	used = 2 + (int)strlen(label);
+	while(used < USB_INFO_LABEL)
+	{
+		putch(' ');
+		used++;
+	}
+}
+
+/* The two speeds this stack knows, in the words the specification uses.
+*  Anything else cannot reach here -- the core forces an unrecognised value to
+*  full speed before it stores it -- but the default is kept so that a future
+*  high speed device does not silently print as a full speed one. */
+static const char *usb_speed_text(int speed)
+{
+	switch(speed)
+	{
+		case USB_SPEED_LOW:  return "low";
+		case USB_SPEED_FULL: return "full";
+		default:             break;
+	}
+
+	return "?";
+}
+
+static const char *usb_endpoint_type_text(uint8_t type)
+{
+	switch(type)
+	{
+		case USB_XFER_CONTROL:   return "control";
+		case USB_XFER_ISOC:      return "isochronous";
+		case USB_XFER_BULK:      return "bulk";
+		case USB_XFER_INTERRUPT: return "interrupt";
+		default:                 break;
+	}
+
+	return "unknown";
+}
+
+/* What the class triple MEANS, next to the raw numbers rather than instead of
+*  them.
+*
+*  The numbers stay because they are what somebody compares against "lsusb" on
+*  a real machine, and a name this file invented would not compare against
+*  anything. But a bare 03:01:01 helps nobody either: the whole difference
+*  between a keyboard and a mouse is in the last byte, and that is precisely
+*  what a person staring at a device that does not work needs to read.
+*
+*  How far the decoding goes is deliberately uneven. The full triple is taken
+*  apart for the two classes this stack is about -- HID, where the subclass
+*  says "boot protocol" and the protocol says which of the two boot devices it
+*  is, and mass storage, where the pair says which command set travels over
+*  which transport. Everything else gets its class named and its subclass and
+*  protocol left as the numbers in the column, because naming them would be a
+*  table of hundreds of entries in aid of a device this kernel would not touch
+*  anyway. Class 0x09, the hub, is named for the opposite reason: it is not
+*  supported on purpose and that is exactly what the reader has to be told. */
+static const char *usb_class_text(uint8_t iface_class, uint8_t subclass,
+                                  uint8_t protocol)
+{
+	switch(iface_class)
+	{
+		case 0x00:
+			/* Invalid in an interface descriptor: 0 means "look at the
+			   device descriptor instead", and a device that puts it here is
+			   describing nothing. */
+			return "no interface class";
+
+		case 0x01: return "audio";
+		case 0x02: return "communications";
+
+		case USB_CLASS_HID:
+			if(subclass == USB_HID_SUB_BOOT)
+			{
+				if(protocol == USB_HID_PROTO_KEYBOARD) return "HID boot keyboard";
+				if(protocol == USB_HID_PROTO_MOUSE)    return "HID boot mouse";
+				return "HID boot, no protocol";
+			}
+			if(subclass == 0x00) return "HID, no boot protocol";
+			return "HID";
+
+		case 0x05: return "physical interface";
+		case 0x06: return "still imaging";
+		case 0x07: return "printer";
+
+		case USB_CLASS_MASS_STORAGE:
+			if(subclass == USB_MSC_SUB_SCSI)
+			{
+				if(protocol == USB_MSC_PROTO_BULK) return "SCSI disk, bulk-only";
+				return "SCSI disk";
+			}
+			if(subclass == 0x04) return "UFI floppy";
+			if(subclass == 0x05) return "SFF-8070i storage";
+			return "mass storage";
+
+		case USB_CLASS_HUB:  return "hub (not supported)";
+
+		case 0x0A: return "communications data";
+		case 0x0B: return "smart card";
+		case 0x0E: return "video";
+
+		case 0xE0:
+			if(subclass == 0x01 && protocol == 0x01) return "Bluetooth";
+			return "wireless controller";
+
+		case 0xFF: return "vendor specific";
+
+		default:   break;
+	}
+
+	return "unknown class";
+}
+
+/* Which of the four incompatible host controller interfaces a PCI device is.
+*  The prog-if byte is the whole answer and the reason pci.h keeps it: class
+*  0C subclass 03 says "USB host controller" and says nothing about which
+*  kind, and their register interfaces have nothing in common. */
+static const char *usb_hc_kind_text(uint8_t prog_if)
+{
+	switch(prog_if)
+	{
+		case USB_PROGIF_UHCI: return "UHCI, USB 1.1 -- the one this kernel drives";
+		case USB_PROGIF_OHCI: return "OHCI, USB 1.1";
+		case USB_PROGIF_EHCI: return "EHCI, USB 2.0";
+		case USB_PROGIF_XHCI: return "xHCI, USB 3";
+		case USB_PROGIF_DEV:  return "a USB device, not a host controller";
+		default:              break;
+	}
+
+	return "an unknown host controller interface";
+}
+
+/* Whether a UHCI controller is on the bus at all. Asked only to tell "there
+*  is nothing here for the driver" apart from "the driver had something and
+*  could not bring it up", which are two different problems with two different
+*  answers. */
+static int usb_uhci_on_bus(void)
+{
+	const pci_device *dev;
+	int i;
+
+	for(i = 0; i < pci_count(); i++)
+	{
+		dev = pci_get(i);
+		if(dev == 0) continue;
+
+		if(dev->class_code == PCI_CLASS_SERIAL &&
+		   dev->subclass   == USB_PCI_SUBCLASS &&
+		   dev->prog_if    == USB_PROGIF_UHCI)
+		{
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+/* Every USB host controller the PCI enumeration found, of whatever kind, and
+*  how many there were. "Is there USB hardware here" is a different question
+*  from "is there USB hardware this kernel can drive", and only this list
+*  answers the first one. */
+static int usb_show_hc_on_bus(void)
+{
+	const pci_device *dev;
+	char text[NET_HEX_TEXT];
+	int found;
+	int i;
+
+	found = 0;
+
+	for(i = 0; i < pci_count(); i++)
+	{
+		dev = pci_get(i);
+		if(dev == 0) continue;
+
+		if(dev->class_code != PCI_CLASS_SERIAL) continue;
+		if(dev->subclass   != USB_PCI_SUBCLASS) continue;
+
+		found++;
+
+		printf("    ");
+		net_hex_text((uint32_t)dev->bus, 2, text);
+		printf("%s:", text);
+		net_hex_text((uint32_t)dev->slot, 2, text);
+		printf("%s.%i  ", text, (int)dev->func);
+		net_hex_text((uint32_t)dev->vendor, 4, text);
+		printf("%s:", text);
+		net_hex_text((uint32_t)dev->device, 4, text);
+		printf("%s  prog-if ", text);
+		net_hex_text((uint32_t)dev->prog_if, 2, text);
+		printf("%s, %s\n", text, usb_hc_kind_text(dev->prog_if));
+	}
+
+	return found;
+}
+
+/* Why an xHCI on the bus is not a fault, said once. The header of usb.h is
+*  where this comes from and it is worth repeating on screen, because a user
+*  who reads "no USB" on a modern laptop has every reason to think the machine
+*  is broken. */
+static void usb_explain_layering(void)
+{
+	printf("  usb.h draws its line for exactly this reason. Resetting a port,\n");
+	printf("  addressing a device and reading its descriptors are the same\n");
+	printf("  whatever the silicon underneath; only the bottom third, moving\n");
+	printf("  bytes to an endpoint, is controller specific. A driver for\n");
+	printf("  another controller fills in usb_hc_ops underneath, and\n");
+	printf("  everything above it -- including this command -- keeps working\n");
+	printf("  unchanged.\n");
+}
+
+/* No controller. The ordinary outcome, and the one that has to teach rather
+*  than merely report -- so it does not stop at "none" but says what IS on the
+*  bus, which is the difference between "this machine has no USB" and "this
+*  machine's USB is not the kind this kernel speaks". */
+static void usb_explain_absent(void)
+{
+	int controllers;
+
+	usb_info_label("Controller:");
+	printf("none this kernel can drive\n");
+
+	printf("  USB host controllers on the PCI bus (class 0C:03):\n");
+	controllers = usb_show_hc_on_bus();
+
+	if(controllers == 0)
+	{
+		printf("    None.\n");
+		printf("  There is no USB hardware here at all, which is what \"make run\n");
+		printf("  USB=0\" gives: QEMU attaches a controller only when it is asked\n");
+		printf("  to, with \"-device piix3-usb-uhci\".\n");
+		usb_explain_layering();
+		return;
+	}
+
+	if(usb_uhci_on_bus())
+	{
+		/* The one case here that IS a fault. Everything above knows only
+		   that no controller registered; uhci.c knows which step failed,
+		   and it kept the sentence. */
+		printf("  A UHCI controller is on the bus and did not come up, so\n");
+		printf("  this is a failure rather than a missing device. The driver\n");
+		printf("  is the only thing that knows which step it was:\n");
+		printf("    %s\n", uhci_info());
+		return;
+	}
+
+	printf("  There is USB hardware here, but none of it is UHCI -- the only\n");
+	printf("  host controller interface this kernel drives. This is a limit\n");
+	printf("  of the driver, not a fault of the machine: every machine built\n");
+	printf("  in the last decade has xHCI and nothing else, and its keyboard\n");
+	printf("  works perfectly well under a system that has an xHCI driver.\n");
+	usb_explain_layering();
+}
+
+/* THE FRAME NUMBER, AS A RATE.
+*
+*  uhci.h calls this the one number that separates a controller which is
+*  running from one that was set up and never started -- and one sample cannot
+*  do that, because every value it could show, zero included, is a legal
+*  reading for both. Only the difference between two samples says anything, so
+*  this takes two a fixed interval apart and reports what moved.
+*
+*  It is printed as a rate rather than as a raw difference because a rate has
+*  an expected value and a difference does not. One frame is one millisecond
+*  by definition, so a live UHCI controller reads about 1000 frames a second
+*  and nothing else, whatever the interval was. That turns the line into a
+*  check anybody can make without knowing this kernel: 1000 is right, 0 is a
+*  controller that was set up and never started, and something in between is
+*  a sample the scheduler disturbed rather than a bus running at some other
+*  speed.
+*
+*  The elapsed time is measured rather than assumed. sleep() may return late
+*  under a busy scheduler, and dividing by the interval that was asked for
+*  instead of the one that actually passed would turn the shell's own
+*  scheduling into a wrong statement about the hardware.
+*
+*  The running total is on the same line and is the smaller half of the
+*  answer: it says how long the controller has been alive, and it is the one
+*  number that survives being read once.
+*
+*  All of it is one line, with the paragraph underneath only where there is
+*  something wrong to say. The whole report has to fit on a screen that holds
+*  twenty-four lines, and a sentence explaining that everything is fine is the
+*  first thing to lose when the alternative is scrolling the controller off
+*  the top. */
+static void usb_show_frames(void)
+{
+	uint32_t first;
+	uint32_t second;
+	uint32_t moved;
+	uint32_t rate;
+	unsigned int started;
+	unsigned int elapsed;
+
+	first   = uhci_frames();
+	started = (unsigned int)timer_get_ticks();
+
+	sleep(USB_FRAME_SAMPLE_MS);
+
+	second = uhci_frames();
+
+	/* Unsigned subtraction, because the millisecond counter wraps and only
+	   the difference of two snapshots stays meaningful across the wrap --
+	   the same reason sleep() computes its deadline this way. */
+	elapsed = (unsigned int)timer_get_ticks() - started;
+	if(elapsed == 0) elapsed = (unsigned int)USB_FRAME_SAMPLE_MS;
+
+	moved = (second >= first) ? (second - first) : 0;
+	rate  = (moved * 1000UL) / (uint32_t)elapsed;
+
+	usb_info_label("Frames:");
+	mem_print_right(rate, 1);
+	printf("/s -- ");
+
+	if(moved == 0)
+	{
+		printf("NOT running (");
+	}
+	else if(rate < (uint32_t)USB_FRAME_RATE_LOW ||
+	        rate > (uint32_t)USB_FRAME_RATE_HIGH)
+	{
+		printf("running, oddly (");
+	} else {
+		printf("the schedule is running (");
+	}
+
+	mem_print_right(moved, 1);
+	printf(" in %u ms, ", (int)elapsed);
+	mem_print_right(second, 1);
+	printf(" total)\n");
+
+	if(moved == 0)
+	{
+		printf("  The frame number has not moved, so the schedule is not\n");
+		printf("  running. A controller that was set up and never started\n");
+		printf("  looks identical to a working one from every other angle --\n");
+		printf("  its registers read back, its ports report what is plugged\n");
+		printf("  in, and every transfer merely times out. This is the one\n");
+		printf("  number that tells the two apart.\n");
+		return;
+	}
+
+	if(rate < (uint32_t)USB_FRAME_RATE_LOW || rate > (uint32_t)USB_FRAME_RATE_HIGH)
+	{
+		printf("  A UHCI frame is one millisecond by definition, so a running\n");
+		printf("  controller reads about %u/s and no other rate. A reading\n",
+		       (int)USB_FRAME_RATE_NOMINAL);
+		printf("  well off that is this shell being descheduled during the\n");
+		printf("  sample, not the bus. Run it again.\n");
+	}
+}
+
+/* The endpoints of one device, one to a line under its row.
+*
+*  Endpoint 0 is deliberately not among them and neither is any isochronous
+*  endpoint -- see the note usb_show_devices() prints under the table, which
+*  is where that belongs because it is a property of the listing rather than
+*  of any one device. */
+static void usb_show_endpoints(const usb_device *dev)
+{
+	const usb_endpoint *ep;
+	int i;
+
+	for(i = 0; i < dev->endpoints && i < USB_MAX_ENDPOINTS; i++)
+	{
+		ep = &dev->endpoint[i];
+
+		printf("      EP");
+		mem_print_right((uint32_t)ep->address, 3);
+		putch(' ');
+		ps_print_left((ep->direction & USB_DIR_IN) ? "IN" : "OUT", 4);
+		ps_print_left(usb_endpoint_type_text(ep->type), 12);
+		mem_print_right((uint32_t)ep->max_packet, 4);
+		printf(" bytes");
+
+		/* An interval is only meaningful for an interrupt endpoint. Bulk
+		   and control transfers are scheduled whenever there is bandwidth
+		   left, and a device may put anything at all in the field, so
+		   printing it would be inventing a promise nobody made. */
+		if(ep->type == USB_XFER_INTERRUPT)
+		{
+			if(ep->interval <= 1)
+			{
+				printf(", polled every frame");
+			} else {
+				printf(", polled every %u frames", (int)ep->interval);
+			}
+		}
+
+		printf("\n");
+	}
+}
+
+/* The table, and the two empty states that are not the table.
+*
+*  Raw numbers in the columns, because they are what somebody compares against
+*  "lsusb" on a real machine; the reading of them in the last column, because
+*  a class code nobody can decode is a wasted line. Hexadecimal for both ids
+*  and the class triple: that is how "lsusb" writes an id, it is how "lspci"
+*  writes a class here, and half the class codes -- 0x0A, 0x0E, 0xE0, 0xFF --
+*  are only recognisable that way. */
+static void usb_show_devices(void)
+{
+	const usb_device *dev;
+	char id_text[USB_ID_TEXT];
+	char class_text[USB_CLASS_TEXT];
+	int count;
+	int bound;
+	int hubs;
+	int i;
+
+	count = usb_device_count();
+
+	usb_info_label("Devices:");
+	if(count == 0)
+	{
+		printf("none\n");
+
+		/* Two ways to end up with an empty list, and they are opposite
+		   problems. Nothing answered a port is the ordinary one; something
+		   answered and did not survive being enumerated is a failure, and
+		   the counters above are what tell them apart. */
+		if(usb_errors() != 0)
+		{
+			printf("  Something did answer a root port and did not survive being\n");
+			printf("  enumerated: the failure count above is not zero, and the last\n");
+			printf("  error names the step that gave up. So this empty list is a\n");
+			printf("  failure rather than an empty controller.\n");
+			return;
+		}
+
+		printf("  Every root port was reset and none of them answered, so nothing\n");
+		printf("  is plugged in -- and no transfer was needed to find that out,\n");
+		printf("  which is why the counters above are zero. That is an empty\n");
+		printf("  controller, not a broken one; the frame rate is what says the\n");
+		printf("  controller itself is alive.\n");
+		printf("  \"make run USB=hid\" plugs a keyboard and a mouse in. It is\n");
+		printf("  not the default because QEMU then routes input to them, and\n");
+		printf("  there is no HID driver yet -- the machine boots and cannot\n");
+		printf("  be typed at. That driver is the next thing missing here.\n");
+		return;
+	}
+
+	bound = 0;
+	hubs  = 0;
+
+	for(i = 0; i < count; i++)
+	{
+		dev = usb_device_get(i);
+		if(dev == 0) continue;
+		if(dev->driver != 0 && strcmp(dev->driver, "none") != 0) bound++;
+		if(dev->iface_class == USB_CLASS_HUB) hubs++;
+	}
+
+	printf("%i enumerated, ", count);
+	if(bound == 0)
+	{
+		printf("none with a driver\n");
+	} else {
+		printf("%i with a driver\n", bound);
+	}
+
+	printf("  ");
+	fs_print_right_text("Port", 6);
+	fs_print_right_text("Addr", 6);
+	fs_print_right_text("Speed", 6);
+	fs_print_right_text("ID", 11);
+	fs_print_right_text("Class", 10);
+	fs_print_right_text("EPs", 4);
+	printf("  ");
+	ps_print_left("Driver", 9);
+	printf("What it says it is\n");
+
+	for(i = 0; i < count; i++)
+	{
+		dev = usb_device_get(i);
+		if(dev == 0) continue;
+
+		/* "0627:0001", the way lsusb prints an id and the form a search
+		   engine takes. */
+		net_hex_text((uint32_t)dev->vendor, 4, id_text);
+		id_text[4] = ':';
+		net_hex_text((uint32_t)dev->product, 4, id_text + 5);
+
+		/* "03:01:01" -- class, subclass and protocol, which are only
+		   meaningful as a triple, in the same colon form "lspci" uses for
+		   the pair it prints. */
+		net_hex_text((uint32_t)dev->iface_class, 2, class_text);
+		class_text[2] = ':';
+		net_hex_text((uint32_t)dev->iface_subclass, 2, class_text + 3);
+		class_text[5] = ':';
+		net_hex_text((uint32_t)dev->iface_protocol, 2, class_text + 6);
+
+		printf("  ");
+		mem_print_right((uint32_t)dev->port, 6);
+		mem_print_right((uint32_t)dev->address, 6);
+		fs_print_right_text(usb_speed_text(dev->speed), 6);
+		fs_print_right_text(id_text, 11);
+		fs_print_right_text(class_text, 10);
+		mem_print_right((uint32_t)dev->endpoints, 4);
+		printf("  ");
+
+		/* usb.h promises this is never null; the guard is here because a null
+		   would print as nothing at all and leave an empty column that looks
+		   like a device with no driver rather than like a bug. */
+		ps_print_left((dev->driver != 0) ? dev->driver : "?", 9);
+
+		printf("%s\n", usb_class_text(dev->iface_class, dev->iface_subclass,
+		                              dev->iface_protocol));
+
+		usb_show_endpoints(dev);
+	}
+
+	/* Why the EPs column may be smaller than the device's own descriptor
+	   says. Printed once, under the table, because it is a property of the
+	   listing and not of any one row. */
+	printf("\n");
+	printf("  Endpoint 0 is in no configuration, and isochronous endpoints\n");
+	printf("  are dropped on purpose (see usb.h). Neither is listed.\n");
+
+	if(bound == 0)
+	{
+		printf("  No device has a driver. Enumeration finished -- port reset,\n");
+		printf("  address given, descriptors read, configuration set -- so every\n");
+		printf("  number above came off the wire. What is missing is the layer\n");
+		printf("  above: nothing here claims a class yet, so nobody polls those\n");
+		printf("  endpoints. The bus works; there is no driver sitting on it.\n");
+	}
+
+	if(hubs != 0)
+	{
+		printf("  A hub is among them, and hubs are absent on purpose -- usb.h\n");
+		printf("  lists them next to isochronous transfers and USB 3. So the hub\n");
+		printf("  enumerated and nothing plugged into it did: those are ports\n");
+		printf("  only a hub driver could reset. QEMU produces this by itself --\n");
+		printf("  it inserts a hub once more than two devices are attached.\n");
+	}
+}
+
+/* What the transfers add up to. Counted by the core across every device, so
+*  they are the bus's total and not any one device's -- which is what makes
+*  them useful when the question is whether anything has moved at all. */
+static void usb_show_counters(void)
+{
+	const char *error;
+
+	usb_info_label("Transfers:");
+	mem_print_right(usb_transfers(), 1);
+	printf(" attempted, ");
+	mem_print_right(usb_errors(), 1);
+	printf(" failed\n");
+
+	error = usb_last_error();
+
+	usb_info_label("Last error:");
+	if(error == 0 || error[0] == EOS)
+	{
+		printf("none since boot\n");
+	} else {
+		printf("%s\n", error);
+	}
+
+}
+
+static void usb_show_bus(void)
+{
+	printf("USB bus:\n");
+
+	if(!usb_present())
+	{
+		usb_explain_absent();
+		return;
+	}
+
+	usb_info_label("Controller:");
+	printf("%s\n", usb_hc_name());
+
+	/* THE TWO LINES BELOW ARE THE ONLY ONES THAT ASK uhci.h, and they are
+	   behind uhci_present() because of the very layering this command
+	   describes. Everything else here goes through usb.h and would print
+	   the same for an OHCI or xHCI driver that filled in usb_hc_ops; the
+	   info string and the frame counter belong to one particular
+	   controller, and asking them about another one would answer 0 -- which
+	   reads as "the schedule is stopped" and would be a lie about a bus
+	   that is working perfectly. */
+	if(uhci_present())
+	{
+		/* The controller's own account of itself, in its own words. The one
+		   line here this file did not compose, and it carries what only
+		   uhci.c knows: where the registers are, how many root ports there
+		   are, what the BIOS had done to the legacy support register before
+		   the driver took it away, and whether the driver polls or takes an
+		   interrupt. It is longer than eighty columns and is allowed to
+		   wrap -- breaking it up would mean parsing a string uhci.c owns. */
+		usb_info_label("It reports:");
+		printf("%s\n", uhci_info());
+
+		usb_show_frames();
+	} else {
+		usb_info_label("Frames:");
+		printf("not asked -- %s is not the UHCI driver\n", usb_hc_name());
+	}
+
+	usb_show_counters();
+	usb_show_devices();
+}
+
 /* --- the commands themselves --------------------------------------------- */
 
 void listpci(char *cmd)
@@ -7649,6 +8363,23 @@ void listpci(char *cmd)
 	}
 
 	net_show_pci();
+}
+
+void listusb(char *cmd)
+{
+	/* No options. There are at most eight devices and two root ports, so
+	   there is nothing here worth filtering out -- and the command is typed
+	   when something does not work, which is exactly when the line somebody
+	   would have filtered away is the one that explains it. */
+	if(prmc(cmd) != 0)
+	{
+		printf("Syntax: lsusb\n");
+		printf("\t          Show the USB controller, whether its schedule is\n");
+		printf("\t          running, and the devices that were enumerated\n");
+		return;
+	}
+
+	usb_show_bus();
 }
 
 void netconfig(char *cmd)
@@ -8100,6 +8831,8 @@ void help(void)
 	printf("\tgfx       Draw the graphics demo, gfx -t tests the surface\n");
 	printf("\t          it draws on, gfx -i shows the mode booted into\n");
 	printf("\tlspci     List the devices the PCI enumeration found\n");
+	printf("\tlsusb     Show the USB controller, whether its schedule is\n");
+	printf("\t          running, and the devices that were enumerated\n");
 	printf("\tifconfig  Show the interface and its counters, ifconfig -q\n");
 	printf("\t          shows the receive queue the card's interrupt fills,\n");
 	printf("\t          ifconfig IP NETMASK GATEWAY sets the addresses\n");

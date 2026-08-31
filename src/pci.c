@@ -241,6 +241,12 @@ static void pci_record(uint8_t bus, uint8_t slot, uint8_t func,
     d->subclass   = (uint8_t)(class_word & 0xFF);
     d->class_code = (uint8_t)((class_word >> 8) & 0xFF);
 
+    /* The programming interface byte at 0x09, one below the subclass. Read
+    *  separately rather than as part of a wider fetch because it belongs to
+    *  the other half of the dword. See pci.h for why a USB driver cannot do
+    *  without it. */
+    d->prog_if    = pci_read8(bus, slot, func, PCI_PROG_IF);
+
     d->irq = pci_read8(bus, slot, func, PCI_INTERRUPT_LINE);
 
     /* A normal device has six base address registers, a PCI-to-PCI bridge

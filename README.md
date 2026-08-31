@@ -359,6 +359,70 @@ uses a third of the screen where the first version used most of it, and
 a graphics mode costs twice, once for the framebuffer and once for the back
 buffer a program draws into, and at 1920x1080x32 those are 8.3 MB each.
 
+### USB
+
+`lsusb` enumerates what is on the bus. The stack is in two files on purpose,
+and the split is the point rather than tidiness: roughly two thirds of USB is
+the same whatever silicon is underneath — resetting a port, giving a device an
+address, reading its descriptors, working out what it is — and only the bottom
+third, moving bytes to an endpoint, is controller specific. There are four
+incompatible ways to do that, and this kernel drives the simplest: **UHCI**,
+whose registers are in I/O space and whose data structures are three small
+things.
+
+A machine built in the last decade has **xHCI and nothing else**, so `lsusb`
+says so rather than reporting "no USB": it walks the PCI bus itself for class
+0C:03 and, finding an xHCI, names it and says whose limit that is. That
+distinction — no USB hardware versus USB this driver cannot speak — is what a
+person actually needs.
+
+Three things about UHCI decided the driver:
+
+**The controller reads its own data structures by DMA**, so they live at
+physical addresses, their alignment is enforced by hardware (the low bits of
+every link pointer are flags, so an unaligned structure is a *different*
+address), and the controller may be walking a list while it is being built. A
+transfer is therefore assembled completely while nothing points at it and
+published with **one naturally aligned 32-bit store** — indivisible against a
+PCI master's read, so the controller sees either the old terminator or the
+finished chain and never a third state.
+
+**Three answers are not errors.** A short packet is how a device says "that is
+all", and a control transfer's data stage depends on it. A NAK is how an idle
+keyboard says it has nothing — 1136 empty polls returned 0 in testing, and a
+driver treating that as failure reports a broken keyboard on every machine. A
+STALL is how a device says it does not know a request, and enumeration
+deliberately provokes one.
+
+**It polls rather than using its interrupt**, and for a reason found by
+measuring: QEMU puts the UHCI on IRQ 11 — the same line as the network card —
+and `irq_install_handler()` keeps one handler per line, so installing there
+would silently unhook the NIC. Fixing that properly needs a shared-interrupt
+chain in `irq.c`.
+
+Enumeration has one step that is almost always got subtly wrong, and the
+reason is worth recording. Reading the device descriptor needs endpoint 0's
+packet size, which is *in* the device descriptor. The answer is to ask for only
+the first 8 bytes — 8 is the smallest legal packet size, so every device can
+move it, and the field sits at offset 7. The lazy versions work perfectly on
+every device whose packet size really is 8, which is every low-speed keyboard
+and mouse: exactly the hardware one tests with.
+
+`uhci_frames()` exists because a controller that was configured and never
+started looks identical from every other angle. `lsusb` prints it as a *rate*,
+because a rate has an expected value: a UHCI frame is one millisecond by
+definition, so a live controller reads 1000/s and no other number.
+
+**`make run` attaches the controller and no devices.** `USB=hid` plugs in a
+keyboard and a mouse, and is not the default because QEMU then routes input to
+them — and with no HID driver yet, the machine boots, shows a prompt, and
+cannot be typed at. That was tried rather than assumed.
+
+Deliberately absent: hubs (so one device per root port — QEMU inserts a hub of
+its own once a second device is attached unless the ports are named), the class
+drivers themselves, isochronous transfers, and anything about USB 3, whose bus
+is electrically separate and reachable only through xHCI.
+
 ### The mouse
 
 `mouse` shows the pointer live: position, movement, buttons, and counters for

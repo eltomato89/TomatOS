@@ -15,6 +15,7 @@
 #include <vmm.h>
 #include <fbcon.h>
 #include <mouse.h>
+#include <usb.h>
 #include <exec.h>
 #include <ata.h>
 #include <fat.h>
@@ -936,6 +937,21 @@ static void disk_init(void)
 static void network_init(void)
 {
 	pci_init();
+
+	/* USB before the network, and that order is the interesting part: both
+	*  ask the same PCI enumeration what is on the bus, but QEMU puts its UHCI
+	*  controller on IRQ 11 -- the line the RTL8139 also lands on. The UHCI
+	*  driver polls rather than installing a handler there, precisely so that
+	*  it cannot unhook the card; see the reasoning in src/uhci.c. Bringing it
+	*  up first means a machine where that ever changed would fail loudly here
+	*  rather than quietly losing the network later.
+	*
+	*  No controller is the ordinary outcome, on QEMU without "-device
+	*  piix3-usb-uhci" and on any machine built in the last decade, which has
+	*  xHCI and nothing else. usb_init() says what it found in one line and
+	*  returns either way. */
+	usb_init();
+
 	rtl8139_init();
 	net_init();
 

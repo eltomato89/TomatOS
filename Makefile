@@ -200,7 +200,48 @@ QEMU_KEYMAP ?= de
 # Override with:  make run QEMU_MEM=32
 QEMU_MEM ?= 64
 
-QEMUFLAGS := -m $(QEMU_MEM) -k $(QEMU_KEYMAP)
+# ---------------------------------------------------------------------------
+#  USB
+#
+#  QEMU has no USB controller unless one is asked for, which is also the
+#  ordinary state of a machine built in the last decade -- those have xHCI and
+#  nothing else, and this kernel drives UHCI. So "no controller" is a case the
+#  kernel has to handle either way, and USB=0 is how to see it.
+#
+#  Three settings, because attaching a USB input device has a consequence that
+#  is easy to walk into:
+#
+#      USB=0     no controller at all -- also what a modern machine looks like
+#                to this kernel, since those have xHCI and nothing else
+#      USB=1     the controller, no devices                        (default)
+#      USB=hid   the controller with a keyboard and a mouse on it
+#
+#  USB=hid is for testing the stack and NOT the default, because QEMU routes
+#  input to the most recently attached device of that kind. Attach a USB
+#  keyboard and the monitor's sendkey -- and a real keypress in the window --
+#  goes to it rather than to the PS/2 controller, and this kernel has no HID
+#  driver yet. The result is a machine that boots, shows a prompt, and cannot
+#  be typed at. It was tried; that is exactly what happens.
+#
+#  The "port=" is not decoration either. Left to itself QEMU attaches the first
+#  device to a root port and inserts a HUB for the second, putting it behind
+#  that -- and hubs are deliberately not supported, so the second device
+#  becomes invisible and the kernel reports "class 9/0/0 hub" instead. Naming
+#  the ports puts both on the controller directly. The controller has two, so a
+#  third device would need the hub support that is not here yet.
+USB ?= 1
+
+ifeq ($(USB),hid)
+USBFLAGS := -device piix3-usb-uhci \
+            -device usb-kbd,port=1 \
+            -device usb-mouse,port=2
+else ifeq ($(USB),0)
+USBFLAGS :=
+else
+USBFLAGS := -device piix3-usb-uhci
+endif
+
+QEMUFLAGS := -m $(QEMU_MEM) -k $(QEMU_KEYMAP) $(USBFLAGS)
 
 # ---------------------------------------------------------------------------
 #  Network
@@ -223,6 +264,7 @@ QEMUFLAGS := -m $(QEMU_MEM) -k $(QEMU_KEYMAP)
 #  the wire at all and whether its byte order is what we think it is.
 NET     ?= 1
 NETDUMP ?= 0
+
 
 ifeq ($(NET),1)
 NETDEV := -netdev user,id=n0
@@ -1091,6 +1133,11 @@ help:
 	@echo "  VNC_DISPLAY=<n>       different display number (port 5900+n)"
 	@echo "  QEMU_KEYMAP=<layout>  keyboard layout, default: de"
 	@echo "  NET=0                 run without a network card"
+	@echo "  USB=0                 run without a USB controller"
+	@echo "  USB=hid               attach a USB keyboard and mouse as well."
+	@echo "                        Note QEMU then routes input to them, and"
+	@echo "                        there is no HID driver yet -- so the"
+	@echo "                        machine boots and cannot be typed at."
 	@echo ""
 	@echo "Which targets give a graphics console (1024x768) and which do not:"
 	@echo "  run          text mode. QEMU's -kernel loader does not implement"

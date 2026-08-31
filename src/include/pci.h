@@ -22,6 +22,7 @@
 #define PCI_STATUS       0x06
 #define PCI_CLASS        0x0B
 #define PCI_SUBCLASS     0x0A
+#define PCI_PROG_IF      0x09
 #define PCI_HEADER_TYPE  0x0E
 #define PCI_BAR0         0x10
 #define PCI_INTERRUPT_LINE 0x3C
@@ -40,6 +41,13 @@ typedef struct
     uint16_t device;
     uint8_t  class_code;
     uint8_t  subclass;
+    /* The third level of the class triple, and it is not optional for every
+    *  device: class 0x0C subclass 0x03 is "USB host controller" and says
+    *  nothing about which KIND -- UHCI is 0x00, OHCI 0x10, EHCI 0x20 and xHCI
+    *  0x30, and their register interfaces have nothing in common. A driver
+    *  that matched on class and subclass alone would happily bind to a
+    *  controller it cannot speak to. */
+    uint8_t  prog_if;
     uint8_t  irq;
     uint32_t bar[6];        /* raw base address registers */
 } pci_device;
