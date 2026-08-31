@@ -382,7 +382,6 @@ static usbhid_iface usbhid_ifaces[USBHID_MAX_IFACES];
 static int          usbhid_iface_count = 0;
 static int          usbhid_started     = 0;
 static int          usbhid_task_pid    = -1;
-static int          usbhid_task_running = 0;
 
 static uint32_t usbhid_stat_reports = 0;
 static uint32_t usbhid_stat_keys    = 0;
@@ -1048,56 +1047,6 @@ static void usbhid_task(void)
 
 /* --- Starting the task, which is later than creating it ------------------ */
 
-/* WHY THE TASK IS NOT SIMPLY STARTED WHERE IT IS CREATED. This cost a boot
-*  that stopped dead one line after the USB devices were listed, and net.c
-*  carries the same trap and the same answer above net_drain_start().
-*
-*  usbhid_init() may be called from the boot path -- kernel.c's network_init()
-*  is the obvious place for it, right after usb_init() -- and THE BOOT PATH IS
-*  NOT A TASK. It runs on the boot stack, and schedule() saves the context it
-*  interrupted only when there is a current task to save it into. Until the
-*  first switch there is none, so the first timer tick after ANY task becomes
-*  runnable elects that task and throws the boot away: everything kernel.c
-*  still had to do, the console task included, never happens. The machine ends
-*  up with a perfectly working USB keyboard and nothing to type into.
-*
-*  Creating the task is free -- taskmgr_add_task() leaves the slot suspended
-*  and the scheduler cannot elect what it cannot see. Only the start has to
-*  wait, and what it waits for is the scheduler being demonstrably up already:
-*  taskmgr_get_currpid() returns -1 until it has elected somebody, and the
-*  somebody it elects first is the console task, since that is the first task
-*  the kernel creates.
-*
-*  This is safe from interrupt context, which is where the deferred version
-*  runs from: taskmgr_task_start() only stores a state, exactly as task_wake()
-*  does, and the pid was validated when the task was created so none of its
-*  complaining paths can be reached. */
-static void usbhid_start_handler(struct regs *r);
-
-static void usbhid_start_task(void)
-{
-    if(usbhid_task_running || usbhid_task_pid < 0)
-        return;
-
-    if(taskmgr_get_currpid() < 0)
-        return;
-
-    usbhid_task_running = 1;
-
-    /* Removed before the start rather than after, so this cannot run twice if
-    *  a tick lands between the two. timer_notify_handlers() reads the slot
-    *  into a local before calling, so clearing it from inside the call is
-    *  exactly as safe as clearing it from anywhere else. */
-    timer_uninstall_handler(usbhid_start_handler);
-
-    taskmgr_task_start(usbhid_task_pid);
-}
-
-static void usbhid_start_handler(struct regs *r)
-{
-    (void)r;
-    usbhid_start_task();
-}
 
 /* --- Bringing it up ------------------------------------------------------ */
 
@@ -1105,8 +1054,8 @@ static void usbhid_start_handler(struct regs *r)
 *  starts the one task that polls all of them.
 *
 *  Call it once, after usb_init(). Either from the boot path, next to
-*  usb_init() itself, or from a task -- both work, and the difference between
-*  them is entirely inside usbhid_start_task(), which is where it is explained.
+*  usb_init() itself, or from a task -- both work, and nothing here has to
+*  know which: taskmgr_task_start() holds the boot path apart from the rest.
 *
 *  Safe on a machine with no USB controller and on one with a controller and
 *  nothing plugged in: both leave the interface count at zero and start no
@@ -1164,18 +1113,12 @@ void usbhid_init(void)
     if(usbhid_task_pid < 0)
         return;
 
-    /* Started here when this was called from a task, and from the next timer
-    *  tick after the scheduler is up when it was called from the boot path.
-    *  See usbhid_start_task() for why the second case cannot be the first.
-    *
-    *  A full handler table -- sixteen slots, and nothing else in this kernel
-    *  installs one -- would leave the task suspended forever. It is not worth
-    *  a fallback: the fallback that suggests itself, starting it anyway, is
-    *  precisely the hang this exists to avoid. */
-    usbhid_start_task();
-
-    if(!usbhid_task_running)
-        timer_install_handler(usbhid_start_handler);
+    /* Started right here, wherever this was called from. usbhid_init() runs
+    *  on the boot path, and starting a task there used to throw the boot away
+    *  -- this file carried a timer handler that polled the scheduler until it
+    *  was safe. taskmgr_task_start() now defers it to the handover itself;
+    *  see the block above boot_handed_over in tasks.c. */
+    taskmgr_task_start(usbhid_task_pid);
 }
 
 /* --- What the shell can ask ---------------------------------------------- */

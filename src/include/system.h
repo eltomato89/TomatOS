@@ -306,7 +306,18 @@ extern void taskmgr_task_abort(int pid, int error_number, const char *error_desc
 *  recyclable -- and the same rule about not freeing anything here, since this
 *  runs on the stack of the task it is ending. */
 extern void taskmgr_task_exit(int pid, int status);
+/* Makes a task runnable -- or, before taskmgr_boot_complete(), records that
+*  it should be. See the block above boot_handed_over in tasks.c: the boot
+*  path is not a task, so a task that became runnable there would be elected
+*  by the next tick and the boot would be thrown away. Callers do not have to
+*  know that; this is safe to call from anywhere, boot path included. */
 extern void taskmgr_task_start(int pid);
+
+/* The boot path is finished: release everything it asked to start. Called
+*  exactly once, from kernel(), as the last thing it does. Nothing else may
+*  call this -- a second call is ignored, and a call from anywhere else would
+*  be claiming something it cannot know. */
+extern void taskmgr_boot_complete(void);
 extern void taskmgr_task_suspend(int pid);
 extern void taskmgr_killall();
 

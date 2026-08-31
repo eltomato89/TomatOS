@@ -526,46 +526,9 @@ const void *net_wait_channel(void)
 
 /* The pid of the drain task, or -1. Kept so a second net_init() does not
 *  create a second drainer -- two of them would be exactly the case the
-*  single writer rule above forbids -- and so that it can be made runnable
-*  later than it is created; see net_drain_start() for why it has to be. */
+*  single writer rule above forbids. */
 static int rxq_task    = -1;
-static int rxq_running = 0;
 
-/* Makes the drain task runnable, once and not before it is safe to.
-*
-*  Creating the task in net_init() is free -- taskmgr_add_task() leaves the
-*  slot suspended and the scheduler cannot elect what it cannot see -- but
-*  STARTING it there is not, and the reason is worth writing down because
-*  the symptom is a machine that boots to a blank screen with a perfectly
-*  working network on it.
-*
-*  net_init() runs on the boot path, from kernel.c's network_init(), which
-*  is called before the console task is created. That path is not a task: it
-*  runs on the boot stack. schedule() saves the context it was interrupted
-*  from only when there is a current task to save it into, and until the
-*  first switch there is none -- so the first tick after ANY task becomes
-*  runnable elects that task and throws the boot away. Everything kernel.c
-*  does after network_init(), the console task included, would never happen.
-*
-*  So the task is made runnable at the first moment the scheduler is
-*  demonstrably already running: taskmgr_get_currpid() returns -1 until it
-*  has elected somebody, and the somebody it elects first is the console
-*  task, because that is the first task the kernel creates. Testing it costs
-*  a load and a branch, and only until the answer is yes.
-*
-*  The two callers are net_send() and net_receive(), which is every use of
-*  the stack in either direction. Whichever comes first starts the drain,
-*  and until one of them does there is nothing for it to drain. */
-static void net_drain_start(void)
-{
-    if(rxq_running || rxq_task < 0)
-        return;
-    if(taskmgr_get_currpid() < 0)
-        return;
-
-    rxq_running = 1;
-    taskmgr_task_start(rxq_task);
-}
 
 /* Keeps the compiler from moving the stores that fill a record past the
 *  store that publishes it. Nothing is emitted; the clobber is the point. */
@@ -818,8 +781,12 @@ void net_init(void)
         return;
     }
 
-    /* Not started here. See net_drain_start(). */
-    net_drain_start();
+    /* Started right here, on the boot path, which is safe because
+    *  taskmgr_task_start() defers it to taskmgr_boot_complete() -- see the
+    *  block above boot_handed_over in tasks.c. This file used to carry that
+    *  rule itself, in twenty lines of comment and a deferral to the first
+    *  packet; the rule now lives in the one place that can enforce it. */
+    taskmgr_task_start(rxq_task);
 
     net_is_up = 1;
 
@@ -900,10 +867,6 @@ int net_send(const uint8_t dst_mac[ETH_ALEN], uint16_t type,
         return -1;
     if(len > 0 && payload == 0)
         return -1;
-
-    /* Task context, and the earliest point at which anything uses the
-    *  stack: the right moment to let the drain run. */
-    net_drain_start();
 
     flags = irq_save();
 
@@ -1366,11 +1329,6 @@ void net_receive(const uint8_t *frame, uint32_t len)
     }
 
     stat_rx++;
-
-    /* A machine that only listens still needs its drain. Nothing here is
-    *  reached before the scheduler is running -- net_drain_start() checks
-    *  that itself -- and all it does then is set a state byte. */
-    net_drain_start();
 
     type = ntohs(eth->type);
     if(type != ETH_TYPE_ARP && type != ETH_TYPE_IP)

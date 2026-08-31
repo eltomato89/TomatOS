@@ -41,6 +41,44 @@
 
 static int current_task = -1;
 
+/* THE BOOT PATH IS NOT A TASK, and this is what keeps that from mattering.
+*
+*  kernel() runs on the boot stack, not on any slot's. schedule() files the
+*  registers it interrupted into task_states[current_task], and current_task
+*  is -1 until it has elected somebody -- so before the first switch there is
+*  nowhere to put them and they are not saved at all. The consequence is
+*  sharp: the first timer tick after ANY task becomes runnable elects that
+*  task, and the boot path is simply gone. Everything kernel() had left to do,
+*  the console task included, never happens.
+*
+*  This cost a boot that stopped dead one line after the USB devices were
+*  listed. Three modules met it independently, and each answered it locally --
+*  net.c deferred its drain to the first packet, usbhid.c installed a timer
+*  handler that polled taskmgr_get_currpid() until it stopped saying -1. Both
+*  worked. Neither was discoverable: the rule lived in two comments, and the
+*  fourth module to start a task from kernel() would have found it the same
+*  way the first three did.
+*
+*  So the rule is enforced in the one place that can enforce it. Until
+*  taskmgr_boot_complete() is called, taskmgr_task_start() records the intent
+*  instead of acting on it, and nothing the boot path creates can be elected
+*  out from under it. The scheduler is untouched: it cannot elect what is not
+*  RUNNING, and now nothing is RUNNING until the boot path says so.
+*
+*  What this does NOT do is let a task run DURING boot. A boot path that
+*  started a task and then waited for it to do something would now hang where
+*  it used to lose the boot. Nothing does that, both are bugs, and a hang at
+*  least stops somewhere a debugger can look. The real cure for that case is
+*  to give the boot strand a slot of its own so it becomes an ordinary task --
+*  a much larger change to the most dangerous code here, for a case nothing
+*  has needed yet. */
+static int boot_handed_over = 0;
+
+/* Slots whose taskmgr_task_start() arrived before the handover. Not a queue:
+*  a slot can only be pending once, and the order they are released in is the
+*  scheduler's business rather than this file's. */
+static uint8_t task_start_pending[MAX_TASKS];
+
 task_settings tasks[MAX_TASKS];
 
 /* The kernel stack of every task, or 0 for a slot that has none. A ring 0
@@ -1263,6 +1301,11 @@ static void occupy_slot(int slot, const char *name, int prio)
 	//of leftover that becomes one later.
 	wait_forget(slot);
 
+	/* Same reasoning as wait_forget() above, for the other thing a slot can
+	*  be carrying when it is handed on: a start that was asked for and never
+	*  released belongs to the previous occupant, not to this one. */
+	task_start_pending[slot] = 0;
+
 	tasks[slot].pid = slot;
 	copy_bounded(tasks[slot].name, name, sizeof(tasks[slot].name));
 	tasks[slot].priority = prio;
@@ -1907,9 +1950,62 @@ void taskmgr_task_start(int pid)
 	if(task_states[pid]->eip == 0)
 	{
 		printf("ERR: Task %i has no entry point and can not be started!\n", pid);
+	} else
+	if(!boot_handed_over)
+	{
+		/* Recorded, not refused. Every caller wants exactly this -- see the
+		*  block above boot_handed_over -- and a caller that had to ask first
+		*  would be back to remembering a rule instead of being held to one.
+		*
+		*  The validation above has already run, so a bad pid is still
+		*  reported here, on the boot path, where the message is visible and
+		*  the call is. Deferring the diagnosis to the release would report it
+		*  from a context that says nothing about who asked. */
+		task_start_pending[pid] = 1;
 	} else {
 		tasks[pid].state = TASK_STATE_RUNNING;
 	}
+}
+
+/* The handover: the boot path has nothing left to do, so what it created may
+*  run. Called once, from kernel(), after the console task is created -- and
+*  the console is NOT a special case here, it is simply the last slot the boot
+*  path asked to start.
+*
+*  INTERRUPTS ARE OFF ACROSS THE LOOP, and that is the whole subtlety of this
+*  function. Setting one slot RUNNING with the timer live re-creates the exact
+*  bug this exists to remove: the next tick elects that slot, and the rest of
+*  the loop -- and the console with it -- never runs. The window is a few
+*  instructions wide and would have been a boot that hangs once in a while.
+*
+*  After the restore a tick may switch away at any point, which is the
+*  intended handover rather than a hazard: kernel() returns into start.asm's
+*  halt loop, and there is nothing left to lose.
+*
+*  A slot that stopped being startable in the meantime is skipped rather than
+*  resurrected. Nothing does that today; the test costs one comparison and
+*  removes a way for a dead task to come back to life. */
+void taskmgr_boot_complete(void)
+{
+	unsigned long flags;
+	int i;
+
+	if(boot_handed_over) return;
+
+	__asm__ __volatile__ ("pushfl; popl %0; cli" : "=r" (flags) : : "memory");
+
+	boot_handed_over = 1;
+
+	for(i = 0; i < MAX_TASKS; i++)
+	{
+		if(!task_start_pending[i]) continue;
+		task_start_pending[i] = 0;
+
+		if(tasks[i].state == TASK_STATE_SUSPENDED && task_states[i] != 0)
+			tasks[i].state = TASK_STATE_RUNNING;
+	}
+
+	__asm__ __volatile__ ("pushl %0; popfl" : : "r" (flags) : "memory", "cc");
 }
 
 void taskmgr_task_suspend(int pid)
@@ -1923,6 +2019,12 @@ void taskmgr_task_suspend(int pid)
 		printf("ERR: Task %i could not be found!\n", pid);
 	} else {
 		tasks[pid].state = TASK_STATE_SUSPENDED;
+
+		/* A start that has not been released yet is cancelled by this, which
+		*  is what "suspended" has to mean for it to mean anything: without
+		*  the line, a suspend on the boot path would be quietly undone at the
+		*  handover and the task would start after all. */
+		task_start_pending[pid] = 0;
 
 		//Same problem as on abort: after being suspended, the currently running task
 		//must not keep using up its remaining CPU time.

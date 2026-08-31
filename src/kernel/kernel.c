@@ -999,11 +999,11 @@ static void network_init(void)
 
 	/* The class driver, after the core has enumerated -- it looks through the
 	*  device table the core filled in rather than at the bus. It creates its
-	*  polling task suspended and arranges for it to start once there is a task
-	*  to switch away from, which is the trap three modules in this kernel have
-	*  now hit independently: making a task runnable on the boot path throws
-	*  the boot away, because schedule() saves no context while current_task is
-	*  still -1. */
+	*  polling task and starts it, which is safe here for a reason that used to
+	*  be this module's problem and is now nobody's: taskmgr_task_start() holds
+	*  a start made on the boot path until taskmgr_boot_complete() at the end of
+	*  this file. See the block above boot_handed_over in tasks.c for what that
+	*  is protecting against. */
 	usbhid_init();
 
 	/* Mass storage, after HID and after blk_init() -- it registers block
@@ -1364,6 +1364,17 @@ int kernel(uint32_t magic, multiboot_info *mbi_phys)
 
 	task_console = taskmgr_add_task( main, "CONSOLE", TASK_PRIORITY_REALTIME );
 	taskmgr_task_start(task_console);
+
+	/* Nothing this function created has been runnable until now -- see the
+	*  block above boot_handed_over in tasks.c. This is the line that hands
+	*  the machine over, and it is the last one on purpose: after it the very
+	*  next tick may elect somebody, and everything above has to be done.
+	*
+	*  The console is released by this call like anything else. It is not
+	*  started separately, because a boot path that had to start one task by
+	*  hand and let the others be released would be two rules where there is
+	*  one. */
+	taskmgr_boot_complete();
 
 	/* From here on the timer IRQ takes over: the scheduler jumps into the
 	 * console task. We return to start.asm, which waits there in an
