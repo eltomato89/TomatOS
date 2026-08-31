@@ -778,9 +778,20 @@ static void paint_body_mouse(gfx_surface *c, const gfx_rect *body)
 		gfx_fill_rect(c, bx + i * step, by, box, box,
 		              on ? col_bar : col_shadow);
 		gfx_draw_rect(c, bx + i * step, by, box, box, col_frame);
+		/* The letter is dark when the button is up and white when it is
+		*  down, and in both cases it is the strongest contrast available
+		*  against the fill behind it. It used to be col_dim on col_shadow --
+		*  0x505050 on 0x707068, two mid greys a shade apart, which is legible
+		*  at 8x8 only if you already know what it says.
+		*
+		*  The state is carried by the FILL, which is what a real button does:
+		*  the label says which button it is and does not change, the surface
+		*  says whether it is pressed. Signalling the state by dimming the
+		*  label instead makes the one thing that must stay readable the thing
+		*  that gets harder to read. */
 		gfx_char(c, bx + i * step + inset, by + (box - gui_cell_h) / 2,
 		         (i == 0) ? 'L' : ((i == 1) ? 'R' : 'M'),
-		         gui_scale, on ? col_title_text : col_dim);
+		         gui_scale, on ? col_title_text : col_text);
 	}
 
 	body_line(c, body, 4, (gui_drag >= 0) ? "dragging" : "", col_text);

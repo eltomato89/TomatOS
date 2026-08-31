@@ -3032,7 +3032,24 @@ static int sys_mapfb(struct regs *r)
 		return SYS_ENOMEM;
 	}
 
+	/* The pointer's field becomes the screen, and the pointer is put in the
+	*  middle of it.
+	*
+	*  Setting the bounds alone is not enough, and the difference is visible.
+	*  The driver's own default field is 640x480, so a pointer nobody has moved
+	*  sits at (320,240). Growing the field to 1920x1080 leaves it there --
+	*  legal, inside the new rectangle, and three quarters of the way into the
+	*  top left corner. A program that has just taken the whole screen has no
+	*  way to find out: there is no call that reads the position, only events,
+	*  so it draws its cursor wherever it assumes the pointer is and the two
+	*  disagree until the user moves the mouse. That was seen on screen -- a
+	*  cursor drawn at the centre while the first event reported (320,240).
+	*
+	*  Centring is the answer rather than adding a "where is it" call, because
+	*  a defined starting point is what the program actually needs, and the
+	*  centre is the one place both sides can agree on without asking. */
 	mouse_set_bounds((int)fbcon_width(), (int)fbcon_height());
+	mouse_set_position((int)fbcon_width() / 2, (int)fbcon_height() / 2);
 
 	/* Asked a second time, after the mapping. The invariant that makes one
 	*  check enough elsewhere -- only the caller edits the caller's half, and
