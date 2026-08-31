@@ -22,6 +22,25 @@ ISO_DIR     := $(BUILD_DIR)/iso
 USER_DIR    := user
 USER_OBJ_DIR := $(BUILD_DIR)/user
 
+# What the disk contains, as files rather than as recipe lines.
+#
+# Everything under here is copied onto the image with its path and its name
+# unchanged, so the tree in the source is the tree the shell walks. Adding a
+# file to the disk is putting it in this directory; nothing in this Makefile
+# has to learn about it.
+#
+# THE NAMES ARE UPPER CASE 8.3 ON PURPOSE, and that is the one thing about
+# this directory that looks wrong and is not. mtools writes a VFAT long name
+# entry for any name that is not a valid 8.3, and src/fat.c skips long name
+# entries -- so a file called "readme.txt" here would be copied onto the
+# image, take up clusters, and be invisible to every program that lists a
+# directory. The name in the source tree is the name on the disk, which also
+# means one can see from here what "ls /" will print.
+#
+# Build outputs do not live here: the programs are compiled into $(BUILD_DIR)
+# and joined with this tree in $(STAGING_DIR) below.
+SYSROOT_DIR := sysroot
+
 KERNEL      := $(BUILD_DIR)/kernel.elf
 ISO         := $(BUILD_DIR)/tomatos.iso
 
@@ -789,35 +808,67 @@ define fat_format
 		-c $(DISK_CLUSTER) -H 0 -m $(DISK_MEDIA) -R $(2) -v $(DISK_LABEL) ::
 endef
 
-# Fill a formatted volume with the tree the shell walks. Shared verbatim by
-# $(DISK) and $(BOOTIMG) so the two images differ only in their boot chain,
-# never in their contents.
-#   $(1) = image file
-define fat_populate
-	@$(MTOOLS_ENV) $(MMD) -i $(1) ::/BIN ::/DOCS
+# ---------------------------------------------------------------------------
+#  The staging tree: what goes on the image, assembled as a directory
+#
+#  The image used to be filled by a recipe -- an mmd for the directories, a
+#  loop for the programs, and three text files whose wording lived inside a
+#  shell block in this Makefile. That worked, and it had three costs: the
+#  contents of the disk could not be looked at without reading a Makefile,
+#  adding a file meant editing a recipe, and the directory structure was
+#  hard coded in an mmd line that had to be kept in step with the copies
+#  below it.
+#
+#  So the image is now built from a directory instead. $(STAGING_DIR) is the
+#  disk, laid out exactly as it will appear, and filling the volume is one
+#  recursive copy. The structure comes from the tree: a new subdirectory in
+#  $(SYSROOT_DIR) needs no mmd here, because mtools creates what it finds.
+#
+#  It is assembled rather than checked in, because two different kinds of
+#  thing end up on the disk:
+#
+#    - $(SYSROOT_DIR), in the source tree, holds what a human wrote. It is
+#      versioned, and a change to it shows up in a diff as a change to the
+#      file rather than as a change to a shell quoting escape.
+#    - The programs are build outputs. They are compiled into $(BUILD_DIR),
+#      and copying them here under their 8.3 names is the only place the
+#      lower case source name and the upper case disk name meet.
+#
+#  DOCS/DISK.TXT stays GENERATED, which is the one deliberate exception. It
+#  quotes the geometry the image was actually built with, so it is checkable
+#  against the volume it sits on -- a static copy of those numbers would be a
+#  second place to change them and a first place for them to go stale.
+STAGING_DIR   := $(BUILD_DIR)/staging
+STAGING_STAMP := $(BUILD_DIR)/staging.stamp
+
+# Every file, at any depth. Listed rather than globbed one level deep so that
+# editing sysroot/DOCS/whatever rebuilds the image.
+SYSROOT_FILES := $(shell find $(SYSROOT_DIR) -type f 2>/dev/null)
+
+# THE DIRECTORIES ARE PREREQUISITES TOO, and that is not redundant with the
+# files above. This list is taken once, when make parses this file, so a
+# DELETED file is not in it -- there is nothing left to be newer than the
+# stamp, make finds nothing to do, and the image keeps a file the source tree
+# no longer has. That is the worst of the three cases: an added file that is
+# missing gets noticed, a changed file that is stale gets noticed, and a
+# deleted file that is still there looks exactly like a file that is supposed
+# to be there.
+#
+# A directory's timestamp moves when an entry is added to it or removed from
+# it, which is precisely the event the file list cannot see. Removing a whole
+# subtree touches its parent, so that is covered as well.
+SYSROOT_DIRS := $(shell find $(SYSROOT_DIR) -type d 2>/dev/null)
+
+# Makefile is a prerequisite because DISK.TXT below is generated from it.
+$(STAGING_STAMP): $(USER_ELFS) $(SYSROOT_FILES) $(SYSROOT_DIRS) Makefile | $(BUILD_DIR)
+	@echo "  STAGE   $(STAGING_DIR)"
+	@rm -rf $(STAGING_DIR)
+	@mkdir -p $(STAGING_DIR)/BIN $(STAGING_DIR)/DOCS
+	@cp -R $(SYSROOT_DIR)/. $(STAGING_DIR)/
 	@for p in $(USER_PROGS); do \
 		u=`echo $$p | tr 'a-z' 'A-Z'`; \
-		echo "  DISK    /BIN/$$u.ELF"; \
-		$(MTOOLS_ENV) $(MCOPY) -o -i $(1) $(BUILD_DIR)/$$p.elf ::/BIN/$$u.ELF; \
+		cp $(BUILD_DIR)/$$p.elf $(STAGING_DIR)/BIN/$$u.ELF; \
 	done
-	@echo "  DISK    /README.TXT /MOTD.TXT /DOCS/DISK.TXT"
-	@{ \
-		echo 'TomatOS on a disk'; \
-		echo '================='; \
-		echo ''; \
-		echo 'This volume is read by src/ata.c (ATA PIO, LBA28) and'; \
-		echo 'src/fat.c (FAT12/16, read only).'; \
-		echo ''; \
-		echo 'Layout:'; \
-		echo '  /BIN    user programs, one ELF each'; \
-		echo '  /DOCS   text files, one level down'; \
-		echo ''; \
-		echo 'Rebuild it with "make disk".'; \
-	} | $(MTOOLS_ENV) $(MCOPY) -o -i $(1) - ::/README.TXT
-	@{ \
-		echo 'Welcome to TomatOS.'; \
-		echo 'Ripe since 2011.'; \
-	} | $(MTOOLS_ENV) $(MCOPY) -o -i $(1) - ::/MOTD.TXT
 	@{ \
 		echo 'Disk geometry'; \
 		echo '-------------'; \
@@ -832,13 +883,27 @@ define fat_populate
 		echo 'at LBA 0.'; \
 		echo ''; \
 		echo 'If you can read this, directory traversal works.'; \
-	} | $(MTOOLS_ENV) $(MCOPY) -o -i $(1) - ::/DOCS/DISK.TXT
+	} > $(STAGING_DIR)/DOCS/DISK.TXT
+	@touch $@
+
+# Fill a formatted volume with the staging tree. Shared verbatim by $(DISK)
+# and $(BOOTIMG) so the two images differ only in their boot chain, never in
+# their contents.
+#
+# -s makes mcopy descend, which is what turns the tree into the recipe. The
+# shell expands the wildcard to the top level entries, files and directories
+# alike; everything below them is mtools' business.
+#   $(1) = image file
+define fat_populate
+	@echo "  DISK    $(STAGING_DIR) -> $(1)"
+	@$(MTOOLS_ENV) $(MCOPY) -s -o -i $(1) $(STAGING_DIR)/* ::
 endef
 
-# Makefile is a prerequisite because the text files above live in this file:
-# editing their content has to rebuild the image, and so does changing the
-# geometry.
-$(DISK): $(USER_ELFS) Makefile | $(BUILD_DIR)
+# The staging tree is the prerequisite rather than the programs: it already
+# depends on them, on sysroot/ and on this file, so anything that changes what
+# lands on the disk arrives through it. Makefile stays listed for the geometry
+# in the format line below, which is not part of the tree.
+$(DISK): $(STAGING_STAMP) Makefile | $(BUILD_DIR)
 	@echo "  IMG     $@  ($(DISK_SIZE_MB) MB, C/H/S $(DISK_CYLS)/$(DISK_HEADS)/$(DISK_SECS), FAT16)"
 	$(call fat_format,$@,1)
 	$(call fat_populate,$@)
@@ -998,7 +1063,7 @@ $(KERNEL_BIN): $(KERNEL) | $(BUILD_DIR)
 # not copied.
 bootdisk: $(BOOTIMG)
 
-$(BOOTIMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_BIN) $(USER_ELFS) Makefile | $(BUILD_DIR)
+$(BOOTIMG): $(STAGE1_BIN) $(STAGE2_BIN) $(KERNEL_BIN) $(STAGING_STAMP) Makefile | $(BUILD_DIR)
 	@echo "  IMG     $@  ($(DISK_SIZE_MB) MB, FAT16, $(RESERVED_SECTORS) reserved sectors)"
 	$(call fat_format,$@,$(RESERVED_SECTORS))
 	$(call fat_populate,$@)
