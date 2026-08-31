@@ -90,16 +90,45 @@ extern int mouse_poll(mouse_event *out);
 extern const void *mouse_wait_channel(void);
 
 /* Counters, for a shell that wants to show whether the hardware is actually
-*  saying anything. resyncs is the interesting one: a stream that keeps losing
-*  its framing points at the controller or at a lost interrupt, and a pointer
-*  that jumps is otherwise very hard to tell from a driver bug. */
+*  saying anything.
+*
+*  packets counts what arrived from WHATEVER pointer is in use, PS/2 or
+*  injected, because a count that stayed at zero while the pointer visibly
+*  moved reads as a broken driver. The other three are properties of an
+*  unframed byte stream and stay PS/2 only: resyncs is the interesting one --
+*  a stream that keeps losing its framing points at the controller or a lost
+*  interrupt, and a pointer that jumps is otherwise very hard to tell from a
+*  driver bug. USB has framing and cannot lose it, so those stay at zero
+*  there, which is the truth rather than a gap. */
 extern uint32_t mouse_packets(void);
 extern uint32_t mouse_resyncs(void);
 extern uint32_t mouse_overflows(void);
 extern uint32_t mouse_dropped(void);
 
 /* What the device turned out to be, for "mouse" to print: whether the wheel
-*  was negotiated, how many buttons it reports. A short phrase, never null. */
+*  was negotiated, how many buttons it reports, and which bus it is on. A short
+*  phrase, never null. */
 extern const char *mouse_describe(void);
+
+/* Delivers movement and buttons from a pointing device that is not the one on
+*  the 8042 -- today a USB HID mouse. This is what the promise at the top of
+*  this file cashes in: nothing above learns which bus the pointer is on.
+*
+*  dx and dy are in SCREEN orientation: positive y is down. That is the same
+*  direction a HID boot mouse already reports and the OPPOSITE of what a PS/2
+*  mouse sends, which counts up. The inversion belongs to whichever driver
+*  needs it, and doing it here as well would invert twice for one of them --
+*  which is a pointer that works and a pointer that moves the wrong way, from
+*  code that looks identical.
+*
+*  buttons is the full current state, MOUSE_BUTTON_*, not a change: what
+*  changed is worked out here, so a driver that only knows which buttons are
+*  down right now -- which is all a HID report says -- does not have to
+*  remember the previous one.
+*
+*  Safe from interrupt context, and from a task; a USB driver that polls will
+*  be in the latter. name is what mouse_describe() should say afterwards, or 0
+*  to leave it alone. */
+extern void mouse_inject(int dx, int dy, uint8_t buttons, const char *name);
 
 #endif

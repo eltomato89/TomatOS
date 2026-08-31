@@ -216,12 +216,18 @@ QEMU_MEM ?= 64
 #      USB=1     the controller, no devices                        (default)
 #      USB=hid   the controller with a keyboard and a mouse on it
 #
-#  USB=hid is for testing the stack and NOT the default, because QEMU routes
-#  input to the most recently attached device of that kind. Attach a USB
-#  keyboard and the monitor's sendkey -- and a real keypress in the window --
-#  goes to it rather than to the PS/2 controller, and this kernel has no HID
-#  driver yet. The result is a machine that boots, shows a prompt, and cannot
-#  be typed at. It was tried; that is exactly what happens.
+#  USB=hid works: the HID class driver reads both, and typing on the USB
+#  keyboard reaches the shell exactly as the PS/2 one does -- kb_inject() and
+#  mouse_inject() feed the same queues, so nothing above learns which bus a
+#  keypress came from.
+#
+#  It is still not the default, and the reason is about failure rather than
+#  function. QEMU routes input to the most recently attached device of that
+#  kind, so with a USB keyboard present the PS/2 one gets nothing at all --
+#  which means a regression in the HID driver produces a machine that boots,
+#  shows a prompt, and cannot be typed at. That happened before the driver
+#  existed, and it is not a state "make run" should be one bad commit away
+#  from.
 #
 #  The "port=" is not decoration either. Left to itself QEMU attaches the first
 #  device to a root port and inserts a HUB for the second, putting it behind
@@ -1135,9 +1141,10 @@ help:
 	@echo "  NET=0                 run without a network card"
 	@echo "  USB=0                 run without a USB controller"
 	@echo "  USB=hid               attach a USB keyboard and mouse as well."
-	@echo "                        Note QEMU then routes input to them, and"
-	@echo "                        there is no HID driver yet -- so the"
-	@echo "                        machine boots and cannot be typed at."
+	@echo "                        They work -- QEMU routes input to them and"
+	@echo "                        the HID driver reads it. Not the default"
+	@echo "                        because it leaves the PS/2 pair unused, so"
+	@echo "                        a driver regression would lock the keyboard."
 	@echo ""
 	@echo "Which targets give a graphics console (1024x768) and which do not:"
 	@echo "  run          text mode. QEMU's -kernel loader does not implement"

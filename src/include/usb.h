@@ -261,4 +261,33 @@ extern uint32_t usb_errors(void);
 /* Why the last thing that failed, failed. Empty when nothing has. */
 extern const char *usb_last_error(void);
 
+/* --- The HID class driver ------------------------------------------------
+*
+*  Declared here rather than in a header of its own because it is the first
+*  class driver and there is exactly one; a second would be the moment to
+*  split them apart.
+*
+*  It claims interfaces of class 3 subclass 1 -- boot protocol keyboards and
+*  mice -- and delivers what they say into the queues the PS/2 drivers already
+*  fill, through kb_inject() and mouse_inject(). Nothing above learns which bus
+*  a keypress came from, which is the whole point of those two entry points. */
+extern void usbhid_init(void);
+
+extern int  usbhid_present(void);
+extern int  usbhid_count(void);
+
+/* One line about the claimed interface at "index": what it is, which port, and
+*  whether it has since been unplugged. A static buffer, never null. */
+extern const char *usbhid_describe(int index);
+
+/* What has actually come off the wire. reports excludes NAKs, so a keyboard
+*  nobody is touching leaves it still -- which is what makes it useful: a
+*  number that climbs while nothing is being typed means the device is
+*  chattering, and one that stays at zero while keys are pressed means the
+*  polling is not reaching it. */
+extern uint32_t usbhid_reports(void);
+extern uint32_t usbhid_keys(void);
+extern uint32_t usbhid_moves(void);
+extern uint32_t usbhid_errors(void);
+
 #endif

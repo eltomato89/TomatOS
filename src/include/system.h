@@ -164,6 +164,22 @@ extern int timer_uninstall_handler(void (*handler)(struct regs *r));
 
 /* KEYBOARD.C */
 extern void keyboard_install();
+
+/* Delivers a character as if it had been typed, for a keyboard that is not the
+*  one on the 8042 -- today a USB HID keyboard.
+*
+*  It exists so that nothing above the keyboard learns where a key came from.
+*  getch() blocks on a channel this wakes, the shell reads it the same way, and
+*  a program in ring 3 reaching SYS_GETCH cannot tell the difference. That is
+*  the same arrangement mouse_inject() gives the pointer, and the reason both
+*  exist is that the PS/2 controller is not going to be the only source for
+*  much longer.
+*
+*  Safe from interrupt context, which is where a driver will call it. A
+*  character of 0 is ignored: it is what kb.c's own tables produce for a key
+*  with no character -- a modifier, a function key -- and delivering it would
+*  wake every waiter for nothing. */
+extern void kb_inject(unsigned char ch);
 extern unsigned char getch();
 extern void kb_flush();
 

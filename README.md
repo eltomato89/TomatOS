@@ -418,10 +418,53 @@ keyboard and a mouse, and is not the default because QEMU then routes input to
 them — and with no HID driver yet, the machine boots, shows a prompt, and
 cannot be typed at. That was tried rather than assumed.
 
+#### HID: the same keys, a different bus
+
+`USB=hid` attaches a USB keyboard and mouse, and they work. The proof is
+blunt: QEMU routes input to the most recently attached device of a kind, so
+with a USB keyboard present the PS/2 one gets nothing — and before the class
+driver existed, that configuration booted to a prompt that could not be typed
+at. Now `lsusb` typed on the USB keyboard reaches the shell.
+
+Nothing above the drivers learns which bus a keypress came from.
+`kb_inject()` and `mouse_inject()` deliver into the same slot and the same
+queue the PS/2 handlers fill, so `getch()`, the shell, `SYS_GETCH` and the
+window system are all unchanged. That was the promise at the top of
+`mouse.h` from the day it was written, and this is it being cashed in.
+
+Three things about HID are not what the PS/2 equivalent taught:
+
+**A keyboard report is a state, not an event.** Eight bytes: modifiers, a
+reserved byte, and six slots naming the keys *currently held*. A press is a
+usage that is in the new report and not the old one, so the previous report
+has to be kept — and slot order is meaningless, so it is set membership rather
+than position. All six slots holding `0x01` is not six keys but the device
+saying too many are down to report, and storing that as the previous state
+would make every still-held key look newly pressed afterwards: a burst of
+characters on release.
+
+**Auto-repeat does not exist.** A PS/2 keyboard repeats in hardware; a USB one
+just keeps saying the key is held. Without repeat implemented in the driver, a
+held backspace deletes one character and the two keyboards on one machine
+behave visibly differently.
+
+**Y is already the right way up.** A HID boot mouse reports screen
+orientation, positive down; a PS/2 mouse counts up and is flipped in its
+driver. `mouse_inject()` therefore takes screen orientation, and its comment
+says so, because doing the flip in both places is a pointer that moves the
+wrong way from code that looks identical.
+
+Usage IDs are not scancodes — a different alphabet with the shift state in its
+own byte — so the layout is a second table, and it must produce the *same*
+characters as `kb.c` does for the same physical keys. That correspondence is
+testable without hardware and was: 82 usages compared against the PS/2 tables
+in both shift states, all equal, with the divergences (keypad `/`, the key
+next to left shift) documented rather than smoothed over.
+
 Deliberately absent: hubs (so one device per root port — QEMU inserts a hub of
-its own once a second device is attached unless the ports are named), the class
-drivers themselves, isochronous transfers, and anything about USB 3, whose bus
-is electrically separate and reachable only through xHCI.
+its own once a second device is attached unless the ports are named), mass
+storage, isochronous transfers, and anything about USB 3, whose bus is
+electrically separate and reachable only through xHCI.
 
 ### The mouse
 

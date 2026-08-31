@@ -539,18 +539,95 @@ static int mouse_clamp(int v, int limit)
 *  Called from the interrupt with three bytes that have passed the framing
 *  check. Everything the header warns about is here.
 */
+/* Everything that happens once a movement and a button state are known,
+*  wherever they came from. Split out of mouse_process_packet() so that
+*  mouse_inject() -- a USB HID mouse, today -- runs the identical code rather
+*  than a second copy of it that drifts. The one thing the callers must agree
+*  on before getting here is the SIGN of dy: screen orientation, positive
+*  down, per mouse.h. A PS/2 packet has to be flipped first; a HID report does
+*  not. Doing it here would be doing it twice for one of them.
+*
+*  Runs with interrupts off when the PS/2 handler calls it, and in task
+*  context when a polled USB driver does. It touches the queue's producer end
+*  and the position, which is the interrupt's half of the split -- so a task
+*  side caller has to hold the guard, which mouse_inject() does. */
+static void mouse_deliver(int dx, int dy, uint8_t buttons, unsigned int now_ms)
+{
+    uint8_t  changed;
+    int      nx;
+    int      ny;
+    uint32_t head;
+    uint32_t tail;
+    uint32_t slot;
+
+    /* CLAMPED ON EVERY UPDATE, not only when someone asks. A pointer that is
+    *  allowed off its rectangle is a pointer the user cannot get back: the
+    *  counts that took it out there have to be undone one for one before it
+    *  reappears, and there is nothing on screen during that to say which way
+    *  to move. */
+    nx = mouse_clamp((int)cur_x + dx, bound_w);
+    ny = mouse_clamp((int)cur_y + dy, bound_h);
+
+    changed = (uint8_t)(buttons ^ cur_buttons);
+
+    cur_x       = (int16_t)nx;
+    cur_y       = (int16_t)ny;
+    cur_buttons = buttons;
+
+    /* A packet that moved nothing and changed nothing produces no event. The
+    *  device only sends when something happened, so this is rare -- an
+    *  overflow packet with no button change is the usual way to get here --
+    *  but an event that says nothing would still cost a queue slot and a walk
+    *  over the task table to wake somebody who then finds nothing to do. */
+    if(dx == 0 && dy == 0 && changed == 0)
+        return;
+
+    head = mq_head;
+    tail = mq_tail;
+
+    if((uint32_t)(head - tail) >= (uint32_t)MOUSE_QUEUE_SIZE)
+    {
+        stat_dropped++;
+        return;
+    }
+
+    slot = head & MOUSE_QUEUE_MASK;
+
+    /* dx and dy are the movement the DEVICE reported, with the Y inversion
+    *  applied and nothing else -- not the difference between the old and new
+    *  positions. The two differ only at an edge, where the position stopped
+    *  and the hand did not, and there the reported delta is the one piece of
+    *  information a caller cannot reconstruct: x and y already say where the
+    *  pointer ended up, so a delta that merely repeats that would carry
+    *  nothing. Anything that wants the on-screen step has it as the difference
+    *  between two consecutive events' x. */
+    mq[slot].x       = (int16_t)nx;
+    mq[slot].y       = (int16_t)ny;
+    mq[slot].dx      = (int16_t)dx;
+    mq[slot].dy      = (int16_t)dy;
+    mq[slot].buttons = buttons;
+    mq[slot].changed = changed;
+    mq[slot].time_ms = (uint32_t)now_ms;
+
+    /* Publication: everything above is in memory the consumer does not look
+    *  at, because it only reads below mq_head. The barrier keeps the compiler
+    *  from moving the index ahead of the fields. */
+    __asm__ __volatile__ ("" : : : "memory");
+    mq_head = head + 1;
+
+    /* The whole of what the interrupt owes anybody who is waiting. task_wake()
+    *  walks the task table, sets states and returns -- no printing, no drain,
+    *  no switch, exactly as in kb.c's keyboard handler. The scheduler picks it
+    *  up at the next tick. */
+    task_wake(MOUSE_WAIT_CHANNEL);
+}
+
 static void mouse_process_packet(unsigned int now_ms)
 {
     unsigned char flags;
     uint8_t       buttons;
-    uint8_t       changed;
     int           dx;
     int           dy;
-    int           nx;
-    int           ny;
-    uint32_t      head;
-    uint32_t      tail;
-    uint32_t      slot;
 
     flags = pkt[0];
     stat_packets++;
@@ -629,66 +706,7 @@ static void mouse_process_packet(unsigned int now_ms)
         dy = -dy;
     }
 
-    /* CLAMPED ON EVERY UPDATE, not only when someone asks. A pointer that is
-    *  allowed off its rectangle is a pointer the user cannot get back: the
-    *  counts that took it out there have to be undone one for one before it
-    *  reappears, and there is nothing on screen during that to say which way
-    *  to move. */
-    nx = mouse_clamp((int)cur_x + dx, bound_w);
-    ny = mouse_clamp((int)cur_y + dy, bound_h);
-
-    changed = (uint8_t)(buttons ^ cur_buttons);
-
-    cur_x       = (int16_t)nx;
-    cur_y       = (int16_t)ny;
-    cur_buttons = buttons;
-
-    /* A packet that moved nothing and changed nothing produces no event. The
-    *  device only sends when something happened, so this is rare -- an
-    *  overflow packet with no button change is the usual way to get here --
-    *  but an event that says nothing would still cost a queue slot and a walk
-    *  over the task table to wake somebody who then finds nothing to do. */
-    if(dx == 0 && dy == 0 && changed == 0)
-        return;
-
-    head = mq_head;
-    tail = mq_tail;
-
-    if((uint32_t)(head - tail) >= (uint32_t)MOUSE_QUEUE_SIZE)
-    {
-        stat_dropped++;
-        return;
-    }
-
-    slot = head & MOUSE_QUEUE_MASK;
-
-    /* dx and dy are the movement the DEVICE reported, with the Y inversion
-    *  applied and nothing else -- not the difference between the old and new
-    *  positions. The two differ only at an edge, where the position stopped
-    *  and the hand did not, and there the reported delta is the one piece of
-    *  information a caller cannot reconstruct: x and y already say where the
-    *  pointer ended up, so a delta that merely repeats that would carry
-    *  nothing. Anything that wants the on-screen step has it as the difference
-    *  between two consecutive events' x. */
-    mq[slot].x       = (int16_t)nx;
-    mq[slot].y       = (int16_t)ny;
-    mq[slot].dx      = (int16_t)dx;
-    mq[slot].dy      = (int16_t)dy;
-    mq[slot].buttons = buttons;
-    mq[slot].changed = changed;
-    mq[slot].time_ms = (uint32_t)now_ms;
-
-    /* Publication: everything above is in memory the consumer does not look
-    *  at, because it only reads below mq_head. The barrier keeps the compiler
-    *  from moving the index ahead of the fields. */
-    __asm__ __volatile__ ("" : : : "memory");
-    mq_head = head + 1;
-
-    /* The whole of what the interrupt owes anybody who is waiting. task_wake()
-    *  walks the task table, sets states and returns -- no printing, no drain,
-    *  no switch, exactly as in kb.c's keyboard handler. The scheduler picks it
-    *  up at the next tick. */
-    task_wake(MOUSE_WAIT_CHANNEL);
+    mouse_deliver(dx, dy, buttons, now_ms);
 }
 
 /* --- The interrupt --------------------------------------------------------
@@ -1160,8 +1178,59 @@ uint32_t mouse_dropped(void)
     return stat_dropped;
 }
 
+/* Set by mouse_inject() to whatever the other driver calls itself, and
+*  reported instead of the PS/2 description once something has come in that
+*  way. Null until then. */
+static const char *foreign_name = 0;
+
+/* Delivers movement from a pointing device that is not on the 8042. See
+*  mouse.h for the contract, and in particular for why dy arrives already in
+*  screen orientation rather than being flipped here.
+*
+*  It takes the interrupt guard where mouse_process_packet() does not need to:
+*  the PS/2 handler is already inside an interrupt, while this may be called
+*  from a task -- a polled USB driver is -- and mouse_deliver() writes the
+*  producer end of a queue whose other end is read by tasks. Without the guard
+*  a timer tick between the two stores that publish an event would let a
+*  consumer see a slot that has been counted and not filled in. */
+void mouse_inject(int dx, int dy, uint8_t buttons, const char *name)
+{
+    unsigned long flags;
+
+    flags = mouse_irq_save();
+
+    /* Marking the pointer present is what makes everything above this file
+    *  start believing it: mouse_present() gates the shell command and the
+    *  bounds. A machine with no PS/2 mouse and a USB one has to answer yes. */
+    mouse_present_flag = 1;
+    if(name != 0)
+        foreign_name = name;
+
+    /* Counted here as well, because mouse_packets() is one of the numbers
+    *  mouse.h promises says whether the hardware is saying anything -- and a
+    *  pointer that plainly moved while the count stayed at zero reads as a
+    *  broken driver. It was exactly that on screen before this line: position
+    *  (416,300) under the words "no packet has arrived yet".
+    *
+    *  The other three counters stay PS/2 only and that is right rather than an
+    *  oversight: resyncs and overflows are properties of an unframed byte
+    *  stream, which USB does not have, and a USB report that goes nowhere is
+    *  counted by the class driver instead. */
+    stat_packets++;
+
+    mouse_deliver(dx, dy, buttons, (unsigned int)timer_get_ticks());
+
+    mouse_irq_restore(flags);
+}
+
 const char *mouse_describe(void)
 {
+    /* Whatever last spoke wins. A machine with both a PS/2 and a USB pointer
+    *  has one cursor, and naming the one that is actually moving it is more
+    *  use than naming the one that was found first. */
+    if(foreign_name != 0)
+        return foreign_name;
+
     if(!mouse_present_flag)
         return "no mouse";
 

@@ -284,6 +284,44 @@ unsigned char getchs()
 	special_key = EOS;
 	return x;
 }
+/* Delivers a character from somewhere other than the 8042 -- see the
+*  declaration in system.h for why this exists at all.
+*
+*  Structurally it is the tail of keyboard_handler(): store, then wake. Two
+*  differences, both deliberate.
+*
+*  It does NOT go through the scancode tables. A USB HID keyboard reports usage
+*  IDs, which are a different alphabet from PS/2 scancodes and carry their own
+*  shift state in a separate byte; translating them is the HID driver's job
+*  because only it knows what it received. What arrives here is already a
+*  character.
+*
+*  And it takes the interrupt guard, where the handler does not need to: the
+*  handler already runs with interrupts off, this may be called from anywhere.
+*  last_key is one byte and a store to it cannot tear, but the guard also
+*  covers the "was it empty" question a caller may ask around it.
+*
+*  A character that arrives while one is still unread REPLACES it, which is
+*  what the 8042 path does too -- there is one slot and always has been. That
+*  is a known limitation of this keyboard layer and not something this function
+*  should fix on its own; fixing it means a queue, and then getch(), getchn(),
+*  SYS_GETCH and SYS_INPUT all have to agree about it. */
+void kb_inject(unsigned char ch)
+{
+	unsigned long flags;
+
+	/* EOS is the "nothing here" marker, so injecting it would be indis-
+	*  tinguishable from an empty slot and would wake every waiter to find
+	*  nothing. Modifiers and function keys legitimately produce it. */
+	if(ch == EOS) return;
+
+	flags = kb_irq_save();
+	last_key = ch;
+	kb_irq_restore(flags);
+
+	task_wake(KB_WAIT_CHANNEL);
+}
+
 unsigned char getchn()
 {
 	char x;

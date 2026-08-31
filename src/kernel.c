@@ -952,6 +952,15 @@ static void network_init(void)
 	*  returns either way. */
 	usb_init();
 
+	/* The class driver, after the core has enumerated -- it looks through the
+	*  device table the core filled in rather than at the bus. It creates its
+	*  polling task suspended and arranges for it to start once there is a task
+	*  to switch away from, which is the trap three modules in this kernel have
+	*  now hit independently: making a task runnable on the boot path throws
+	*  the boot away, because schedule() saves no context while current_task is
+	*  still -1. */
+	usbhid_init();
+
 	rtl8139_init();
 	net_init();
 
