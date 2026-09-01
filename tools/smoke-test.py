@@ -103,7 +103,18 @@ FILESYSTEM_LINE = re.compile(r"^Filesystem: (FAT\d+) on ([^,\s]+)", re.M)
 #    kernel banner and this one lie the GDT, the IDT, the syscall gate, the
 #    scheduler and the handover in taskmgr_boot_complete(); this line is
 #    printed by a task, so it says the scheduler actually switched into one.
-SHELL_BANNER = "eltomato's TomatOS 0.31"
+#    The version is NOT part of what is matched. It was, and the first time
+#    somebody bumped it the test went red pointing at the shell banner, which
+#    is the one thing that had not broken. What this line is here to prove is
+#    that a task ran and printed something -- the version it prints is the
+#    Makefile's business, and expected_version() below checks it separately
+#    so that a mismatch says "wrong version" rather than "no shell".
+SHELL_BANNER = "eltomato's TomatOS"
+
+#    And the version it carries, checked separately -- see the version block
+#    in main(). Matches what main.c prints from TOMATOS_VERSION and
+#    TOMATOS_BUILD.
+VERSION_LINE = re.compile(r"^eltomato's TomatOS (\S+) \[Build ([^\]]+)\]", re.M)
 
 # 5. The prompt. The shell is at scan(), waiting for the keyboard, which means
 #    the keyboard IRQ arrived and the console task is not spinning somewhere.
@@ -212,6 +223,29 @@ def key_for(char):
         return char
     if char.isascii() and char.isalpha() and char.islower():
         return char
+    return None
+
+
+def expected_version(repo_root):
+    """The version the banner should carry, read out of the Makefile.
+
+    Same reasoning as expected_modules() below: the Makefile owns the number,
+    so the Makefile is where it is read from. Returns None when it cannot be
+    parsed, and the caller then checks only that a version is present -- a
+    test that cannot establish what to expect should say so and check less,
+    not invent an expectation and fail on it.
+    """
+    makefile = os.path.join(repo_root, "Makefile")
+    try:
+        with open(makefile, "r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                match = re.match(r"^VERSION\s*:?=\s*(\S+)\s*$", line)
+                if match:
+                    return match.group(1)
+    except OSError:
+        pass
+    print("  note: could not read VERSION out of %s, so the banner's version "
+          "is not checked" % makefile)
     return None
 
 
@@ -522,6 +556,28 @@ def main():
             print("  ok      : %-14s %.1f s" % (label, time.time() - started))
 
         text = read_log(log_path)
+
+        # --- the version -------------------------------------------------
+        #
+        # Checked apart from the banner so that a bumped VERSION that did not
+        # reach the image reads as "wrong version" rather than as "the shell
+        # never started". The Makefile owns the number; if it cannot be read,
+        # expected_version() says so and we check only that some version and
+        # some build stamp are there at all.
+        match = VERSION_LINE.search(text)
+        if match is None:
+            fail("the shell banner carries no version: expected a line like "
+                 "\"eltomato's TomatOS 0.4 [Build 2026-09-01]\". main.c "
+                 "prints TOMATOS_VERSION and TOMATOS_BUILD, and the Makefile "
+                 "defines both for main.o only", text)
+        got, stamp = match.group(1), match.group(2)
+        wanted_version = expected_version(repo_root)
+        if wanted_version is not None and got != wanted_version:
+            fail("the image says version %s, the Makefile says %s -- most "
+                 "likely main.o was not rebuilt after VERSION changed, since "
+                 "make does not track compiler flags. \"make clean\" settles "
+                 "it" % (got, wanted_version), text)
+        print("  ok      : %-14s %s, built %s" % ("version", got, stamp))
 
         # --- the module table -------------------------------------------
         wanted = expected_modules(repo_root)

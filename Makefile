@@ -136,6 +136,24 @@ CFLAGS := \
 	-fno-omit-frame-pointer \
 	-Wall
 
+# What the banner prints.
+#
+# The stamp is the COMMIT date, not today's. Two builds of the same source then
+# produce the same bytes, which is the property that let a portability change
+# and a subsystem move be checked by comparing sha256 sums -- and it answers
+# the more useful question anyway: what is in this image, rather than when
+# somebody happened to compile it. Outside a git checkout, both fall back to
+# something honest rather than to a guess.
+VERSION      := 0.4
+BUILD_STAMP  := $(shell git log -1 --format=%cd --date=short 2>/dev/null || echo unknown)
+
+# Only main.c prints the banner, so only main.o is rebuilt when either
+# changes. Note make does not track flags: after a new commit the stamp is
+# stale until main.c is touched or the tree is cleaned, which is why the
+# release path builds from clean.
+$(BUILD_DIR)/kernel/main.o: CFLAGS += \
+	-DTOMATOS_VERSION='"$(VERSION)"' -DTOMATOS_BUILD='"$(BUILD_STAMP)"'
+
 # Automatic header dependency generation (.d files next to the .o files).
 DEPFLAGS := -MMD -MP
 

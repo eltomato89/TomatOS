@@ -996,8 +996,15 @@ void main()
 	char cmd[256];
 	char word[100];
 
-    printf("eltomato's TomatOS 0.31 [Version 0.31 Build 2011/27/09]\n");
-    printf("(c) Copyright 2006-2011 Jens Köhler\n\n");
+	/* TOMATOS_VERSION and TOMATOS_BUILD come from the Makefile. The build
+	*  stamp is the date of the commit being built rather than today's date,
+	*  which is what keeps two builds of the same source byte-identical --
+	*  and it is also the more useful of the two answers, since it says what
+	*  is in the image rather than when somebody happened to compile it. The
+	*  defaults below only apply to a build from outside a git checkout. */
+	printf("eltomato's TomatOS %s [Build %s]\n",
+	       TOMATOS_VERSION, TOMATOS_BUILD);
+	printf("(c) Copyright 2006-2026 Jens Köhler\n\n");
 
 	/* The pid is kept: "gfx" suspends this task for the duration of the
 	   picture, because the bar writes straight into the text screen and the
