@@ -275,9 +275,22 @@ jobs:
         if: always() && steps.bootimg.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
+          #
+          # THE CONDITION IS NEGATED ON PURPOSE. GitHub's && and || return
+          # OPERANDS rather than booleans, and the empty string is falsy, so
+          # the natural-looking
+          #
+          #     outcome == 'success' && '' || '-DID-NOT-BOOT'
+          #
+          # can never yield its true branch: '' is falsy, so || always takes
+          # over and every image was named DID-NOT-BOOT, including the ones
+          # that booted. It also broke the release, because the name then no
+          # longer ended in the stamp the download pattern below matches on.
+          # Putting the non-empty string in the true branch is what makes the
+          # idiom work.
           name: >-
             tomatos-boot-img-${{ steps.stamp.outputs.stamp
-            }}${{ steps.smoke.outcome == 'success' && '' || '-DID-NOT-BOOT' }}
+            }}${{ steps.smoke.outcome != 'success' && '-DID-NOT-BOOT' || '' }}
           path: |
             build/tomatos_boot.img
             build/smoke-test/
