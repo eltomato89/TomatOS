@@ -9,6 +9,7 @@
 #include <mm.h>
 #include <vmm.h>
 #include <fbcon.h>
+#include <hardware.h>
 
 /* Physical address of the VGA text mode buffer. Memory mapped hardware, not
 *  RAM -- the kernel reaches it through the direct mapping at P2V(). */
@@ -198,6 +199,56 @@ void cls(void)
     console_unlock(flags);
 }
 
+/* --- The serial mirror ----------------------------------------------------
+*
+*  Everything the kernel prints also leaves through COM1, and this is the one
+*  line that does it. It is here and nowhere else because putch() is the one
+*  place every character passes through, exactly once:
+*
+*      printf() -> puts() -> putch()   every conversion, via puts()
+*      printf() -> putch()             %c and %%, and the CP437 umlauts
+*      puts()   -> putch()             a string, one character at a time
+*      SYS_WRITE -> putch()            a ring 3 program's string, the same way
+*      SYS_PUTCH -> putch()            a ring 3 program's single character
+*      keyboard  -> putch()            the echo of what was typed
+*      panic()  -> printf() -> ...     the last thing a dying kernel says
+*
+*  and the framebuffer console does NOT bypass it: fbcon_putc() is not a
+*  console entry point but the back end putch() calls instead of writing into
+*  the VGA text buffer when a graphics mode is in charge. Outside this file
+*  nothing calls it at all. So one mirror here catches the text console and
+*  the framebuffer console both, and catches each character once - putting it
+*  in puts() as well would double every string, and putting it in fbcon.c
+*  would lose every line the kernel prints before the framebuffer exists,
+*  which is most of the boot.
+*
+*  The status bar is the deliberate exception, and it is an exception because
+*  it does not come through here: display_update_statusbar() writes row 0
+*  through statusbar_cell(). That is the right outcome - the bar repaints a
+*  clock once a second forever, and mirroring it would bury the log under it.
+*  cls() does not come through here either, so clearing the screen does not
+*  clear the log. A log is a record of what was said, not a picture of the
+*  screen as it stands.
+*
+*  It goes first, before the cursor arithmetic and before anything is drawn:
+*  the character is then in the log even if what follows faults, which is the
+*  situation in which one most wants to know what the last thing printed was.
+*
+*  The cost is a bounded wait for the UART, taken with interrupts masked
+*  because putch() already holds the console lock. See SERIAL_TX_SPINS in
+*  src/kernel/hardware.c for the bound and for what happens when it runs out.
+*  On a machine with no serial port at all - a T430, say - the port is probed
+*  once, found absent, and every character after that costs one compare.
+*
+*  There is no switch to turn this off, and that is a decision rather than an
+*  omission. A run time flag could only be flipped by a shell command, and the
+*  boot messages - the ones an automated test actually needs, and the ones a
+*  machine that dies before the prompt will only ever produce - are all
+*  printed before any shell exists to flip it. A flag would therefore be able
+*  to disable the case that does not matter and not the case that does. The
+*  one switch worth having is the one the hardware throws itself: no UART, no
+*  output, no cost. */
+
 /* Puts a single character on the screen */
 void putch(unsigned char c)
 {
@@ -207,6 +258,9 @@ void putch(unsigned char c)
     int cols;
 
     flags = console_lock();
+
+    serial_console_putc(c);
+
     att = attrib << 8;
     cols = screen_cols();
 

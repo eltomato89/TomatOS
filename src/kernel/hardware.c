@@ -351,34 +351,167 @@ int do_amd(void) {
  * boot hang and overwrote foreign regions while doing so. The memory is now
  * reported by the bootloader's memory map, see pmm_init() in src/mm/pmm.c. */
 
-void init_serial() {
-   outportb(PORT + 1, 0x00);    // Disable all interrupts
-   outportb(PORT + 3, 0x80);    // Enable DLAB (set baud rate divisor)
-   outportb(PORT + 0, 0x0C);    // Set divisor to C (lo byte) 9600 baud
-   outportb(PORT + 1, 0x00);    //                  (hi byte)
-   outportb(PORT + 3, 0x03);    // 8 bits, no parity, one stop bit
-   outportb(PORT + 2, 0xC7);    // Enable FIFO, clear them, with 14-byte threshold
-   outportb(PORT + 4, 0x0B);    // IRQs enabled, RTS/DSR set
+/* --- COM1 -----------------------------------------------------------------
+*
+*  The serial port is the kernel's second console. Everything putch() puts on
+*  the screen is also written out here, character for character, by
+*  serial_console_putc() at the bottom of this section - which is what makes a
+*  headless boot, a machine whose panel stays dark, and an automated test that
+*  reads the boot messages back all possible at once. Nothing about that works
+*  if writing a byte can block forever, so most of what follows is about the
+*  two ways it could: a port that is not there at all, and a port that is
+*  there but never reports its transmitter free again.
+*
+*  What the port is doing right now. This is the whole of the state:
+*
+*    -1  not looked at yet. The next character to be written probes for a
+*        UART and programs it.
+*     0  there is nothing here to write to, or there was and it stopped
+*        answering. Every write from now on is a no-op and costs one compare.
+*     1  probed, programmed, usable.
+*
+*  It starts unprobed rather than being brought up by init_serial() alone,
+*  because the first thing the kernel prints happens long before init_serial()
+*  is reached: the banner starts at kernel.c:1105 and init_serial() is called
+*  at kernel.c:1332, some two hundred lines of driver setup later. Those early
+*  lines are exactly the ones worth having on a wire - they are the ones that
+*  say what the machine looks like and they are the ones a boot that dies
+*  half way through never gets past. Probing on first use rather than on a
+*  call from the boot path means the log starts with the first character the
+*  kernel ever prints, whenever that is.
+*
+*  Only ever changed from putch(), which holds the console lock, so no two
+*  writers can race for it. A torn update would be harmless anyway: the worst
+*  it could do is program the UART twice. */
+static int serial_state = -1;
+
+/* How long we are prepared to wait for the transmitter holding register to
+*  report itself empty, counted in reads of the line status register rather
+*  than in microseconds.
+*
+*  It has to be a spin count and not a time, because this runs from putch(),
+*  which runs with the interrupts masked and is called from interrupt context.
+*  There is no timer to ask and no sleep to take: the only clock available
+*  here is "how many bus cycles have gone by".
+*
+*  One inportb of an I/O port is a bus cycle, on the order of a microsecond on
+*  real hardware, so 20000 of them is roughly 20 milliseconds. One character
+*  at 115200 baud takes 87 microseconds to shift out, and the wait we expect
+*  is never longer than the character currently in the shift register plus the
+*  one in the holding register - some 175 microseconds. The bound is therefore
+*  a hundred times the longest wait that can legitimately happen, which is the
+*  point: it must never fire in normal operation, and it must always fire
+*  before the machine looks hung.
+*
+*  A timeout is not treated as a hiccup to be retried. There is no flow
+*  control on this line - the UART shifts bits out whether or not anything is
+*  listening - so a transmitter that does not free up is broken hardware, not
+*  a slow reader. The port is marked dead and never polled again, which is
+*  what keeps the worst case at ONE bounded wait for the whole run rather than
+*  one per character: 20 milliseconds once, instead of 20 milliseconds times
+*  the couple of thousand characters in the boot banner. */
+#define SERIAL_TX_SPINS 20000
+
+/* Is there a UART at 0x3F8?
+*
+*  A ThinkPad T430 has no serial port; QEMU always does. On a machine without
+*  one the outportb goes nowhere, which is harmless, but the inportb reads a
+*  floating bus and answers 0xFF forever (0x00 on some chipsets) - and a
+*  status register that permanently reads "transmitter busy" is precisely the
+*  hang this whole section exists to avoid. So the question has to be settled
+*  before the first character, not discovered by waiting for one.
+*
+*  The scratch register at PORT+7 answers it. It is a byte of storage in the
+*  chip that has no effect on anything, present on every 16450 and later,
+*  which is every PC serial port since the AT. Two complementary patterns are
+*  written and read back: a bus with nothing on it reads all ones or all
+*  zeroes and cannot return both. Nothing is transmitted, so the probe costs
+*  four bus cycles and cannot itself wait for anything.
+*
+*  The loopback test through the modem control register is the other common
+*  way to ask this. It is not used here because it puts a byte through the
+*  shift register, which takes a character time to come back - a wait, in the
+*  one function that must not have one. */
+static int serial_probe(void)
+{
+	if(inportb(PORT + 5) == 0xFF)
+		return 0;
+
+	outportb(PORT + 7, 0x5A);
+	if(inportb(PORT + 7) != 0x5A)
+		return 0;
+
+	outportb(PORT + 7, 0xA5);
+	if(inportb(PORT + 7) != 0xA5)
+		return 0;
+
+	return 1;
 }
 
-/*
-
-void init_serial() {
-   outportb(PORT + 1, 0x00);    // Disable all interrupts
-   outportb(PORT + 3, 0x80);    // Enable DLAB (set baud rate divisor)
-   outportb(PORT + 0, 0x03);    // Set divisor to 3 (lo byte) 38400 baud
-   outportb(PORT + 1, 0x00);    //                  (hi byte)
-   outportb(PORT + 3, 0x03);    // 8 bits, no parity, one stop bit
-   outportb(PORT + 2, 0xC7);    // Enable FIFO, clear them, with 14-byte threshold
-   outportb(PORT + 4, 0x0B);    // IRQs enabled, RTS/DSR set
+/* 115200 baud, 8N1: divisor 1, the fastest the chip's 1.8432 MHz clock
+*  divides down to and the rate every terminal program and every "-serial"
+*  backend defaults to.
+*
+*  The speed is not cosmetic. The console mirror waits for the transmitter
+*  before every character, so on real hardware the boot is no faster than the
+*  wire. The banner is 1261 bytes at the prompt, which is 12610 bits with the
+*  start and stop bit each byte carries: 1.3 seconds at the 9600 baud this
+*  port used to be set to, and 0.11 seconds at 115200. A second and a bit
+*  added to every boot is the difference between a mirror that can be left on
+*  and one that has to be argued about. */
+static void serial_program(void)
+{
+	outportb(PORT + 1, 0x00);    /* no interrupts: this driver polls        */
+	outportb(PORT + 3, 0x80);    /* DLAB on, the divisor is behind it       */
+	outportb(PORT + 0, 0x01);    /* divisor 1 (lo) = 115200 baud            */
+	outportb(PORT + 1, 0x00);    /*             (hi)                        */
+	outportb(PORT + 3, 0x03);    /* DLAB off again, 8 bits, no parity, 1 stop */
+	outportb(PORT + 2, 0xC7);    /* FIFOs on and cleared, 14 byte trigger   */
+	outportb(PORT + 4, 0x0B);    /* DTR, RTS, OUT2                          */
 }
-*/
+
+/* Probe and program, once. Everything that writes calls this first, so the
+*  port is ready whoever gets there first - the boot banner through putch() or
+*  the explicit call from kernel.c. */
+static int serial_ready(void)
+{
+	if(serial_state < 0)
+	{
+		if(serial_probe())
+		{
+			serial_program();
+			serial_state = 1;
+		}
+		else
+		{
+			serial_state = 0;
+		}
+	}
+
+	return serial_state;
+}
+
+/* Called from the boot path at kernel.c:1332. By then the console mirror has
+*  almost certainly brought the port up already and this does nothing, which
+*  is deliberate rather than wasteful: reprogramming a UART means setting DLAB
+*  and rewriting the divisor, and doing that while the FIFO still holds the
+*  tail of the banner would garble the characters still on their way out. */
+void init_serial() {
+	serial_ready();
+}
 
 int serial_received() {
    return inportb(PORT + 5) & 1;
 }
 
+/* Blocks until a character arrives, which is the right thing for a reader and
+*  the reason there is no bound here - "no input yet" is not a fault. The
+*  presence check is still needed: on a machine with no port the status
+*  register reads 0xFF, bit 0 included, and this would hand back a stream of
+*  garbage forever. Nothing in the kernel calls it today. */
 char read_serial() {
+   if(!serial_ready()) return 0;
+
    while (serial_received() == 0);
 
    return inportb(PORT);
@@ -388,27 +521,104 @@ int is_transmit_empty() {
    return inportb(PORT + 5) & 0x20;
 }
 
+/* One raw byte, exactly as given: no newline translation, no filtering. The
+*  callers above this decide what a byte should look like; this one only gets
+*  it onto the wire, or gives up trying.
+*
+*  See SERIAL_TX_SPINS for why the wait is bounded and why running out of it
+*  switches the port off for good rather than trying again next time. */
 void write_serial(char a) {
-   while (is_transmit_empty() == 0);
+   int spins;
 
-   outportb(PORT,a);
+   if(!serial_ready()) return;
+
+   for(spins = SERIAL_TX_SPINS; spins > 0; spins--)
+   {
+      if(is_transmit_empty()) {
+         outportb(PORT, a);
+         return;
+      }
+   }
+
+   serial_state = 0;
 }
 
-void writes_serial(char *str) {
-	char string[128];
-	int i;
-	strcpy(string, str);
-	
-	for(i=0; i <= strlen(string)-1; i++)
+/* One character of console output.
+*
+*  This is what putch() calls, and it is called for every character that
+*  reaches the screen from anywhere - the boot banner, the shell, a ring 3
+*  program through SYS_WRITE - because putch() is the single place all of them
+*  meet. See the call graph in src/video/scrn.c.
+*
+*  Two things are done to the byte on the way, and both are about the log
+*  being readable as text afterwards rather than about fidelity to the screen:
+*
+*  A newline becomes CR LF. The screen console treats a bare '\n' as "margin
+*  and one line down"; a terminal and a file both want the pair, and a log
+*  full of lone line feeds staircases across the screen of whoever reads it.
+*  This is the ONLY place the translation happens - write_serial() above is
+*  deliberately raw, so a character cannot pick up a second carriage return by
+*  passing through two layers that both mean well.
+*
+*  Anything outside printable ASCII is reduced. The screen console is CP437:
+*  printf() translates the UTF-8 umlauts into 0x84, 0x94 and friends, and
+*  those bytes are not valid UTF-8. A single one of them in the log makes grep
+*  call the whole file binary and answer "Binary file matches" instead of the
+*  line - which would defeat the point of having the log at all. The seven
+*  umlauts are spelled out again on the way past, which is exactly the
+*  translation printf() did on the way in, run backwards: "Jens Koehler" reads
+*  better in a log than "Jens K?hler" and costs a table of seven entries. Any
+*  other high byte - a box drawing character, say - becomes a question mark,
+*  because there is no honest ASCII for it. The control characters below a
+*  space that putch() itself ignores are dropped here for the same reason it
+*  ignores them: they put nothing on the screen, so they have no business in a
+*  mirror of it. Backspace, tab and carriage return are passed through,
+*  because they mean on a terminal what they mean on the screen. */
+void serial_console_putc(unsigned char c)
+{
+	if(c == '\n')
 	{
-		switch(string[i])
-		{
-			case '\n':	write_serial(13);
-						write_serial(10);
-						break;
-			default:	write_serial(string[i]);
-		}
-		
+		write_serial(13);
+		write_serial(10);
+		return;
+	}
+
+	if(c == '\b' || c == '\t' || c == '\r' || (c >= ' ' && c < 0x7F))
+	{
+		write_serial((char)c);
+		return;
+	}
+
+	if(c < 0x80)
+		return;
+
+	switch(c)
+	{
+		case 0x8E: write_serial('A'); write_serial('E'); return;  /* AE */
+		case 0x84: write_serial('a'); write_serial('e'); return;  /* ae */
+		case 0x99: write_serial('O'); write_serial('E'); return;  /* OE */
+		case 0x94: write_serial('o'); write_serial('e'); return;  /* oe */
+		case 0x9A: write_serial('U'); write_serial('E'); return;  /* UE */
+		case 0x81: write_serial('u'); write_serial('e'); return;  /* ue */
+		case 0xE1: write_serial('s'); write_serial('s'); return;  /* sz */
+		default:   write_serial('?'); return;
+	}
+}
+
+/* A whole string. Walks the caller's string rather than copying it: the old
+*  version copied into a 128 byte buffer on the stack with strcpy() first, so
+*  a string longer than that wrote over its own return address. Its loop
+*  condition was "i <= strlen(s) - 1", and strlen() returns a size_t: for an
+*  empty string that is not -1 but the largest unsigned there is, and the
+*  comparison promotes i to match, so the loop walked off the end of the
+*  buffer instead of not running at all. Nothing in the kernel calls this,
+*  which is the only reason neither ever went off. */
+void writes_serial(char *str)
+{
+	while(*str != '\0')
+	{
+		serial_console_putc((unsigned char)*str);
+		str++;
 	}
 }
 
