@@ -610,7 +610,25 @@ isr_common_stub:
     push eax
     mov eax, fault_handler
     call eax
-    pop eax
+
+    ; SWITCH TO THE FRAME THE HANDLER RETURNED, exactly as irq_common_stub
+    ; does. This used to be "pop eax", which dropped the argument and threw
+    ; the return value away with it, and fault_handler switched tasks by
+    ; copying the incoming context over this one instead. That copy restores
+    ; every register except ESP -- and for an incoming RING 3 task the iret
+    ; below repairs esp by accident, because it pops useresp and ss from the
+    ; frame. For an incoming RING 0 task it pops only eip, cs and eflags, so
+    ; the resumed kernel task carried on running on the stack of the task
+    ; that had just died. Whether that was survivable came down to which of
+    ; two legal epilogues the compiler had picked for the function it was
+    ; resumed into: one that unwinds relative to esp died, one that restores
+    ; esp from ebp got away with it.
+    ;
+    ; "add esp, 4" rather than "pop eax", because eax is the return value.
+    ; When the handler is not switching it returns the frame it was given, so
+    ; the mov is a no-op.
+    add esp, 4
+    mov esp, eax
     pop gs
     pop fs
     pop es
@@ -844,7 +862,13 @@ syscall_stub:
 
     push esp                    ; struct regs *r
     call syscall_handler
-    add esp, 4                  ; drop the argument; the handler returns void
+    add esp, 4                  ; drop the argument
+
+    ; The frame to return into, which is a different one when the call ended
+    ; the task. See the block in isr_common_stub for what went wrong while
+    ; this was a copy: it is the same bug and the same fix. A handler that is
+    ; not switching returns the frame it was given, making this a no-op.
+    mov esp, eax
 
     pop gs
     pop fs

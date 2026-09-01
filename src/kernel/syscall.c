@@ -1398,6 +1398,15 @@ static void sysfb_format(sys_fbinfo *info)
 *  is applied here -- the saved context is overwritten in place with the
 *  context of the next runnable task, and the iret lands in that task
 *  instead. The exiting task's own registers are never restored again. */
+/* Where sys_exit() leaves the frame the stub should return into, or 0 when no
+*  task switch happened. It is a variable rather than a return value because
+*  every entry in syscall_table[] has the same signature and that signature
+*  yields the call's result; sys_exit needs to hand back something else
+*  entirely. Written by sys_exit, read and cleared by syscall_handler, and
+*  never live across an interrupt: both run with interrupts off, in the same
+*  invocation of the stub. */
+static struct regs *syscall_switch_to = 0;
+
 static int sys_exit(struct regs *r)
 {
 	int pid;
@@ -1439,6 +1448,36 @@ static int sys_exit(struct regs *r)
 	*  i.e. a machine that looks dead to the person sitting in front of it. */
 	sysfb_release_task(pid);
 
+	/* INTERRUPTS OFF FROM HERE TO THE IRET, and this is not tidiness.
+	*
+	*  Vector 0x80 is a TRAP gate (0xEF), chosen so that a system call can
+	*  block -- which means IF is still set from ring 3 all the way through
+	*  this function. Everything below runs in a window where a timer tick can
+	*  land, and two separate things go wrong if one does.
+	*
+	*  The tick would push its frame on THIS task's kernel stack, the one that
+	*  is about to stop existing, while current_task already names the task
+	*  schedule() elected. schedule() would then file task_states[incoming]
+	*  pointing into a dead stack -- and unlike the ESP bug above, no epilogue
+	*  saves that.
+	*
+	*  And the frame this function publishes below travels in a file static,
+	*  because every entry in syscall_table[] returns the call's result and
+	*  this one needs to hand back something else. A tick in between lets
+	*  another task issue a system call, whose syscall_handler clears the
+	*  static on the way in, and the stub would then switch back into the
+	*  frame of the task that just exited.
+	*
+	*  The exception path has no equivalent line because it needs none:
+	*  isrs.c installs its vectors as INTERRUPT gates (0x8E), so the CPU has
+	*  already cleared IF by the time fault_handler runs.
+	*
+	*  Nothing re-enables it here. The iret at the end of syscall_stub loads
+	*  eflags from the incoming frame, which carries whatever IF that task was
+	*  interrupted with -- so the incoming task gets its own answer rather
+	*  than ours. */
+	__asm__ __volatile__ ("cli" : : : "memory");
+
 	/* The task is marked as ended and loses its remaining time slice, so the
 	*  search below skips it. Ended, not aborted: a program that returns 0 has
 	*  not failed, and "ps" saying it was aborted is read as a fault by exactly
@@ -1468,19 +1507,27 @@ static int sys_exit(struct regs *r)
 
 	if(next != r)
 	{
-		/* The stub restores every register from exactly this memory and
-		*  then irets. Replacing the contents therefore switches tasks
-		*  without a single line of assembler.
+		/* Published for syscall_handler to return, so that syscall_stub can
+		*  "mov esp, eax" into it -- the same handover irq_common_stub has
+		*  always used.
 		*
-		*  The copy is indifferent to which address space is loaded while it
-		*  runs, and that is not luck: r points into the exiting task's kernel
-		*  stack and next into the incoming task's, and both stacks live above
-		*  KERNEL_VIRTUAL_BASE, in the quarter of the directory every space
-		*  shares. Same memory, same contents, in either space. The iret at
-		*  the end of the stub is the first instruction that actually needs
-		*  the new space -- it is the one that reaches user code again -- and
-		*  by then schedule() has long since loaded it. */
-		*r = *next;
+		*  This used to copy *next over *r and let the stub iret out of the
+		*  old frame, which is wrong in one specific way: the copy moves every
+		*  register EXCEPT esp. An incoming ring 3 task survived it because
+		*  the iret pops useresp and ss out of the frame and repairs esp by
+		*  accident; an incoming ring 0 task does not, and carried on running
+		*  on the kernel stack of the task that had just exited. Whether that
+		*  killed the machine came down to which epilogue the compiler had
+		*  chosen for whatever function that task was parked in.
+		*
+		*  Neither the old copy nor this pointer cares which address space is
+		*  loaded while it runs, and that is not luck: r points into the
+		*  exiting task's kernel stack and next into the incoming task's, and
+		*  both live above KERNEL_VIRTUAL_BASE, in the quarter of the
+		*  directory every space shares. The iret at the end of the stub is
+		*  the first instruction that actually needs the new space, and by
+		*  then schedule() has long since loaded it. */
+		syscall_switch_to = next;
 		return 0;
 	}
 
@@ -3420,7 +3467,10 @@ static syscall_fn syscall_table[SYSCALL_MAX] =
 	sys_input      /* SYS_INPUT    26 */
 };
 
-void syscall_handler(struct regs *r)
+/* Returns THE FRAME TO RETURN INTO: the one it was given, or the incoming
+*  task's when the call ended this one. syscall_stub does "mov esp, eax" with
+*  it. See the block in sys_exit() for why a copy was not good enough. */
+struct regs *syscall_handler(struct regs *r)
 {
 	unsigned int num;
 	int result;
@@ -3428,21 +3478,28 @@ void syscall_handler(struct regs *r)
 	num = r->eax;
 	syscall_calls++;
 
+	/* Cleared on the way IN, not on the way out, so that a handler which
+	*  never reaches the bottom of this function cannot leave a stale frame
+	*  behind for the next system call to switch into. */
+	syscall_switch_to = 0;
+
 	if(num >= (unsigned int)SYSCALL_MAX || syscall_table[num] == 0)
 	{
 		r->eax = (unsigned int)SYS_ENOSYS;
-		return;
+		return r;
 	}
 
 	result = syscall_table[num](r);
 
-	/* SYS_EXIT has replaced *r with another task's context by now (or has
-	*  already written its own error into eax). Writing the result here would
-	*  clobber that task's eax, so the one call that does not return to its
+	/* SYS_EXIT has elected another task by now (or has already written its
+	*  own error into eax). Writing the result here would clobber the
+	*  incoming task's eax, so the one call that does not return to its
 	*  caller is also the one whose result is not delivered. */
-	if(num == SYS_EXIT) return;
+	if(num == SYS_EXIT)
+		return syscall_switch_to != 0 ? syscall_switch_to : r;
 
 	r->eax = (unsigned int)result;
+	return r;
 }
 
 uint32_t syscall_count(void)

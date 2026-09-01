@@ -222,7 +222,15 @@ static void page_fault_report(struct regs *r, uint32_t cr2, addrspace_t space)
 	}
 }
 
-void fault_handler(struct regs *r)
+/* Returns THE FRAME TO RETURN INTO, which is a different one when the faulting
+*  task was aborted and another was elected. isr_common_stub does "mov esp,
+*  eax" with it, exactly as irq_common_stub has always done with schedule()'s
+*  answer.
+*
+*  It used to be void, and switched by copying the incoming context over the
+*  outgoing one. See the block in start.asm for why that was wrong for a ring 0
+*  task; in short, the copy restores every register except esp. */
+struct regs *fault_handler(struct regs *r)
 {
 	int pid;
 	int i;
@@ -284,12 +292,12 @@ void fault_handler(struct regs *r)
 
 		if(next != r)
 		{
-			/* Replace the context in place: isr_common_stub restores all
-			*  registers from exactly this memory area and jumps into it via
-			*  iret. This is the equivalent of the IRQ path's "mov esp, eax",
-			*  only without touching the assembler. */
-			*r = *next;
-			return;
+			/* Hand the new frame back and let the stub switch to it. The
+			*  comment that used to sit here called copying it "the
+			*  equivalent of the IRQ path's mov esp, eax, only without
+			*  touching the assembler", and that was the bug: a copy moves
+			*  every register except the stack pointer. */
+			return next;
 		}
 
 		/* schedule() returns the unchanged context when no task is runnable

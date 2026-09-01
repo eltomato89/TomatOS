@@ -190,7 +190,7 @@ extern void syscall_install(void);
 /* Entry point called by the assembly stub in start.asm. Reads the call
 *  number and arguments out of the saved register set and writes the result
 *  back into r->eax, so the iret hands it to the caller. */
-extern void syscall_handler(struct regs *r);
+extern struct regs *syscall_handler(struct regs *r);
 
 /* Number of system calls served since boot -- shown by the shell. */
 extern uint32_t syscall_count(void);
