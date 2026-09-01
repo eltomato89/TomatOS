@@ -102,11 +102,28 @@ task_settings tasks[MAX_TASKS];
 *  taskmgr_task_start(), long after its stack is in place. */
 static uint8_t *task_kstacks[MAX_TASKS];
 
-/* A kernel stack whose task is gone but that could not be handed back at the
-*  moment its slot was recycled, see kernel_stack_release(). Freed by
-*  reap_pending_kstack() on the next task creation, exactly like
-*  pending_space next to it. */
-static uint8_t *pending_kstack;
+/* Kernel stacks whose tasks are gone but which could not be handed back at
+*  the moment their slots were recycled, see kernel_stack_release(). Freed by
+*  reap_pending_kstack() on the next task creation, like pending_space next
+*  door.
+*
+*  THIS IS AN ARRAY BECAUSE ONE ENTRY WAS NOT ENOUGH, and the comment that
+*  said it was is worth quoting: "At most one can be parked: parking requires
+*  the caller to be running on the stack it is releasing, and there is only
+*  one esp." That is true of the FIRST of the two reasons kernel_stack_in_use()
+*  answers yes, and only of that one. The second -- some slot's task_states[]
+*  entry pointing into the stack -- has nothing to do with esp, and two
+*  releases in a row can both hit it. The second then overwrote the pointer
+*  and the first stack was lost for good: two frames marked used forever, plus
+*  a guard page left out of the direct mapping, with nothing left naming
+*  either.
+*
+*  MAX_TASKS entries, which is 256 bytes and is not a guess about how many are
+*  needed. It is not a proof either: a slot that is recycled twice can park a
+*  second stack while its first is still parked, so the bound is "how often
+*  this can happen between two reaps" rather than the number of slots. Running
+*  out is handled where it would happen rather than assumed away. */
+static uint8_t *pending_kstacks[MAX_TASKS];
 
 /* The address space a slot runs in, or 0 for "the kernel space".
 *
@@ -547,8 +564,41 @@ static int kernel_stack_in_use(uint8_t *stack)
 *
 *  A stack that is still live is parked instead of freed, the same answer
 *  task_space_release() gives for an address space that is still in CR3 and
-*  for the same reason. At most one can be parked: parking requires the caller
-*  to be running on the stack it is releasing, and there is only one esp. */
+*  for the same reason. Several can be parked at once -- see the block above
+*  pending_kstacks[] for why the one slot this used to have was wrong. */
+/* Puts a stack aside for reap_pending_kstack() to look at later.
+*
+*  Reaps first, because the common reason the table is under pressure is that
+*  it is holding stacks nothing depends on any more -- and a free entry found
+*  that way costs one walk of an array of 64 pointers.
+*
+*  A FULL TABLE LEAKS THE STACK AND SAYS SO. It is the same trade the whole of
+*  this machinery exists for, stated one level up: leaking 8 KiB is
+*  recoverable, handing back a stack somebody still returns onto is not. The
+*  message is there because a leak nobody hears about is the one that is still
+*  there in a year, and because reaching this at all would mean the assumption
+*  above pending_kstacks[] is wrong and somebody should know. */
+static void reap_pending_kstack(void);
+
+static void park_kstack(uint8_t *stack)
+{
+	int i;
+
+	reap_pending_kstack();
+
+	for(i = 0; i <= MAX_TASKS-1; i++)
+	{
+		if(pending_kstacks[i] == 0)
+		{
+			pending_kstacks[i] = stack;
+			return;
+		}
+	}
+
+	printf("ERR: no room to park a kernel stack, 8 KiB leaked at 0x%x\n",
+	       (unsigned int) stack);
+}
+
 static void kernel_stack_release(int slot)
 {
 	uint8_t *stack;
@@ -565,7 +615,7 @@ static void kernel_stack_release(int slot)
 
 	if(kernel_stack_in_use(stack))
 	{
-		pending_kstack = stack;
+		park_kstack(stack);
 		return;
 	}
 
@@ -583,11 +633,16 @@ static void kernel_stack_release(int slot)
 *  stack somebody still returns onto is not. */
 static void reap_pending_kstack(void)
 {
-	if(pending_kstack == 0) return;
-	if(kernel_stack_in_use(pending_kstack)) return;
+	int i;
 
-	kernel_stack_destroy(pending_kstack);
-	pending_kstack = 0;
+	for(i = 0; i <= MAX_TASKS-1; i++)
+	{
+		if(pending_kstacks[i] == 0) continue;
+		if(kernel_stack_in_use(pending_kstacks[i])) continue;
+
+		kernel_stack_destroy(pending_kstacks[i]);
+		pending_kstacks[i] = 0;
+	}
 }
 
 /* Highest address of the slot's user stack, i.e. the initial user esp. */
@@ -1310,6 +1365,36 @@ static void occupy_slot(int slot, const char *name, int prio)
 	copy_bounded(tasks[slot].name, name, sizeof(tasks[slot].name));
 	tasks[slot].priority = prio;
 	tasks[slot].state = TASK_STATE_SUSPENDED;
+
+	/* THE REST OF THE SLOT, which used to be left as the previous occupant
+	*  had it. Neither leftover was dangerous and both were wrong in the same
+	*  way: a field that describes this task, still describing the last one.
+	*
+	*  cpu_time is what is left of a time slice. Inheriting it means a new
+	*  task's first slice is however much its dead predecessor had not used --
+	*  usually 0, because a task that exits or aborts has its slice zeroed on
+	*  the way out, so the visible effect was one wasted tick before
+	*  schedule() re-elected it. Set from the priority, which is what
+	*  schedule() would do at the top of the next slice anyway.
+	*
+	*  error and error_no belong to whatever killed the previous occupant, and
+	*  there is exactly one way they become visible on the wrong task. Both
+	*  taskmgr_task_abort() and taskmgr_task_exit() set these fields as they
+	*  set the state, so a task that dies either of those two deaths reports
+	*  its own. taskmgr_killall() does not: it assigns TASK_STATE_ABORTED and
+	*  nothing else, so every slot it kills shows whatever was left lying in
+	*  these two fields -- and "ps" prints them for ABORTED as "( ERR n, ...
+	*  )". On a recycled slot that is the previous occupant's death attributed
+	*  to this one.
+	*
+	*  Nothing calls taskmgr_killall() today; the one call site in main.c is
+	*  commented out. So this is a hole being closed rather than a fault being
+	*  fixed, and clearing the fields here is the right place for it either
+	*  way: a slot being handed to a new task should carry nothing of the old
+	*  one, whoever ends up reading it. */
+	tasks[slot].cpu_time = prio;
+	tasks[slot].error[0] = '\0';
+	tasks[slot].error_no = 0;
 }
 
 int taskmgr_add_task( void* tfunct, const char *name, int prio)
