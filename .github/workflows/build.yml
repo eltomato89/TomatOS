@@ -1,0 +1,421 @@
+# ============================================================================
+#  TomatOS -- build the disk image, boot it, and hand it over
+#
+#  WHY THIS EXISTS
+#
+#  TomatOS is built with a Linux toolchain: gcc -m32, GNU ld, NASM, mtools.
+#  The machine it is most often tried out on is a Mac running UTM, which has
+#  none of those, and porting the build to macOS was considered and decided
+#  against -- the Makefile leans on a GNU linker, a 32-bit libgcc and mtools
+#  in ways that would cost more to make portable than the port would be worth.
+#
+#  So this workflow IS the way a testable image reaches that machine. Every
+#  push builds one on a Linux runner and uploads it; the download is the
+#  "make bootdisk" that cannot be run there. A tag additionally publishes a
+#  release, see the second job at the bottom for why only a tag.
+#
+#  And because an image that was built but never booted is a guess, the
+#  workflow boots it before it publishes it. See tools/smoke-test.py.
+# ============================================================================
+name: Build and boot the disk image
+
+on:
+  # Every push, on every branch, and that is deliberate rather than lazy: the
+  # point of this workflow is to produce something bootable to try, and a push
+  # to a work-in-progress branch is exactly when one wants to try something.
+  # There is no paths-ignore either -- a build takes seconds, and a run that
+  # was skipped because the push "only touched documentation" is a run whose
+  # artefact is missing precisely when somebody goes looking for it.
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  # So an image can be produced without inventing a commit to produce it with.
+  workflow_dispatch:
+
+# The default token is read-only here. The release job below asks for write on
+# its own, so a run that only builds cannot alter the repository even if
+# something in the build tried to.
+permissions:
+  contents: read
+
+# A second push to the same branch makes the first one's image obsolete before
+# it has finished being built, so let it go rather than pay for both. Tags are
+# exempt: those runs publish a release and must not be interrupted by anything.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    name: Build, then boot what was built
+    # ubuntu-latest is Ubuntu 24.04 at the time of writing, and 24.04 is what
+    # every package name and version below was verified against -- in a clean
+    # ubuntu-base 24.04.4 root, not by reading a package list. GitHub has
+    # ubuntu-26.04 in preview and will migrate this label to it eventually;
+    # the one step that would notice is the mtools check further down, and it
+    # is written to notice by testing the tool rather than by testing the
+    # release, so the migration should be uneventful. If it is not, pinning
+    # "ubuntu-24.04" here is the one-line way back.
+    runs-on: ubuntu-latest
+
+    # The build takes seconds and the boot takes seconds; anything that has not
+    # finished in a quarter of an hour is stuck, and GitHub's own default would
+    # let it sit there for six hours before saying so. The smoke test enforces
+    # its own timeout from the inside, which is the one that produces a usable
+    # error message -- this is only the outer guard for everything that is not
+    # the smoke test.
+    timeout-minutes: 15
+
+    outputs:
+      # Passed to the release job so that it can find the artefacts this job
+      # uploaded, whose names carry the same stamp.
+      stamp: ${{ steps.stamp.outputs.stamp }}
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Work out a stamp that tells two downloads apart
+        id: stamp
+        # The artefacts end up in somebody's browser downloads folder next to
+        # each other, quite possibly from different runs and different
+        # branches, and "tomatos-boot-img.zip", "tomatos-boot-img(1).zip",
+        # "tomatos-boot-img(2).zip" is not a thing anyone can navigate. The run
+        # number orders them, the short SHA says which commit, so a name still
+        # answers "which one is this" a week later with no tab open.
+        run: |
+          echo "stamp=${GITHUB_RUN_NUMBER}-$(git rev-parse --short=7 HEAD)" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Install the toolchain
+        # Worked out by running exactly this in a clean Ubuntu 24.04 root and
+        # then building, rather than by guessing at names. Three of these are
+        # not obvious and each cost a failed build to find:
+        #
+        #   gcc-multilib  is what makes "gcc -m32" more than an error message.
+        #                 It brings libc6-dev-i386 and lib32gcc-s1, and the
+        #                 Makefile asks the compiler for the 32-bit libgcc by
+        #                 path -- "gcc -m32 -print-libgcc-file-name" -- which
+        #                 without this prints a path to a file that is not
+        #                 there. build-essential alone does NOT cover it.
+        #
+        #   gawk          because the Makefile reads boot/layout.inc with
+        #                 awk's strtonum(), and strtonum() is a GNU extension.
+        #                 Ubuntu's default awk is mawk, which does not have it.
+        #                 This one does not fail loudly: the $(shell ...) call
+        #                 simply comes back empty, the Makefile falls back to
+        #                 its built-in default for the constant, and the build
+        #                 stops much later complaining that the kernel and the
+        #                 modules overlap -- at a number that appears nowhere
+        #                 in the source. Installing gawk switches the "awk"
+        #                 alternative over, so nothing else has to change.
+        #
+        #   xxd           used by the bootdisk recipe to write the module table
+        #                 into stage2. It is its own package on Ubuntu now
+        #                 rather than part of vim-common, and it is not in a
+        #                 minimal root.
+        #
+        # The rest are the obvious ones: nasm assembles the boot chain and the
+        # interrupt stubs, mtools writes the FAT16 volume without needing root
+        # or a loop device, grub-common provides grub-mkrescue and grub-pc-bin
+        # the i386-pc modules it puts on the ISO, xorriso is what actually
+        # writes the ISO, and qemu-system-x86 is what boots the result.
+        #
+        # python3 is already on the runner image; it is listed anyway so that
+        # this line is the whole truth about what the build and the test need,
+        # and can be pasted into a bare container unchanged.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            gcc-multilib \
+            nasm \
+            mtools \
+            gawk \
+            xxd \
+            grub-common \
+            grub-pc-bin \
+            xorriso \
+            qemu-system-x86 \
+            python3
+
+      - name: Make sure mformat can reserve more than 255 sectors
+        # This is the one thing here that is not an apt line, and it is not
+        # optional on Ubuntu 24.04.
+        #
+        # The boot image is a single FAT16 volume whose reserved sectors hold
+        # our own boot chain -- stage 1, stage 2, the flat kernel and the user
+        # programs -- so the Makefile formats it with "mformat -R 1040". In
+        # mtools 4.0.43, which is what noble ships, the argument to -R is
+        # parsed into an 8-bit field: anything above 255 is rejected outright
+        # with "Bad number 1040 for -R (Numerical result out of range)", and
+        # "make bootdisk" cannot run at all. It was widened in a later release;
+        # Ubuntu 25.10 and 26.04 have 4.0.48 and 4.0.49 and are fine.
+        #
+        # So the tool is asked rather than the distribution: format a throwaway
+        # image with the very geometry the Makefile uses, and if that works,
+        # change nothing. When ubuntu-latest moves to a release with a new
+        # enough mtools this step turns into a no-op by itself, with no edit
+        # here and nothing left behind pinning an old version.
+        #
+        # The fallback builds mtools from the GNU release tarball. It is a
+        # small autoconf C program and takes well under a minute; curl and the
+        # CA certificates it needs are on the runner image already.
+        run: |
+          set -euo pipefail
+          probe="$(mktemp -d)/probe.img"
+          if MTOOLS_SKIP_CHECK=1 mformat -C -i "$probe" \
+               -t 65 -h 16 -s 63 -c 4 -H 0 -m 0xf8 -R 1040 -v TOMATOS :: \
+               2>/dev/null; then
+            echo "$(mformat --version | head -1) accepts -R 1040, using it."
+            exit 0
+          fi
+          echo "$(mformat --version | head -1) cannot reserve 1040 sectors."
+          echo "Building mtools ${MTOOLS_VERSION} from source instead."
+          cd "$(mktemp -d)"
+          curl -sSLO "https://ftp.gnu.org/gnu/mtools/mtools-${MTOOLS_VERSION}.tar.gz"
+          tar xzf "mtools-${MTOOLS_VERSION}.tar.gz"
+          cd "mtools-${MTOOLS_VERSION}"
+          # Quiet unless it goes wrong, and then loud: mtools compiles with a
+          # dozen unused-result warnings that are none of this project's
+          # business, and burying a real error among them would be the only
+          # thing worse than the warnings themselves.
+          if ! { ./configure --prefix=/usr/local \
+                 && make -j"$(nproc)" \
+                 && sudo make install ; } > mtools-build.log 2>&1; then
+            echo "Building mtools failed. The last 60 lines:"
+            tail -60 mtools-build.log
+            exit 1
+          fi
+          # Explicit rather than relying on /usr/local/bin already being ahead
+          # of /usr/bin: it is on this image, but a PATH order is a poor thing
+          # to have a build silently depend on.
+          echo /usr/local/bin >> "$GITHUB_PATH"
+        env:
+          # Pinned, so that a bad upstream release cannot walk into a build
+          # that was green yesterday. Raising it is a one-line, reviewable
+          # change; 4.0.49 is also what the maintainer's own Arch machine has,
+          # which is the version the image is known to come out right from.
+          MTOOLS_VERSION: 4.0.49
+
+      - name: Report what we are building with
+        # Cheap, and the first thing anybody wants when a build that has been
+        # green for months goes red without a source change: the runner's
+        # toolchain moved under it, and this is where that shows.
+        run: |
+          gcc --version | head -1
+          ld --version | head -1
+          nasm -v
+          mformat --version | head -1
+          qemu-system-x86_64 --version | head -1
+          awk --version | head -1
+
+      - name: Build the boot image
+        id: bootimg
+        # The one that matters. "make bootdisk" builds the kernel, the user
+        # programs, both boot stages, formats the FAT16 volume and writes the
+        # boot chain into its reserved sectors -- and verifies as it goes that
+        # the BPB survived stage 1 being written over it, that the boot
+        # signature is there, and that every module on the image matches the
+        # ELF it came from byte for byte.
+        run: make bootdisk
+
+      - name: Build the ISO
+        id: iso
+        # Not what UTM boots, and not what the smoke test boots either. It is
+        # built because it is the only thing that exercises the GRUB path --
+        # a second, independent way of getting this kernel started, and the
+        # fallback if the boot chain in boot/ ever breaks on somebody's real
+        # hardware. Building it here means a change that breaks grub.cfg
+        # generation or the Multiboot header is caught on the push that made
+        # it, rather than on the evening somebody needs the ISO.
+        run: make iso
+
+      - name: Boot it
+        id: smoke
+        # The step this whole workflow is arranged around. Everything above
+        # proves the sources compile and link; this proves the 32 MB that came
+        # out of it starts a computer.
+        #
+        # It is deliberately the same command a person runs locally, not a
+        # block of shell that only exists in this file: the test lives in
+        # tools/smoke-test.py, which reads the boot through COM1, asserts on
+        # the banner, the module table, the mounted filesystem and the prompt,
+        # then types "ls" and "hello" at that prompt and asserts on their
+        # output. What it prints on failure is the entire boot log, because a
+        # red X with nothing under it tells the person reading it nothing.
+        #
+        # The timeout is its own, generous and enforced from inside: a hung
+        # guest must not sit here until the job's own limit six hours later.
+        run: python3 tools/smoke-test.py --timeout 300
+
+      - name: Upload the boot image
+        # THE artefact. 32 MB of image, almost all of it zeros -- the FAT16
+        # volume is nearly empty -- so the zip GitHub wraps it in comes to
+        # about 200 KB, well under a percent of the file. Downloading it is
+        # cheaper than most web pages; storing 90 days of them costs nothing
+        # worth thinking about. Unzip, point UTM at the .img, done.
+        #
+        # Uploaded even when the smoke test failed, and that is deliberate.
+        # The run is red either way -- this step cannot make a failing job
+        # pass -- but withholding the image would leave the one person who
+        # could debug it with nothing to debug, on a machine that cannot
+        # build one. So it is published and LABELLED: the artefact carries
+        # "-DID-NOT-BOOT" in its name, which is a thing one cannot fail to
+        # notice in a downloads folder a week later, and it is where the
+        # habit of trusting whatever the newest zip is goes wrong.
+        #
+        # The whole build/smoke-test/ directory rides along rather than just
+        # the image: the boot log is the proof that these exact bytes reached
+        # a prompt on a machine that is not yours, and on a failure it is
+        # joined by a screenshot of the guest -- which for this image is the
+        # only picture of the console there is, since it runs in a VBE
+        # graphics mode and never touches the VGA text buffer.
+        if: always() && steps.bootimg.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: >-
+            tomatos-boot-img-${{ steps.stamp.outputs.stamp
+            }}${{ steps.smoke.outcome == 'success' && '' || '-DID-NOT-BOOT' }}
+          path: |
+            build/tomatos_boot.img
+            build/smoke-test/
+          retention-days: 90
+
+      - name: Upload the kernel with its symbols
+        # 265 KB, 127 KB compressed, and the only artefact that still has
+        # symbols in it: the kernel on the boot image is flat, produced with
+        # "objcopy -O binary", and has neither a symbol table nor section
+        # headers. When the image faults at 0xC0113A4C, this is the file that
+        # can say which function that is -- but only if it is the kernel that
+        # was IN that image, which is why it is kept for as long as the image
+        # is rather than rebuilt afterwards from the same commit and hoped
+        # over. It also boots directly under "qemu -kernel", which is the
+        # fastest way to check whether a problem is in the kernel or in the
+        # boot chain that loaded it.
+        if: always() && steps.bootimg.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tomatos-kernel-elf-${{ steps.stamp.outputs.stamp }}
+          path: build/kernel.elf
+          retention-days: 90
+
+      - name: Upload the ISO
+        # 5.2 MB, 2.1 MB compressed -- ten times the boot image, because a
+        # GRUB rescue image is mostly GRUB. Kept, because it is the second way
+        # into this kernel and the one that does not depend on our own boot
+        # chain, so it is what one reaches for when a machine will not take
+        # the .img. Kept for a shorter time than the .img, because it is the
+        # bulky one and the rarely wanted one, and because unlike the .img
+        # nothing here has booted it -- the smoke test tests what UTM runs.
+        if: always() && steps.iso.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tomatos-iso-${{ steps.stamp.outputs.stamp }}
+          path: build/tomatos.iso
+          retention-days: 14
+
+  # ==========================================================================
+  #  A release, but only for a tag
+  #
+  #  WHY NOT ON EVERY PUSH, given that a release asset is strictly better than
+  #  an artefact in every way that matters here:
+  #
+  #    - it never expires; an artefact is gone after its retention days
+  #    - anyone can download it, with no GitHub account and nobody signed in.
+  #      An artefact on a PUBLIC repository still requires being logged in,
+  #      which makes "here, try my OS" a much longer sentence than it needs
+  #      to be
+  #    - it has a stable URL that can be put in the README
+  #
+  #  And why every push is still the wrong trigger for one: releases are the
+  #  repository's list of what it has ever considered finished. A release per
+  #  push turns that list into a commit log with 32 MB attached to each entry
+  #  -- it buries the versions that meant something, it mails every watcher,
+  #  and within a month nobody can find the release that was worth keeping.
+  #
+  #  So: every push gets an artefact, which is private, temporary and exactly
+  #  right for "does this still boot". A tag gets a release, which is public,
+  #  permanent and exactly right for "this one is worth showing somebody".
+  #  Making a release is then one command -- "git tag v0.4 && git push
+  #  --tags" -- and the decision that it deserves one stays a human decision.
+  # ==========================================================================
+  release:
+    name: Publish a release for a tag
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+
+    # The only place in this file that may write to the repository, and it may
+    # write nothing else: no packages, no pull requests, no pages.
+    permissions:
+      contents: write
+
+    steps:
+      - name: Collect what the build produced
+        # Downloaded rather than rebuilt, and that is the point. A rebuild from
+        # the same commit would almost certainly produce the same image, and
+        # "almost certainly" is not what should stand behind a file people
+        # download and boot. These are the exact bytes the smoke test booted.
+        uses: actions/download-artifact@v4
+        with:
+          pattern: tomatos-*-${{ needs.build.outputs.stamp }}
+          path: release
+          merge-multiple: true
+
+      - name: Publish
+        # gh is on the runner image, so this needs no third party action and
+        # therefore no third party with a token. GH_TOKEN is the run's own
+        # scoped token, which the permissions block above limits to writing
+        # repository contents.
+        #
+        # The image is attached uncompressed: a Mac unzipping a 32 MB download
+        # is not the hard part of trying this out, and UTM wants a plain .img.
+        # A checksum file goes with it, because the one thing worth being sure
+        # of about a downloaded disk image is that it arrived intact.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd release
+          # The smoke test's log rides along in the boot image artefact; it is
+          # evidence about a build, not something to attach to a release.
+          rm -rf smoke-test
+          sha256sum tomatos_boot.img kernel.elf tomatos.iso > SHA256SUMS
+          cat SHA256SUMS
+
+          # A release page is read by somebody who has not seen this
+          # repository before, so it says what the three files are and how to
+          # start the first one. --generate-notes adds the commit list under
+          # this.
+          cat > NOTES.md <<'EOF'
+          Built and boot-tested by
+          [.github/workflows/build.yml](../../blob/main/.github/workflows/build.yml):
+          the image below was started in QEMU before this release was made, and
+          it reached its shell prompt, mounted its filesystem and ran a program
+          there.
+
+          | File | What it is |
+          | --- | --- |
+          | `tomatos_boot.img` | The bootable 32 MB disk image. This is the one to run. |
+          | `tomatos.iso` | The same system on a GRUB rescue CD, for machines that will not boot the image. |
+          | `kernel.elf` | The kernel with its symbols, for debugging. Not needed to run anything. |
+
+          To run it, in UTM: new virtual machine, Emulate, Other, then attach
+          `tomatos_boot.img` as an IDE drive and give it 64 MB of memory. The
+          equivalent on any machine with QEMU is
+
+              qemu-system-x86_64 -machine pc -accel tcg \
+                -drive file=tomatos_boot.img,format=raw,index=0,media=disk \
+                -m 64
+
+          Type `help` at the prompt.
+          EOF
+
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "TomatOS ${GITHUB_REF_NAME}" \
+            --notes-file NOTES.md \
+            --generate-notes \
+            tomatos_boot.img tomatos.iso kernel.elf SHA256SUMS

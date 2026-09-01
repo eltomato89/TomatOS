@@ -781,6 +781,13 @@ endef
 .PHONY: all user run iso run-iso floppy run-floppy disk bootdisk run-bootdisk \
         debug usb usb-boot clean help
 
+# A recipe that fails partway leaves no output behind. Without this, a
+# bootdisk build that died after the image was created but before the module
+# table went in left a half written file that make then considered up to date
+# -- "Nothing to be done" over an image that does not boot. That is a bad way
+# to spend an evening, and it is one line to prevent.
+.DELETE_ON_ERROR:
+
 all: $(KERNEL) user
 
 # --- link ------------------------------------------------------------------

@@ -17,6 +17,9 @@ legacy/tools/
 # announced itself was "git rm" reporting that the file it was looking at
 # matched nothing.
 
+# Running tools/smoke-test.py leaves one of these next to the script.
+__pycache__/
+
 # Editor and OS droppings
 .DS_Store
 *~
