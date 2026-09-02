@@ -144,7 +144,7 @@ CFLAGS := \
 # the more useful question anyway: what is in this image, rather than when
 # somebody happened to compile it. Outside a git checkout, both fall back to
 # something honest rather than to a guess.
-VERSION      := 0.4
+VERSION      := 0.5
 BUILD_STAMP  := $(shell git log -1 --format=%cd --date=short 2>/dev/null || echo unknown)
 
 # Only main.c prints the banner, so only main.o is rebuilt when either
