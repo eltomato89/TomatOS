@@ -15,7 +15,7 @@
 #include <fbdraw.h>
 #include <multiboot.h>
 #include <pci.h>
-#include <rtl8139.h>
+#include <netdev.h>
 #include <net.h>
 #include <dhcp.h>
 #include <dns.h>
@@ -526,12 +526,6 @@ extern char usertext_end[];
 *  been three quarters full absorbed a burst it only just fitted, and the
 *  next one of those is the one that does not fit. */
 #define NET_QUEUE_HIGH   75
-
-/* Which card the driver drives. rtl8139.c owns these two numbers; they are
-*  repeated here for one purpose only, namely to point at the line in the
-*  "lspci" table that is the network card. */
-#define NET_RTL_VENDOR   0x10EC
-#define NET_RTL_DEVICE   0x8139
 
 /* PCI class codes "lspci" names in words. Only the ones a machine this
 *  kernel boots on actually shows are listed; anything else prints its
@@ -5919,7 +5913,7 @@ void mousepointer(char *cmd)
 *  on, and a stack that has no address yet.
 *
 *  These are the shell's commands, not the stack's: everything below asks
-*  net.h, pci.h and rtl8139.h questions and formats the answers. No packet is
+*  net.h, pci.h and netdev.h questions and formats the answers. No packet is
 *  built here.
 *
 *  The formatting helpers exist because printf() has neither field widths nor
@@ -6092,6 +6086,39 @@ static void net_info_label(const char *label)
 	}
 }
 
+/* How many network cards the PCI enumeration saw, whatever they are.
+*
+*  Counted by CLASS rather than by vendor and device number, and that is the
+*  point of it: the shell has no business knowing which chips this kernel has
+*  drivers for -- that is a fact about src/drivers/net/, it changes whenever a
+*  driver is added, and netdev.h exists so that nothing above a driver has to
+*  track it. What the class tells us is the one thing the shell genuinely
+*  wants to say: whether the machine HAS a network card, which is a different
+*  question from whether anything managed to drive it.
+*
+*  "lspci" counts the same devices in its own loop rather than calling this,
+*  because it is walking the table anyway and a second walk to reach the same
+*  number would be the more expensive way to say the same thing. */
+static int net_pci_network_count(void)
+{
+	const pci_device *dev;
+	int count;
+	int found;
+	int i;
+
+	count = pci_count();
+	found = 0;
+
+	for(i = 0; i < count; i++)
+	{
+		dev = pci_get(i);
+		if(dev == 0) continue;
+		if(dev->class_code == PCI_CLASS_NETWORK) found++;
+	}
+
+	return found;
+}
+
 /* Why there is no network. The one place that knows, so that all four
 *  commands give the same account of the same machine.
 *
@@ -6102,19 +6129,30 @@ static void net_info_label(const char *label)
 *  points at the kernel rather than at the machine. */
 static void net_explain_down(void)
 {
-	if(!rtl8139_present())
+	if(!netdev_present())
 	{
 		if(pci_count() == 0)
 		{
 			printf("  The PCI bus was not enumerated at all, so no card was ever\n");
 			printf("  looked for. Every PC answers with at least a host bridge,\n");
 			printf("  so an empty bus means the enumeration has not run.\n");
-		} else {
-			printf("  %i PCI device(s) answered, none of them an RTL8139.\n",
+		}
+		else if(net_pci_network_count() == 0)
+		{
+			printf("  %i PCI device(s) answered, none of them a network card.\n",
 			       pci_count());
 			printf("  Booting without a network device is a normal case here --\n");
 			printf("  \"make run\" does exactly that. \"lspci\" shows what the bus\n");
 			printf("  did answer with.\n");
+		} else {
+			/* The one of the three that IS about this kernel rather than
+			   about the machine: the card is in the slot and nothing here
+			   knows how to drive it. Worth telling apart from an empty bus,
+			   because the fix is a driver rather than a cable. */
+			printf("  %i PCI device(s) answered, %i of them a network card,\n",
+			       pci_count(), net_pci_network_count());
+			printf("  but no driver in this kernel took one. \"lspci\" shows\n");
+			printf("  the vendor and device number a driver would match on.\n");
 		}
 		return;
 	}
@@ -6143,7 +6181,7 @@ static void net_explain_down(void)
 *  Returns 1 when it may go ahead. */
 static int net_interface_ready(const char *what, int need_address)
 {
-	if(!rtl8139_present())
+	if(!netdev_present())
 	{
 		printf("%s: no network card is present.\n", what);
 		net_explain_down();
@@ -6233,7 +6271,6 @@ static uint16_t net_pci_io_base(const pci_device *dev)
 static void net_show_pci(void)
 {
 	const pci_device *dev;
-	const pci_device *card;
 	char text[NET_HEX_TEXT];
 	char class_text[NET_CLASS_TEXT];
 	char io_text[NET_HEX_TEXT + 2];
@@ -6313,30 +6350,43 @@ static void net_show_pci(void)
 	printf("  %i device(s) found, %i of them a network controller.\n",
 	       count, network);
 
-	/* And the line this command is usually run for. */
-	card = pci_find(NET_RTL_VENDOR, NET_RTL_DEVICE);
-	if(card == 0)
+	/* And the line this command is usually run for -- is the network card
+	   there, and did anything take it.
+	
+	   It used to look up 10EC:8139 by hand and print where that card sat,
+	   which is the shell repeating something only a driver has any business
+	   knowing. Now it asks netdev.h what is in use and lets the driver
+	   describe itself: whichever card answers, this line is right about it,
+	   and a driver added tomorrow needs no edit here. The row for the device
+	   is in the table above either way, which is where the bus position it
+	   used to print now comes from. */
+	if(netdev_present())
 	{
-		printf("  No RTL8139 (10EC:8139) is on this bus, so the network stack\n");
-		printf("  has no card to drive. That is the normal state of \"make run\"\n");
-		printf("  without a network device.\n");
+		printf("  In use by the driver: %s.\n", netdev_describe());
+
+		/* Only ever seen on a machine with two cards, and then it is the
+		   whole answer to why the other one is quiet. See netdev.h for why
+		   the second is not brought up rather than being an interface. */
+		if(netdev_offered() > 1)
+		{
+			printf("  %i drivers found a card; the first to be brought up is\n",
+			       netdev_offered());
+			printf("  the one in use and the rest stood down. One card at a\n");
+			printf("  time is a decision, not a missing feature.\n");
+		}
 		return;
 	}
 
-	net_hex_text((uint32_t)card->bus, 2, text);
-	printf("  RTL8139 at %s:", text);
-	net_hex_text((uint32_t)card->slot, 2, text);
-	printf("%s.%i, ", text, (int)card->func);
-	io_text[0] = '0';
-	io_text[1] = 'x';
-	net_hex_text((uint32_t)net_pci_io_base(card), 4, io_text + 2);
-	printf("I/O base %s, IRQ %i -- ", io_text, (int)card->irq);
-
-	if(rtl8139_present())
+	if(network == 0)
 	{
-		printf("the driver is using it.\n");
+		printf("  No network card is on this bus, so the network stack has\n");
+		printf("  none to drive. That is the normal state of \"make run\"\n");
+		printf("  without a network device.\n");
 	} else {
-		printf("the driver did not take it.\n");
+		printf("  The bus has %i network card(s) and no driver took one.\n",
+		       network);
+		printf("  The vendor and device numbers in the rows above are what a\n");
+		printf("  driver matches on; this kernel has none for these.\n");
 	}
 }
 
@@ -6365,7 +6415,7 @@ static void net_show_interface(void)
 	printf("Interface eth0:\n");
 
 	net_info_label("Status:");
-	if(!rtl8139_present())
+	if(!netdev_present())
 	{
 		printf("down -- no network card was found\n");
 	}
@@ -6380,18 +6430,17 @@ static void net_show_interface(void)
 		printf("up\n");
 	}
 
+	/* Whatever card is actually in use describes itself here, and on a
+	   machine with none netdev_describe() says so in words rather than
+	   returning null -- which is exactly what netdev.h promises it for, and
+	   why there is no test in front of it. */
 	net_info_label("Card:");
-	if(rtl8139_present())
-	{
-		printf("%s\n", rtl8139_info());
-	} else {
-		printf("none on the PCI bus\n");
-	}
+	printf("%s\n", netdev_describe());
 
 	/* Asked of the card rather than of net_mac(): with no card the stack
 	   holds an all zero address, and six zero bytes printed as a MAC look
 	   like an answer instead of the absence of one. */
-	net_mac_text(rtl8139_present() ? net_mac() : 0, text);
+	net_mac_text(netdev_present() ? net_mac() : 0, text);
 	net_info_label("Hardware:");
 	printf("%s\n", text);
 
@@ -6497,7 +6546,7 @@ static void net_show_interface(void)
 
 	/* A row of zeroes explains nothing by itself, so when the interface
 	   cannot carry a packet it says why underneath. */
-	if(!rtl8139_present() || !net_up() || !configured)
+	if(!netdev_present() || !net_up() || !configured)
 	{
 		printf("\n");
 		net_explain_down();
@@ -6631,7 +6680,7 @@ static void net_show_queue(void)
 
 	/* Numbers about a queue nothing can put anything into explain nothing by
 	   themselves, the same as the row of zeroes in the display above. */
-	if(!rtl8139_present() || !net_up())
+	if(!netdev_present() || !net_up())
 	{
 		printf("\n");
 		net_explain_down();
@@ -6663,7 +6712,7 @@ static void net_show_arp(void)
 	{
 		printf("  Empty -- no address has been resolved yet.\n");
 
-		if(!rtl8139_present() || !net_up())
+		if(!netdev_present() || !net_up())
 		{
 			net_explain_down();
 		} else {
@@ -7717,7 +7766,7 @@ static void net_show_tcp(void)
 	{
 		printf("  None are open.\n");
 
-		if(!rtl8139_present() || !net_up() || net_ip() == 0)
+		if(!netdev_present() || !net_up() || net_ip() == 0)
 		{
 			net_explain_down();
 		} else {

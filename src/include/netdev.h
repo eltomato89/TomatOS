@@ -25,6 +25,16 @@
 *  stand down -- "lspci" still lists them, so a machine with two cards says so
 *  rather than pretending the second is not there.
 *
+*  A DRIVER WHOSE REGISTRATION IS REFUSED MUST SHUT ITS CARD BACK DOWN. This
+*  follows from the two rules above meeting: a driver registers when it is up,
+*  and only one card is taken into use, so the loser has necessarily brought
+*  hardware up that it must now bring back down. Getting that wrong is not a
+*  tidiness problem -- a receive engine left running is a DMA master writing
+*  into frames the driver has since handed back to the allocator, which
+*  corrupts memory belonging to something else entirely and does it long after
+*  the code that caused it has finished. Stop the engines first, then free the
+*  memory, in that order.
+*
 *  RECEIVING IS NOT IN THIS INTERFACE. A card pushes frames up by calling
 *  net_receive() from its interrupt handler, exactly as the RTL8139 always
 *  did. There is nothing for the stack to poll and therefore nothing to
@@ -72,7 +82,9 @@ typedef struct
 
     /* One line for the shell -- I/O or memory base, IRQ, MAC, whatever the
     *  driver thinks is worth knowing when the network does not work. Never
-    *  null. */
+    *  null, and never longer than a terminal line: "ifconfig" prints it after
+    *  a label, and a driver feeling descriptive wraps somebody else's display.
+    *  Sixty characters is the working limit. */
     const char *(*describe)(void);
 } netdev_ops;
 

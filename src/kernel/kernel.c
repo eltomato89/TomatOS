@@ -22,6 +22,7 @@
 #include <fat.h>
 #include <pci.h>
 #include <rtl8139.h>
+#include <e1000.h>
 #include <net.h>
 #include <dns.h>
 #include <tcp.h>
@@ -1010,7 +1011,22 @@ static void network_init(void)
 	*  devices, so the layer that owns the numbers has to exist first. */
 	usbmsc_init();
 
+	/* Every network driver in the tree gets a look at the bus, and the first
+	*  one whose card is present and comes up takes the stack -- see the note
+	*  about one card at a time in netdev.h. Each of these reports what it
+	*  found and returns either way; a machine with neither card is an
+	*  ordinary machine that has no network.
+	*
+	*  The order decides only which card wins on a machine that has both, and
+	*  the loser shuts its hardware back down rather than leaving a DMA engine
+	*  running. e1000 first because it is the faster part and the one the
+	*  machines this was written for actually have. */
+	e1000_init();
 	rtl8139_init();
+
+	/* Asks whether anything registered. It no longer probes for a card
+	*  itself: a stack that has to enumerate the cards it might be running on
+	*  has been decoupled from one card rather than from the hardware. */
 	net_init();
 
 	/* The resolver binds its UDP port here rather than on first use: binding

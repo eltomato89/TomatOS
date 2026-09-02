@@ -16,14 +16,26 @@
 *  1. THE ORDER IS NOT FREE.
 *
 *  A device that has just been reset answers at address 0, and it keeps
-*  answering there until SET_ADDRESS moves it. UHCI's two root ports sit on one
-*  electrical bus, so two devices in that state answer the same transfer at the
-*  same time and the result is garbage that looks like a hardware fault. That is
-*  the whole reason usb_init() resets and enumerates ONE port at a time and
-*  finishes with a device before it touches the next port -- not tidiness, but
-*  the only way the bus stays unambiguous.
+*  answering there until SET_ADDRESS moves it. A UHCI controller's root ports
+*  sit on one electrical bus, so two devices in that state answer the same
+*  transfer at the same time and the result is garbage that looks like a
+*  hardware fault. That is the whole reason usb_init() resets and enumerates
+*  ONE port at a time and finishes with a device before it touches the next
+*  port -- not tidiness, but the only way the bus stays unambiguous.
 *
 *  The same fact drives what happens when enumeration fails half way (point 5).
+*
+*  THE PORT NUMBERS ARE FLAT AND MAY SPAN SEVERAL CONTROLLERS. port_count()
+*  reports every root port of every controller the driver underneath brought
+*  up -- six of them on an ICH9, which has three UHCI functions with two
+*  sockets each -- and port_reset() takes a number out of that one range. This
+*  file never learns where the boundaries are, which is the point: the mapping
+*  is the controller driver's, and nothing here would be any different for a
+*  machine with one controller or with six.
+*
+*  Two ports of DIFFERENT controllers are on different electrical buses, so the
+*  "one at a time" rule is stricter than it has to be across that boundary. It
+*  is kept whole anyway; see the loop at the bottom of this file for why.
 *
 *  2. THE FIRST TRANSFER IS A CHICKEN AND EGG PROBLEM.
 *
@@ -917,16 +929,17 @@ static int usb_kind_of(uint8_t prog_if)
     return USB_KIND_OTHER;
 }
 
-/* One line, whatever the machine turns out to have. Called only when nothing
-*  registered itself, so everything counted here is by definition something
-*  this kernel did not bring up. */
-static void usb_report_unusable(void)
+/* Counts the host controllers on the bus by kind. Fills count[] and returns
+*  the total. Split out from the report below because the line printed when a
+*  controller DID come up needs the same inventory: "3x UHCI, 1x EHCI" is the
+*  half of that line which describes the machine rather than the driver, and it
+*  is the half that would have told the owner of an ICH9 in one glance that his
+*  keyboard was on hardware nothing here drives. */
+static int usb_count_kinds(int *count)
 {
     const pci_device *d;
-    int count[USB_KIND_COUNT];
     int total;
     int kind;
-    int listed;
     int i;
     int n;
 
@@ -948,6 +961,37 @@ static void usb_report_unusable(void)
         total++;
     }
 
+    return total;
+}
+
+/* "3x UHCI, 1x EHCI", into the line being printed. Returns nothing; the
+*  caller has already decided there is something to list. */
+static void usb_print_kinds(const int *count)
+{
+    int kind;
+    int listed;
+
+    listed = 0;
+    for(kind = 0; kind < USB_KIND_COUNT; kind++)
+    {
+        if(count[kind] == 0)
+            continue;
+
+        printf("%s%dx %s", (listed++ == 0) ? "" : ", ", count[kind],
+               usb_kind_name[kind]);
+    }
+}
+
+/* One line, whatever the machine turns out to have. Called only when nothing
+*  registered itself, so everything counted here is by definition something
+*  this kernel did not bring up. */
+static void usb_report_unusable(void)
+{
+    int count[USB_KIND_COUNT];
+    int total;
+
+    total = usb_count_kinds(count);
+
     if(total == 0)
     {
         /* The ordinary outcome on a machine QEMU started without a controller.
@@ -958,15 +1002,7 @@ static void usb_report_unusable(void)
     }
 
     printf("USB: ");
-    listed = 0;
-    for(kind = 0; kind < USB_KIND_COUNT; kind++)
-    {
-        if(count[kind] == 0)
-            continue;
-
-        printf("%s%dx %s", (listed++ == 0) ? "" : ", ", count[kind],
-               usb_kind_name[kind]);
-    }
+    usb_print_kinds(count);
 
     /* A UHCI in that list is a different failure from all the others: it is
     *  hardware this kernel does drive, so it was tried and something went
@@ -977,13 +1013,26 @@ static void usb_report_unusable(void)
     if(count[USB_KIND_UHCI] > 0)
         printf(" found, none usable (\"lsusb\" says why)\n");
     else
-        printf(" found, this kernel drives UHCI only\n");
+        printf(" found, this kernel drives UHCI only");
+
+    /* If there is an EHCI in that list, the driver already looked at it and
+    *  decided whether its root ports could be handed to a companion. On a
+    *  machine that got here they cannot have been -- there is no UHCI for them
+    *  to go to -- and the REASON is the useful half: "it has no companions"
+    *  says the sockets are wired to hardware nothing here drives and no amount
+    *  of register writing would change that, which is a different statement
+    *  from the driver simply not having tried. */
+    if(uhci_ehci_note()[0] != '\0')
+        printf("; %s", uhci_ehci_note());
+
+    printf("\n");
 }
 
 /* --- Bringing the whole thing up ----------------------------------------- */
 
 void usb_init(void)
 {
+    int count[USB_KIND_COUNT];
     int ports;
     int port;
 
@@ -1007,12 +1056,61 @@ void usb_init(void)
     if(ports < 0)
         ports = 0;
 
-    printf("USB: %s, %d root port(s)\n", usb_hc->name, ports);
+    /* WHAT THE LINE HAS TO SAY, and it is worth spelling out because the old
+    *  one was true and useless. It said "USB: UHCI, 2 root port(s)" on a
+    *  machine that has three UHCI controllers with six ports between them and
+    *  an EHCI holding all six -- every word of it correct, and it described a
+    *  bus that did not exist. Somebody reading it had no way to tell that from
+    *  the same line on a PIIX3 where it is the whole truth.
+    *
+    *  So three clauses, and each answers a different question:
+    *
+    *    what the machine has     "3x UHCI, 1x EHCI"  -- straight off the PCI
+    *                             scan, counted by prog-if, and the clause that
+    *                             makes an undriven controller visible.
+    *    what is being driven     "driving 3x UHCI, 6 root port(s)"
+    *    what happened to the     "EHCI ports handed to the companions", or the
+    *    ports that were not      reason they were left where they were.
+    *    on a UHCI
+    *
+    *  The third clause is uhci.h's to fill in and is empty on a machine with no
+    *  EHCI, so the line stays short on the machines where there is nothing to
+    *  explain. The second asks uhci.h for the controller count for the same
+    *  reason usb_report_unusable() asks it for uhci_info(): the number of
+    *  controllers behind one usb_hc_ops is a fact only the driver has, and
+    *  usb_hc_ops deliberately has no room for it -- see the comment above that
+    *  structure in usb.h. A driver that is not this one leaves the clause
+    *  saying what it can, which is the port count. */
+    printf("USB: ");
 
-    /* ONE PORT AT A TIME, START TO FINISH. Resetting both ports first and then
-    *  addressing them would leave two devices answering at address 0 on the
-    *  same electrical bus, and both would reply to the first control transfer.
-    *  See point 1 in the file header. */
+    if(usb_count_kinds(count) > 0)
+    {
+        usb_print_kinds(count);
+        printf("; ");
+    }
+
+    if(uhci_present())
+        printf("driving %dx %s, %d root port(s)",
+               uhci_controllers(), usb_hc->name, ports);
+    else
+        printf("driving %s, %d root port(s)", usb_hc->name, ports);
+
+    if(uhci_ehci_note()[0] != '\0')
+        printf("; %s", uhci_ehci_note());
+
+    printf("\n");
+
+    /* ONE PORT AT A TIME, START TO FINISH. Resetting several ports first and
+    *  then addressing them would leave two devices answering at address 0 on
+    *  the same electrical bus, and both would reply to the first control
+    *  transfer. See point 1 in the file header.
+    *
+    *  Ports of DIFFERENT controllers are on different electrical buses, so the
+    *  rule is stricter than it strictly has to be there. It is kept whole
+    *  anyway: this loop does not know which controller a port belongs to --
+    *  that is the entire point of the flat numbering -- and a rule that holds
+    *  for every port is worth more than a saving of a few milliseconds on the
+    *  boot of a machine that has two devices plugged into it. */
     for(port = 0; port < ports; port++)
         usb_enum_port(port);
 }

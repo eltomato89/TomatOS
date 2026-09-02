@@ -40,8 +40,31 @@
 #define V2P(a)  ((uint32_t)(a) - KERNEL_VIRTUAL_BASE)
 #define P2V(a)  ((void *)((uint32_t)(a) + KERNEL_VIRTUAL_BASE))
 
-/* Highest physical address the direct mapping can reach. */
-#define DIRECT_MAP_LIMIT     (0xFFFFFFFFu - KERNEL_VIRTUAL_BASE)
+/* Where the vmm puts memory mapped hardware that is too high to reach through
+*  the direct mapping -- a framebuffer at 0xFD000000, an EHCI's registers at
+*  0xFEBD5000. It lives here rather than in vmm.c because the limit below is
+*  computed from it, and that limit is what everything outside the vmm tests
+*  against. */
+#define MMIO_WINDOW_BASE     0xFF000000u
+
+/* Highest physical address the direct mapping can reach.
+*
+*  THIS USED TO SAY 0x3FFFFFFF, and the 16 MiB it was wrong by is the MMIO
+*  window: the direct mapping stops where that window starts, because
+*  KERNEL_VIRTUAL_BASE + p for p above this lands in it. Physical memory up
+*  there has no alias, and P2V() on it does not fail -- it returns a pointer
+*  into somebody's device registers. A read there can have side effects; a
+*  write there certainly does.
+*
+*  Every caller that guards with "phys > DIRECT_MAP_LIMIT" was therefore
+*  admitting a 16 MiB band it could not actually reach: the multiboot memory
+*  map, the kernel command line, the module list and each module's contents,
+*  and the pmm's own checks. All of it unreachable in practice, since a
+*  bootloader has no reason to place any of that at the very top of a machine
+*  with more than 1008 MiB -- but "no reason to" is not a bound, and the
+*  comment in vmm.c already said that everything walking the direct mapping
+*  has to respect the real limit. Now the constant it says that to agrees. */
+#define DIRECT_MAP_LIMIT     (MMIO_WINDOW_BASE - KERNEL_VIRTUAL_BASE - 1u)
 
 #define PAGE_SIZE          4096
 #define PAGE_ENTRIES       1024        /* entries per directory and per table */

@@ -39,7 +39,7 @@
 #include <stdio.h>
 #include <mm.h>
 #include <net.h>
-#include <rtl8139.h>
+#include <netdev.h>
 
 /* --- The boundary to ip.c -------------------------------------------------
 *
@@ -715,24 +715,38 @@ void net_init(void)
     net_is_up = 0;
     memset((char *)net_hwaddr, 0, ETH_ALEN);
 
-    /* The driver normally probes during boot; if nobody has, give it the
-    *  one chance here. Everything after this point tolerates a machine
-    *  with no card -- net_up() simply stays false and net_send() refuses. */
-    if(!rtl8139_present())
-        rtl8139_init();
-
-    if(!rtl8139_present())
+    /* WHO PROBED FOR A CARD, AND WHY IT IS NOT THIS FUNCTION ANY MORE.
+    *
+    *  This used to read "if(!rtl8139_present()) rtl8139_init();" -- a second,
+    *  belt-and-braces probe in case nobody had run one during boot. It was
+    *  harmless while there was one driver and it cannot survive there being
+    *  two: this file would have to name every driver in the tree and call each
+    *  one's _init() in turn, which is precisely the coupling netdev.h exists
+    *  to remove. A stack that has to know the list of cards it might be
+    *  running on has not been decoupled from the card, it has been decoupled
+    *  from one card.
+    *
+    *  So probing belongs where the other drivers are brought up, which is
+    *  network_init() in kernel.c: it already enumerates the PCI bus and calls
+    *  the driver inits in a deliberate order, it is the only place that knows
+    *  what a boot sequence is, and adding a card there is one line next to
+    *  fifteen like it. What is left here is a question -- did anything
+    *  register -- and that question has one answer whatever the machine is.
+    *
+    *  Everything after this point tolerates a machine with no card: net_up()
+    *  stays false and net_send() refuses. */
+    if(!netdev_present())
     {
         printf("net: no network card, stack stays down\n");
         return;
     }
 
-    mac = rtl8139_mac();
-    if(mac == 0)
-    {
-        printf("net: card present but has no MAC address\n");
-        return;
-    }
+    /* Never null: netdev_mac() answers with six zero bytes rather than nothing
+    *  on a machine with no card, and we are past that case. The zero address
+    *  is still caught, two checks down, by the same test that catches a card
+    *  whose MAC did not read out properly -- which is the one that matters,
+    *  because that failure looks exactly like this one from up here. */
+    mac = netdev_mac();
 
     memcpy((void *)net_hwaddr, (const void *)mac, ETH_ALEN);
 
@@ -790,7 +804,24 @@ void net_init(void)
 
     net_is_up = 1;
 
-    printf("net: up on %s\n", mac_string(net_hwaddr));
+    /* The card is named as well as the address, because those are the two
+    *  things a boot line can answer that nothing else can: which driver took
+    *  the machine's card, and what address it is going to be answered at. It
+    *  matters more since there is more than one driver -- "net: up on
+    *  52:54:00:12:34:56" one line under a PCI line naming an e1000 leaves the
+    *  reader to guess whether the two are about the same card. */
+    printf("net: up on %s, %s\n", netdev_name(), mac_string(net_hwaddr));
+
+    /* A machine with two cards says so, on the one line that can. Without it
+    *  the second adapter is simply quiet, "lspci" lists it, and there is
+    *  nothing anywhere to say whether that is a decision or a bug -- which is
+    *  what netdev_offered() is counted for. See netdev.h for why the second
+    *  one is not brought up rather than being given an interface of its own. */
+    if(netdev_offered() > 1)
+    {
+        printf("net: %i cards were found, the other %i stood down\n",
+               netdev_offered(), netdev_offered() - 1);
+    }
 }
 
 int net_up(void)
@@ -890,7 +921,7 @@ int net_send(const uint8_t dst_mac[ETH_ALEN], uint16_t type,
         frame_len = ETH_FRAME_MIN;
     }
 
-    rc = rtl8139_send((const void *)tx_frame, frame_len);
+    rc = netdev_send((const void *)tx_frame, frame_len);
     if(rc == 0)
         stat_tx++;
 

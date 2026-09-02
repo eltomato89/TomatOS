@@ -26,8 +26,16 @@
 
 #include "typedefs.h"
 
-/* Devices tracked at once. One per root port on a UHCI controller, which has
-*  two, plus room for the hub support that is not here yet. */
+/* Devices tracked at once. One per root port, and the number of root ports is
+*  not two: a UHCI controller has two, but a machine has as many UHCI
+*  controllers as its chipset gives it and the driver drives all of them, so an
+*  ICH9 presents six ports and an ICH4 four. Eight covers every chipset that
+*  has ever shipped six, and it leaves room for the hub support that is not
+*  here yet.
+*
+*  What happens past it is not a crash and not silence: usb_enum_port() refuses
+*  the ninth device with USB_ENOMEM, still moves it off address 0 so it cannot
+*  shout over anything, and usb_last_error() says why. */
 #define USB_MAX_DEVICES   8
 
 /* Endpoints recorded per device. A boot keyboard needs one, a disk two. */
@@ -167,7 +175,12 @@ typedef struct
 typedef struct
 {
     int      used;
-    int      port;             /* root port it is plugged into             */
+
+    /* The root port it is plugged into, in the flat numbering usb_hc_ops
+    *  describes. It is not merely a label: it is what the controller driver
+    *  maps back to the controller this device is on, so it must survive for as
+    *  long as the device does. */
+    int      port;
     int      speed;            /* USB_SPEED_*                              */
     uint8_t  address;          /* 0 until SET_ADDRESS succeeds             */
     uint16_t max_packet0;
@@ -208,7 +221,16 @@ typedef struct
     const char *name;          /* "UHCI", for the shell                    */
 
     /* How many root ports, and what is on one. reset() returns 1 when a
-    *  device answered and fills in the speed, 0 when the port is empty. */
+    *  device answered and fills in the speed, 0 when the port is empty.
+    *
+    *  ONE FLAT NUMBERING, 0..port_count()-1, even when the driver is running
+    *  several controllers -- which the UHCI one does, because a chipset gives
+    *  a machine three or six of them and the sockets are split between them.
+    *  There is deliberately no controller argument anywhere in this structure:
+    *  a driver that has more than one maps the port number back to the
+    *  controller itself, and the layer above is spared a concept it has no use
+    *  for. usb_device.port carries that number, so a control transfer to a
+    *  device can be routed from the device alone. */
     int (*port_count)(void);
     int (*port_reset)(int port, int *speed);
 

@@ -109,7 +109,7 @@ extern char text_end[];
 *  for the lifetime of the system, so a free list would be bookkeeping for a
 *  case that does not occur. 16 MiB is room for five framebuffers of the
 *  1024x768x32 size (768 pages, 3 MiB) the console asks for. */
-#define MMIO_WINDOW_BASE   0xFF000000u
+/* MMIO_WINDOW_BASE is in vmm.h, next to the limit derived from it. */
 #define MMIO_WINDOW_PAGES  4096u                                    /* 16 MiB */
 #define MMIO_DIR_FIRST     (MMIO_WINDOW_BASE >> 22)                 /* 1020 */
 
@@ -120,7 +120,7 @@ extern char text_end[];
 *  framebuffer no task but the current one can see. Everything that walks the
 *  direct mapping (page tables, page directories, P2V() on a pmm frame) has to
 *  respect this limit, which is why reachable_limit() reports it. */
-#define DIRECT_MAP_TOP     (MMIO_WINDOW_BASE - KERNEL_VIRTUAL_BASE) /* 0x3F000000 */
+#define DIRECT_MAP_TOP     (DIRECT_MAP_LIMIT + 1u)                  /* 0x3F000000 */
 
 /* --- State ---------------------------------------------------------------- */
 

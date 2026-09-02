@@ -32,6 +32,23 @@
 *  The receive side is one ring the card fills continuously; the transmit
 *  side is four slots used round robin. No descriptors, no scatter-gather.
 *
+*  WHAT THIS FILE IS NOW, AND WHAT IT IS NOT. It is a driver and nothing else.
+*  It used to be the network as far as the rest of the kernel was concerned:
+*  net.c called rtl8139_send() and rtl8139_mac() by name and the shell asked
+*  rtl8139_present() whether the machine had a network at all, which is why a
+*  machine with an Intel card was told it had none. So the four functions those
+*  callers used are static now and are handed to netdev_register() as a
+*  netdev_ops instead; see rtl8139.h for the list and netdev.h for the
+*  argument. rtl8139_init() is all that is left of the outside surface, and it
+*  is here because finding a card is the one thing that cannot be asked of the
+*  layer whose whole existence depends on a driver having found one.
+*
+*  Nothing above this file may assume an RTL8139 any more, and equally nothing
+*  in this file has to care what is above it. The receive direction is the
+*  exception that proves it: rtl_receive() still calls net_receive() directly,
+*  because netdev.h has no receive member on purpose -- a card pushes, so there
+*  is no moment for the stack to choose and therefore nothing to abstract.
+*
 *  Notes: No warranty expressed or implied. Use at own risk.
 */
 
@@ -41,6 +58,7 @@
 #include <vmm.h>
 #include <pci.h>
 #include <net.h>
+#include <netdev.h>
 #include <rtl8139.h>
 
 /* --- Identity ------------------------------------------------------------ */
@@ -480,6 +498,32 @@ static void rtl_interrupt(struct regs *r)
     }
 }
 
+/* --- What this driver offers the netdev layer -----------------------------
+*
+*  The four functions behind these pointers are the four that used to be
+*  declared in rtl8139.h and called by name from net.c and the shell. Nothing
+*  about what they do changed; what changed is that they are static and are
+*  reached only through here, so that the stack above never learns which chip
+*  carried its frame. rtl8139.h says the same thing at more length.
+*
+*  Declared here rather than defined here because the transmit path belongs at
+*  the bottom of the file next to the ring it fills, and the struct has to
+*  exist before rtl8139_init() can hand it over. netdev_ops has no presence
+*  member, and that absence is the point: being registered IS being present,
+*  so the old rtl8139_present() has no counterpart and is gone rather than
+*  hidden. */
+static const uint8_t *rtl8139_mac(void);
+static const char    *rtl8139_info(void);
+static int            rtl8139_send(const void *frame, uint32_t len);
+
+static const netdev_ops rtl_netdev_ops =
+{
+    "RTL8139",
+    rtl8139_send,
+    rtl8139_mac,
+    rtl8139_info
+};
+
 /* --- Bring-up ------------------------------------------------------------- */
 
 /* Both buffers come from the frame allocator: contiguous, physical, and on a
@@ -526,6 +570,47 @@ static int rtl_alloc_buffers(void)
     return 0;
 }
 
+/* Puts the card back to sleep and gives its memory back. Reached from exactly
+*  one place: a second RTL8139 in a machine that already has a card in use.
+*
+*  It is not optional tidying. The card is fully up by the time registration is
+*  asked for -- netdev.h requires that, since a driver registers when it is up
+*  and not when it is found -- so a card that then stands down is a card with
+*  its receiver enabled and a DMA engine writing arriving frames into a ring
+*  that nothing will ever read again, and whose frames are about to be handed
+*  back to the allocator. Leaving it running would be a slow corruption of
+*  whatever gets those frames next, with no symptom pointing anywhere near the
+*  network.
+*
+*  Order matters: the command register goes to zero FIRST, which stops both
+*  engines and therefore all DMA, and only then is the memory released. The
+*  interrupt mask is cleared before that so a frame already in flight cannot
+*  raise a line whose handler is not installed yet -- see rtl8139_init(), which
+*  installs it only after registration succeeded, precisely so that this path
+*  has no handler to remove. That matters more than it sounds: a second card
+*  sharing an interrupt line with the first would otherwise unhook the card
+*  that IS in use on its way out. */
+static void rtl_stand_down(void)
+{
+    rtl_outw(rtl_io + RTL_IMR, 0);
+    outportb(rtl_io + RTL_CR, 0);
+
+    if(rtl_rx_phys != 0)
+    {
+        pmm_free_frames((void *)rtl_rx_phys, (uint32_t)RTL_RX_FRAMES);
+        rtl_rx_phys = 0;
+        rtl_rx_virt = 0;
+    }
+    if(rtl_tx_phys != 0)
+    {
+        pmm_free_frames((void *)rtl_tx_phys, (uint32_t)RTL_TX_FRAMES);
+        rtl_tx_phys = 0;
+        rtl_tx_virt = 0;
+    }
+
+    rtl_ready = 0;
+}
+
 int rtl8139_init(void)
 {
     const pci_device *dev;
@@ -540,7 +625,12 @@ int rtl8139_init(void)
     dev = pci_find(RTL_VENDOR_ID, RTL_DEVICE_ID);
     if(dev == 0)
     {
-        return -1;      /* no card; net_init() copes with that */
+        /* No Realtek on this bus, which is the ordinary case on most machines
+        *  and says nothing about whether the machine has a network: another
+        *  driver may find its own card, and net_init() asks netdev_present()
+        *  rather than asking any driver. Silent on purpose -- a line here
+        *  would appear on every boot of every machine without this chip. */
+        return -1;
     }
 
     rtl_io = pci_io_base(dev, 0);
@@ -596,10 +686,6 @@ int rtl8139_init(void)
 
     rtl_tx_next = 0;
 
-    /* The handler goes in before the card is allowed to raise anything. */
-    irq_install_handler((int)rtl_irq, rtl_interrupt);
-    rtl_unmask_irq(rtl_irq);
-
     /* Accept what is addressed to us, plus multicast and broadcast -- ARP
     *  would not work without the last one. Promiscuous mode and errored
     *  frames stay off. WRAP is deliberately CLEAR: the card may write a
@@ -611,13 +697,50 @@ int rtl8139_init(void)
 
     rtl_outl(rtl_io + RTL_TCR, RTL_TCR_IFG_STD | RTL_TCR_MXDMA_2K);
 
-    /* Now the engines, and only then the interrupt mask: everything the card
-    *  could report already has a place to land. */
+    /* The engines on, and the interrupt mask deliberately still shut. The card
+    *  now receives into the ring and would take a frame from rtl8139_send(),
+    *  which is what netdev.h means by a driver registering when it is up: the
+    *  transmit path needs no interrupt at all, because the OWN bit it waits on
+    *  is set by the hardware. What is still missing is only the notification
+    *  that something arrived, and nothing above this file can ask for that
+    *  before net_init() has run. */
     outportb(rtl_io + RTL_CR, (uint8_t)(RTL_CR_TE | RTL_CR_RE));
-    rtl_outw(rtl_io + RTL_IMR, RTL_INT_MASK);
 
     rtl_ready = 1;
     rtl_build_info();
+
+    /* And the offer, which is the point at which this driver stops being the
+    *  network and starts being one candidate for it. Everything netdev_ops
+    *  promises holds of this card by now -- it answers with its own MAC, it
+    *  takes a frame, and it can describe itself -- which is why the offer is
+    *  made here and not at the top of the function where it would have been
+    *  cheaper to make and false to believe.
+    *
+    *  A refusal means another driver registered first, on a machine with two
+    *  cards. netdev.h is explicit that this is not a failure of this card, so
+    *  it is worded as what it is; what it IS is a card that must now stop,
+    *  since the alternative is a receiver filling a ring nobody drains out of
+    *  memory that is about to be given back. */
+    if(netdev_register(&rtl_netdev_ops) != 0)
+    {
+        printf("%s\n", rtl_info_buf);
+        printf("RTL8139: a network card is already in use -- standing down\n");
+        rtl_stand_down();
+        return -1;
+    }
+
+    /* Only now the interrupt, and in this order so that everything the card
+    *  could report already has somewhere to land: the handler, then the line,
+    *  then the mask that lets the card pull it.
+    *
+    *  After the registration rather than before it, which is the part worth
+    *  knowing. A second card that stands down has then never touched the
+    *  interrupt table -- and on a machine where both cards landed on one line,
+    *  installing first would mean unhooking the card that is actually in use
+    *  on the way back out. */
+    irq_install_handler((int)rtl_irq, rtl_interrupt);
+    rtl_unmask_irq(rtl_irq);
+    rtl_outw(rtl_io + RTL_IMR, RTL_INT_MASK);
 
     printf("%s\n", rtl_info_buf);
     printf("RTL8139: %d KiB receive ring, %d bytes allocated, %d transmit slots\n",
@@ -626,17 +749,12 @@ int rtl8139_init(void)
     return 0;
 }
 
-int rtl8139_present(void)
-{
-    return rtl_ready;
-}
-
-const uint8_t *rtl8139_mac(void)
+static const uint8_t *rtl8139_mac(void)
 {
     return rtl_mac_addr;
 }
 
-const char *rtl8139_info(void)
+static const char *rtl8139_info(void)
 {
     if(!rtl_ready)
     {
@@ -654,7 +772,7 @@ const char *rtl8139_info(void)
 *  Only the slot at rtl_tx_next is examined. Slots are filled in order and
 *  the card works them in the same order, so that one is always the oldest
 *  outstanding: if it is still busy, so are all the others. */
-int rtl8139_send(const void *frame, uint32_t len)
+static int rtl8139_send(const void *frame, uint32_t len)
 {
     uint8_t *buf;
     uint16_t tsd_port;
